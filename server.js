@@ -314,7 +314,7 @@ app.post('/ussd', (req, res) => {
         response = `CON Smart Locks: KES 3,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '4') {
-        response = `CON Electric Fence: KES 3,000
+        response = `CON Electric Fence: KES 5,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '5') {
         response = `CON Solar Backup: KES 3,500
