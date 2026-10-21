@@ -87,7 +87,7 @@ function renderPage({ title, activeNav, content }) {
             <!-- Main Navigation Menu -->
             <nav>
                 <a href="/" class="logo-container">
-                    <img src="/logo.png" alt="Tencent Innovations" class="logo-img">
+                   <img src="/TENCENT_INNOVATIONS_logo.png" alt="Tencent Innovations" class="logo-img">
                     <div class="logo-text-group">
                         <span class="logo-text">Tencent Innovations</span>
                         <span class="logo-tagline">Connecting You, Faster.</span>
