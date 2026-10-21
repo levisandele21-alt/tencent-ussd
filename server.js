@@ -1,10 +1,27 @@
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
 const app = express();
+
+// 1. Security Headers via Helmet
+app.use(helmet());
+
+// 2. Trust Render's Proxy (Required for correct rate limiting)
+app.set('trust proxy', 1);
+
+// 3. Rate Limiting to prevent spam/attacks
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again later.'
+});
+app.use(limiter);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 1. Customer Website Homepage Route
+// 4. Customer Website Homepage Route
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -47,7 +64,7 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 2. USSD Callback Endpoint
+// 5. USSD Callback Endpoint
 app.post('/ussd', (req, res) => {
     const { text, phoneNumber } = req.body;
     let response = '';
@@ -81,4 +98,4 @@ app.post('/ussd', (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations App running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Secure Tencent Innovations App running on port ${PORT}`));
