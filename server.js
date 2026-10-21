@@ -37,9 +37,9 @@ function renderPage({ title, activeNav, content }) {
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>${title} - Tencent Innovations</title>
+            <title>\${title} - Tencent Innovations</title>
             <style>
-                :root { --primary: #0284c7; --bg: #0f172a; --card-bg: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #4ade80; }
+                :root { --primary: #0284c7; --bg: #0f172a; --text: #f8fafc; --muted: #94a3b8; --accent: #4ade80; }
                 body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; }
                 
                 /* Main Navigation Bar */
@@ -66,10 +66,10 @@ function renderPage({ title, activeNav, content }) {
                 .hero-banner p { color: #e2e8f0; font-size: 1.15rem; margin-bottom: 20px; max-width: 800px; margin-left: auto; margin-right: auto; }
                 .ussd-badge { display: inline-block; background: #38bdf8; color: #0f172a; padding: 10px 22px; border-radius: 30px; font-weight: bold; font-size: 1.05rem; box-shadow: 0 4px 15px rgba(56, 189, 248, 0.3); }
 
-                /* Layout & Content Blocks */
-                .container { max-width: 1000px; margin: 40px auto; padding: 0 20px; }
-                .content-card { background: var(--card-bg); border-radius: 12px; padding: 35px; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0,0,0,0.3); margin-bottom: 30px; }
-                .content-card h2 { color: #38bdf8; margin-top: 0; font-size: 2rem; }
+                /* Seamless Page Layout */
+                .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
+                .content-section { margin-bottom: 30px; }
+                .content-section h2 { color: #38bdf8; margin-top: 0; font-size: 2.2rem; }
                 .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; border-left: 3px solid var(--primary); padding-left: 15px; }
                 
                 /* Bullet & Feature Lists */
@@ -78,7 +78,7 @@ function renderPage({ title, activeNav, content }) {
                 ul.feature-list li::before { content: "✔"; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
 
                 /* Call to Action Box */
-                .cta-box { background: #0b1120; border: 1px solid #0284c7; padding: 25px; border-radius: 10px; margin-top: 30px; text-align: center; }
+                .cta-box { background: #1e293b; border: 1px solid #0284c7; padding: 25px; border-radius: 10px; margin-top: 35px; text-align: center; }
                 .cta-box p { font-size: 1.1rem; margin-top: 0; color: #f8fafc; }
                 .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; transition: background 0.2s; }
                 .cta-btn:hover { background: #0369a1; }
@@ -99,17 +99,17 @@ function renderPage({ title, activeNav, content }) {
                     </div>
                 </a>
                 <ul class="nav-links">
-                    <li><a href="/" class="${activeNav === 'home' ? 'active' : ''}">Home</a></li>
-                    <li><a href="/wifi" class="${activeNav === 'wifi' ? 'active' : ''}">WiFi</a></li>
-                    <li><a href="/cctv" class="${activeNav === 'cctv' ? 'active' : ''}">CCTV</a></li>
-                    <li><a href="/smart-locks" class="${activeNav === 'smart-locks' ? 'active' : ''}">Smart Locks</a></li>
-                    <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">Electric Fence</a></li>
-                    <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">Solar</a></li>
-                    <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">Surveys</a></li>
+                    <li><a href="/" class="\${activeNav === 'home' ? 'active' : ''}">Home</a></li>
+                    <li><a href="/wifi" class="\${activeNav === 'wifi' ? 'active' : ''}">WiFi</a></li>
+                    <li><a href="/cctv" class="\${activeNav === 'cctv' ? 'active' : ''}">CCTV</a></li>
+                    <li><a href="/smart-locks" class="\${activeNav === 'smart-locks' ? 'active' : ''}">Smart Locks</a></li>
+                    <li><a href="/electric-fence" class="\${activeNav === 'electric-fence' ? 'active' : ''}">Electric Fence</a></li>
+                    <li><a href="/solar" class="\${activeNav === 'solar' ? 'active' : ''}">Solar</a></li>
+                    <li><a href="/survey" class="\${activeNav === 'survey' ? 'active' : ''}">Surveys</a></li>
                 </ul>
             </nav>
 
-            ${content}
+            \${content}
 
             <div class="contact-bar">
                 📍 <strong>Rangwe, Homa Bay County</strong> &nbsp;|&nbsp; 📞 <strong>0740 311 014</strong> &nbsp;|&nbsp; ✉️ <strong>tencentbz@gmail.com</strong>
@@ -132,7 +132,7 @@ app.get('/', (req, res) => {
             <div class="ussd-badge">📱 Dial *384*100# on your phone to book</div>
         </div>
         <div class="container">
-            <div class="content-card">
+            <div class="content-section">
                 <p class="intro-text">Most problems with networks, cameras and power start with a poor plan, not poor equipment. We are engineers, so we plan first, install properly and stay around to support what we build.</p>
                 
                 <h3 style="color: #38bdf8;">What we do</h3>
@@ -167,7 +167,7 @@ app.get('/', (req, res) => {
 app.get('/wifi', (req, res) => {
     const content = `
         <div class="container">
-            <div class="content-card">
+            <div class="content-section">
                 <h2>Reliable WiFi for homes, rentals and businesses.</h2>
                 <p style="color: var(--muted); font-size: 1.15rem; margin-top: -10px;">Pay-as-you-go hotspot or a fixed monthly connection. We build the network, run the billing and keep it online.</p>
                 
@@ -205,7 +205,7 @@ app.get('/wifi', (req, res) => {
 app.get('/cctv', (req, res) => {
     const content = `
         <div class="container">
-            <div class="content-card">
+            <div class="content-section">
                 <h2>See your property from anywhere.</h2>
                 <p style="color: var(--muted); font-size: 1.15rem; margin-top: -10px;">CCTV systems for homes, shops, schools and compounds, installed and set up to view live on your phone.</p>
                 
@@ -236,234 +236,4 @@ app.get('/cctv', (req, res) => {
                 </ul>
 
                 <div class="cta-box">
-                    <p>Book a survey and we will tell you what your property needs and what it will cost.</p>
-                    <a href="/survey" class="cta-btn">Book a CCTV survey</a>
-                </div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage({ title: 'CCTV Systems', activeNav: 'cctv', content }));
-});
-
-// 4. Smart Locks Page
-app.get('/smart-locks', (req, res) => {
-    const content = `
-        <div class="container">
-            <div class="content-card">
-                <h2>Open your door without a key.</h2>
-                <p style="color: var(--muted); font-size: 1.15rem; margin-top: -10px;">Smart locks for homes, rental units, offices and stores. Use a code, a card, a fingerprint or your phone.</p>
-                
-                <p class="intro-text">Keys get lost, copied and passed to people who should not have them. A smart lock removes that problem. You decide who can enter, and you can take that access away in seconds.</p>
-
-                <h3 style="color: #38bdf8;">Ways to unlock</h3>
-                <ul class="feature-list">
-                    <li>Fingerprint</li>
-                    <li>PIN code</li>
-                    <li>Card or key tag</li>
-                    <li>Phone app (on supported models)</li>
-                    <li>Mechanical key as a backup</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">Why people choose them</h3>
-                <ul class="feature-list">
-                    <li><strong>Landlords and caretakers:</strong> Give each tenant their own code and change it when they move out. No more rekeying.</li>
-                    <li><strong>Families:</strong> Children enter without carrying keys.</li>
-                    <li><strong>Offices and stores:</strong> Give staff access and remove it when they leave.</li>
-                    <li><strong>Short-stay hosts:</strong> Share a temporary code with guests.</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">What we do</h3>
-                <ul class="feature-list">
-                    <li>Help you pick a model that fits your door and budget</li>
-                    <li>Fit and align the lock so it closes smoothly</li>
-                    <li>Add your users and show you how to manage them</li>
-                    <li>Fit new batteries and show you how to know when they are low</li>
-                </ul>
-
-                <p><strong>Good to know:</strong> Smart locks fit most standard wooden and metal doors. We check your door during the survey and tell you if it needs changes before the lock goes on.</p>
-
-                <div class="cta-box">
-                    <p>Tell us about your door and how many people need access. We will recommend a lock and quote you the installed price.</p>
-                    <a href="tel:*384*100#" class="cta-btn">Book a smart lock consultation</a>
-                </div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage({ title: 'Smart Locks', activeNav: 'smart-locks', content }));
-});
-
-// 5. Electric Fence Page
-app.get('/electric-fence', (req, res) => {
-    const content = `
-        <div class="container">
-            <div class="content-card">
-                <h2>Stop intruders at the boundary.</h2>
-                <p style="color: var(--muted); font-size: 1.15rem; margin-top: -10px;">Electric fence installation for homes, compounds, schools, farms and commercial plots, with an alarm that alerts you when the fence is touched or cut.</p>
-                
-                <p class="intro-text">A visible fence with a warning sign makes most intruders look for an easier target. Fitted correctly, it protects your boundary without turning your compound into a hazard. We install to a safe standard and explain every part of the system to you.</p>
-
-                <h3 style="color: #38bdf8;">What is included</h3>
-                <ul class="feature-list">
-                    <li>Fence design for your wall, roof or open boundary</li>
-                    <li>Energiser, wiring, insulators and earthing, installed correctly</li>
-                    <li>Alarm siren and a control unit you can arm and disarm</li>
-                    <li>Warning signs on every side of the fence</li>
-                    <li>Backup battery so protection continues during power cuts</li>
-                    <li>A walk-through showing how to arm, disarm and check the system</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">Safety comes first</h3>
-                <ul class="feature-list">
-                    <li>We use proper insulators and a correct earthing system.</li>
-                    <li>The fence delivers a short pulse designed to deter, not harm.</li>
-                    <li>Warning signs go up before the fence is switched on.</li>
-                    <li>We tell you how to keep vegetation and objects away from the live wires.</li>
-                </ul>
-
-                <p><strong>Often paired with:</strong> CCTV to see what set off the alarm, a solar backup so the fence runs through blackouts, and a smart lock on your gate or main door.</p>
-
-                <div class="cta-box">
-                    <p>Book a survey. We measure your boundary, explain the options and give you a written quote.</p>
-                    <a href="/survey" class="cta-btn">Book an electric fence survey</a>
-                </div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage({ title: 'Electric Fence', activeNav: 'electric-fence', content }));
-});
-
-// 6. Solar Page
-app.get('/solar', (req, res) => {
-    const content = `
-        <div class="container">
-            <div class="content-card">
-                <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
-                <p style="color: var(--muted); font-size: 1.15rem; margin-top: -10px;">Solar and battery systems sized for your home, shop, school or network site, from a small backup to a full installation.</p>
-                
-                <p class="intro-text">Power cuts cost you sales, security and connection time. A solar system with battery storage keeps your essential equipment running, and cuts your dependence on the grid. We size every system to the equipment you need to power, so you do not overpay for capacity you will not use.</p>
-
-                <h3 style="color: #38bdf8;">What we offer</h3>
-                <ul class="feature-list">
-                    <li><strong>Backup power:</strong> Keep lights, TV, router, phones and cameras running through outages.</li>
-                    <li><strong>Hybrid systems:</strong> Use solar by day, batteries at night and the grid as a fallback.</li>
-                    <li><strong>Off-grid systems:</strong> Power sites with no grid connection.</li>
-                    <li><strong>Network and security backup:</strong> Keep WiFi access points, CCTV and electric fences online for hours after a cut.</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">What is included</h3>
-                <ul class="feature-list">
-                    <li>A list of what you want to power, and how long it must run</li>
-                    <li>System sizing: panels, battery capacity and inverter</li>
-                    <li>Mounting, wiring, protection and earthing done to a safe standard</li>
-                    <li>Testing and a walk-through of how the system behaves</li>
-                    <li>Support and maintenance</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">How we size it</h3>
-                <p>We add up the power of each device, estimate the hours you use it, and size the batteries and panels to cover that load with room to grow. You see the numbers before you decide.</p>
-
-                <div class="cta-box">
-                    <p>List the equipment you need to keep running and tell us how long. We will return a recommended system and a quote.</p>
-                    <a href="tel:*384*100#" class="cta-btn">Book a solar consultation</a>
-                </div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
-});
-
-// 7. Surveys Page
-app.get('/survey', (req, res) => {
-    const content = `
-        <div class="container">
-            <div class="content-card">
-                <h2>Know what your site needs before you spend.</h2>
-                <p style="color: var(--muted); font-size: 1.15rem; margin-top: -10px;">A site survey by an engineer, followed by a written plan and quote for WiFi, CCTV, smart locks, electric fence or solar.</p>
-                
-                <p class="intro-text">The survey is where good installations start. We visit your property, measure, test and talk through what you want to achieve. You leave with a clear plan, so you can compare options and decide with confidence.</p>
-
-                <h3 style="color: #38bdf8;">What we check</h3>
-                <ul class="feature-list">
-                    <li><strong>Network:</strong> Signal strength, line of sight to the mast, obstacles and the best place for access points</li>
-                    <li><strong>CCTV:</strong> Camera positions, viewing angles, lighting and cable routes</li>
-                    <li><strong>Smart locks:</strong> Door type, thickness and condition</li>
-                    <li><strong>Electric fence:</strong> Boundary length, corners, gates and earthing points</li>
-                    <li><strong>Solar:</strong> Roof space, shading, the equipment you need to power and where batteries should sit</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">What you receive</h3>
-                <ul class="feature-list">
-                    <li>A written report of what we found</li>
-                    <li>A recommended design, with options where they make sense</li>
-                    <li>An itemised quote for equipment and installation</li>
-                    <li>An estimated installation time</li>
-                </ul>
-
-                <h3 style="color: #38bdf8;">How it works</h3>
-                <ol style="color: #f1f5f9; padding-left: 20px; line-height: 1.8;">
-                    <li>Book a survey on this website or by USSD, and pay the survey fee by M-Pesa.</li>
-                    <li>We call you to agree a time.</li>
-                    <li>An engineer visits and inspects your site.</li>
-                    <li>You receive the report and quote.</li>
-                    <li>If you go ahead, we schedule the installation.</li>
-                </ol>
-
-                <h3 style="color: #38bdf8;">Good to know</h3>
-                <ul class="feature-list">
-                    <li>The survey fee is paid before the visit, so we can set the time aside for you.</li>
-                    <li>You are free to use the report with any installer. We hope you will choose us.</li>
-                </ul>
-
-                <div class="cta-box">
-                    <p>Book your survey now and get a plan you can act on.</p>
-                    <a href="tel:*384*100#" class="cta-btn">Book a site survey</a>
-                </div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
-});
-
-// 8. USSD Endpoint
-app.post('/ussd', (req, res) => {
-    const { text, phoneNumber } = req.body;
-    let response = '';
-
-    if (text === '') {
-        response = `CON Welcome to Tencent Innovations
-1. WiFi & Hotspot Internet
-2. CCTV Installation
-3. Smart Locks
-4. Electric Fence
-5. Solar Backup Power
-6. Site Survey & Visit`;
-    } else if (text === '1') {
-        response = `CON WiFi Consultation: KES 2,500
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '2') {
-        response = `CON CCTV Survey: KES 2,000
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '3') {
-        response = `CON Smart Locks Consultation: KES 2,000
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '4') {
-        response = `CON Electric Fence Survey: KES 3,000
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '5') {
-        response = `CON Solar Consultation: KES 2,500
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '6') {
-        response = `CON Site Survey: KES 1,500
-1. Confirm & Pay via M-PESA`;
-    } else if (text.endsWith('*1')) {
-        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
-    } else {
-        response = `END Invalid selection. Please dial again.`;
-    }
-
-    res.set('Content-Type', 'text/plain');
-    res.send(response);
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations multi-page server running on port ${PORT}`));
+                    <p>Book
