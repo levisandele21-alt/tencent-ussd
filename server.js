@@ -192,7 +192,7 @@ app.get('/cctv', (req, res) => {
         <div class="container">
             <div class="service-detail-card">
                 <h2>CCTV Installation & Surveillance</h2>
-                <div class="price-tag">Consultation & Assessment: KES 2,000</div>
+                <div class="price-tag">Consultation & Assessment: KES 3,000</div>
                 <p>Protect your property with state-of-the-art IP and analog high-definition CCTV systems with remote smartphone monitoring.</p>
                 <h3>Key Features:</h3>
                 <ul class="features-list">
@@ -213,7 +213,7 @@ app.get('/smart-locks', (req, res) => {
         <div class="container">
             <div class="service-detail-card">
                 <h2>Smart Locks & Access Control</h2>
-                <div class="price-tag">Consultation & Fitting Advisory: KES 2,000</div>
+                <div class="price-tag">Consultation & Fitting Advisory: KES 3,000</div>
                 <p>Keyless entry systems designed for homes, Airbnbs, and commercial offices.</p>
                 <h3>Key Features:</h3>
                 <ul class="features-list">
@@ -234,7 +234,7 @@ app.get('/electric-fence', (req, res) => {
         <div class="container">
             <div class="service-detail-card">
                 <h2>Electric Fence Installation</h2>
-                <div class="price-tag">Consultation & Assessment: KES 3,000</div>
+                <div class="price-tag">Consultation & Assessment: KES 5,000</div>
                 <p>Secure boundary protection with high-voltage perimeter fencing systems.</p>
                 <h3>Key Features:</h3>
                 <ul class="features-list">
@@ -255,7 +255,7 @@ app.get('/solar', (req, res) => {
         <div class="container">
             <div class="service-detail-card">
                 <h2>Solar Backup Power Systems</h2>
-                <div class="price-tag">Consultation & System Sizing: KES 2,500</div>
+                <div class="price-tag">Consultation & System Sizing: KES 3,500</div>
                 <p>Reliable clean energy systems designed to keep your business and home running through power outages.</p>
                 <h3>Key Features:</h3>
                 <ul class="features-list">
@@ -276,7 +276,7 @@ app.get('/survey', (req, res) => {
         <div class="container">
             <div class="service-detail-card">
                 <h2>Free Site Visit & Professional Quotations</h2>
-                <div class="price-tag">On-Site Survey: KES 1,500</div>
+                <div class="price-tag">On-Site Survey: KES 5,500</div>
                 <p>Detailed technical audits and precise pricing quotes for all installations in Rangwe and surrounding regions.</p>
                 <h3>What You Get:</h3>
                 <ul class="features-list">
@@ -308,19 +308,19 @@ app.post('/ussd', (req, res) => {
         response = `CON WiFi Setup: KES 2,500
 1. Confirm & Pay via M-PESA`;
     } else if (text === '2') {
-        response = `CON CCTV Installation: KES 2,000
+        response = `CON CCTV Installation: KES 3,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '3') {
-        response = `CON Smart Locks: KES 2,000
+        response = `CON Smart Locks: KES 3,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '4') {
         response = `CON Electric Fence: KES 3,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '5') {
-        response = `CON Solar Backup: KES 2,500
+        response = `CON Solar Backup: KES 3,500
 1. Confirm & Pay via M-PESA`;
     } else if (text === '6') {
-        response = `CON Site Visit: KES 1,500
+        response = `CON Site Visit: KES 5,500
 1. Confirm & Pay via M-PESA`;
     } else if (text.endsWith('*1')) {
         response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. Enter your PIN to complete booking.`;
