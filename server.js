@@ -17,17 +17,19 @@ app.use(
     })
 );
 
-// 3. Trust Render's Proxy (Ensures accurate client IP tracking for rate limiters)
+// 3. Trust Render's Proxy
 app.set('trust proxy', 1);
 
-// 4. Rate Limiting & Payload Body Limits
+// 4. Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: 'Too many requests from this IP, please try again later.',
+    // Safaricom callbacks and the payment status poll must never be throttled by this general limit
     skip: (req) => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
 });
 
+// Strict limit on the payment form: stops people spamming M-Pesa prompts
 const payLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     max: 10,
@@ -35,13 +37,15 @@ const payLimiter = rateLimit({
 });
 app.use(limiter);
 
-// Prevent payload-based denial of service (DoS) attacks
-app.use(express.json({ limit: '10kb' }));
-app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // ---------------------------------------------------------------
-// Email & Telegram Notifications
+// Email notifications (Gmail via Nodemailer)
+// Required env vars on Render: GMAIL_USER, GMAIL_APP_PASSWORD
+// Optional: NOTIFY_TO (defaults to GMAIL_USER)
 // ---------------------------------------------------------------
+// Short timeouts so a blocked SMTP connection (Render free tier) cannot hang the form.
 const mailer = nodemailer.createTransport({
     service: 'gmail',
     connectionTimeout: 8000,
@@ -53,6 +57,7 @@ const mailer = nodemailer.createTransport({
     }
 });
 
+// Escape user input so nobody can inject HTML into pages or emails
 function esc(value = '') {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -62,10 +67,12 @@ function esc(value = '') {
         .replace(/'/g, '&#39;');
 }
 
+// Form fields may arrive as strings or arrays (e.g. checkboxes)
 function flat(value) {
     return Array.isArray(value) ? value.join(', ') : (value || '');
 }
 
+// Send a lead alert. Never throws: a mail failure must not break the customer's page.
 async function notify(subject, fields) {
     const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
     const rows = Object.entries(fields)
@@ -79,8 +86,11 @@ async function notify(subject, fields) {
         .join('');
     const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
+    // Always log the lead first, so it is in Render logs whatever happens next
     console.log('LEAD:', JSON.stringify({ subject: cleanSubject, fields, time }));
 
+    // Telegram (HTTPS, works on Render free tier)
+    // Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     const sendTelegram = async () => {
         if (!process.env.TELEGRAM_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
         const lines = Object.entries(fields).map(([label, val]) => `${label}: ${flat(val)}`);
@@ -94,6 +104,7 @@ async function notify(subject, fields) {
         if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
     };
 
+    // Email (needs SMTP: blocked on Render free tier, works on paid instances)
     const sendEmail = async () => {
         if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
         await mailer.sendMail({
@@ -104,13 +115,27 @@ async function notify(subject, fields) {
         });
     };
 
+    // Run both in parallel; one failing never blocks the other or the customer's page
     const results = await Promise.allSettled([sendTelegram(), sendEmail()]);
     if (results[0].status === 'rejected') console.error('Telegram notification failed:', results[0].reason && results[0].reason.message);
     if (results[1].status === 'rejected') console.error('Notification email failed:', results[1].reason && results[1].reason.message);
 }
 
 // ---------------------------------------------------------------
-// M-Pesa (Daraja) Configuration
+// M-Pesa (Daraja) STK Push for a PAYBILL shortcode
+//
+// Env vars on Render:
+//   MPESA_ENV              sandbox (default) or production
+//   MPESA_CONSUMER_KEY     from the Daraja portal
+//   MPESA_CONSUMER_SECRET  from the Daraja portal
+//   MPESA_SHORTCODE        sandbox test shortcode, later your Paybill number
+//   MPESA_PASSKEY          sandbox test passkey, later your production passkey
+//   MPESA_CALLBACK_SECRET  a long random string (32+ characters) you invent
+//   PUBLIC_BASE_URL        https://tencent-ussd.onrender.com (no trailing slash)
+//
+// NOTE: bookings are kept in memory. They are lost when the server restarts,
+// so add a database before relying on this for real money. Every lead and
+// every confirmed payment is also sent to you by Telegram/email.
 // ---------------------------------------------------------------
 const MPESA = {
     production: process.env.MPESA_ENV === 'production',
@@ -121,9 +146,19 @@ const MPESA = {
     callbackSecret: process.env.MPESA_CALLBACK_SECRET,
     publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
 };
+// MPESA_BASE_URL exists only so tests can point at a mock server
 MPESA.baseUrl = process.env.MPESA_BASE_URL ||
     (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
 
+function mpesaConfigured() {
+    return Boolean(
+        MPESA.key && MPESA.secret && MPESA.shortcode && MPESA.passkey &&
+        MPESA.callbackSecret && MPESA.callbackSecret.length >= 16 &&
+        MPESA.publicBaseUrl.startsWith('https://')
+    );
+}
+
+// The server decides the price. The form only says which service was chosen.
 const SERVICE_PRICES = {
     'Site Survey & Quotation': 1500,
     'WiFi Setup': 2500,
@@ -133,6 +168,7 @@ const SERVICE_PRICES = {
     'Solar Consultation': 2500
 };
 
+// Accepts 0712345678, 712345678, 254712345678, +254712345678 (and 01xx numbers)
 function normalizePhone(raw) {
     let p = String(raw || '').replace(/[\s\-()]/g, '');
     if (p.startsWith('+')) p = p.slice(1);
@@ -141,9 +177,10 @@ function normalizePhone(raw) {
     return /^254[17]\d{8}$/.test(p) ? p : null;
 }
 
-const bookings = new Map();
-const byCheckout = new Map();
-const phoneAttempts = new Map();
+// In-memory stores
+const bookings = new Map();      // booking id -> booking
+const byCheckout = new Map();    // CheckoutRequestID -> booking
+const phoneAttempts = new Map(); // phone -> [timestamps]
 
 function phoneAttemptAllowed(phone) {
     const now = Date.now();
@@ -154,6 +191,7 @@ function phoneAttemptAllowed(phone) {
     return true;
 }
 
+// Tidy old data every 30 minutes
 setInterval(() => {
     const now = Date.now();
     for (const [id, b] of bookings) {
@@ -185,6 +223,7 @@ async function getAccessToken() {
     return tokenCache.value;
 }
 
+// Daraja timestamps are YYYYMMDDHHmmss in Nairobi time (UTC+3)
 function darajaTimestamp() {
     return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
 }
@@ -201,7 +240,7 @@ async function darajaPost(path, payload) {
         signal: AbortSignal.timeout(20000)
     });
     let data = {};
-    try { data = await resp.json(); } catch (_) {}
+    try { data = await resp.json(); } catch (_) { /* non-JSON body */ }
     if (!resp.ok) {
         const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
         err.status = resp.status;
@@ -221,12 +260,13 @@ async function stkPush(booking) {
         PartyA: booking.phone,
         PartyB: MPESA.shortcode,
         PhoneNumber: booking.phone,
+        // Path avoids words like "mpesa"/"safaricom", which Safaricom may reject in callback URLs
         CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: booking.accountRef,
+        AccountReference: booking.accountRef,   // max 12 chars; shows as the Paybill account number
         TransactionDesc: 'Survey fee'
     });
     if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
-    return data;
+    return data; // contains MerchantRequestID and CheckoutRequestID
 }
 
 async function stkQuery(checkoutRequestId) {
@@ -245,7 +285,6 @@ function bookingFields(b, extra = {}) {
         Phone: b.phone,
         Service: b.service,
         Location: b.location,
-        ...(b.propertyType && b.propertyType !== 'N/A' ? { 'Property Type': b.propertyType } : {}),
         Amount: `KES ${b.amount}`,
         Reference: b.accountRef,
         ...extra
@@ -253,13 +292,13 @@ function bookingFields(b, extra = {}) {
 }
 
 async function markPaid(booking, receipt, verified) {
-    if (booking.status === 'paid') return;
+    if (booking.status === 'paid') return;   // idempotent: duplicate callbacks do nothing
     booking.status = 'paid';
     booking.receipt = receipt || '';
     booking.paidAt = Date.now();
     await notify(`✅ PAID: ${booking.service} - ${booking.name}`, bookingFields(booking, {
         'M-Pesa receipt': receipt || '(see M-Pesa statement, match the Reference)',
-        Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only'
+        Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only (status query was unavailable)'
     }));
 }
 
@@ -273,7 +312,10 @@ async function handleCallback(body) {
     const cb = body && body.Body && body.Body.stkCallback;
     if (!cb) return;
     const booking = byCheckout.get(cb.CheckoutRequestID);
-    if (!booking) return;
+    if (!booking) {
+        console.log('Callback for unknown CheckoutRequestID:', cb.CheckoutRequestID);
+        return;
+    }
 
     const succeeded = Number(cb.ResultCode) === 0;
     const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
@@ -286,6 +328,7 @@ async function handleCallback(body) {
     }
     if (!succeeded) { markFailed(booking, cb.ResultDesc); return; }
 
+    // The amount paid must match the price we asked for
     if (Number(meta('Amount')) !== booking.amount) {
         booking.status = 'review';
         await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
@@ -295,6 +338,7 @@ async function handleCallback(body) {
         return;
     }
 
+    // Do not trust the callback alone: ask Safaricom directly
     let verified = false;
     try {
         const q = await stkQuery(booking.checkoutRequestId);
@@ -308,21 +352,25 @@ async function handleCallback(body) {
             return;
         }
     } catch (err) {
-        console.error('STK status query failed:', err.message);
+        console.error('STK status query failed, accepting callback only:', err.message);
     }
     await markPaid(booking, receipt, verified);
 }
 
+// Safaricom calls this when the customer pays, cancels or times out.
+// The secret in the URL stops strangers from posting fake "payments".
 app.post('/payments/cb/:secret', (req, res) => {
     const given = Buffer.from(String(req.params.secret));
     const expected = Buffer.from(String(MPESA.callbackSecret || ''));
     const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
     if (!ok) return res.sendStatus(404);
 
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
     handleCallback(req.body).catch(err => console.error('Callback handling error:', err.message));
 });
 
+// The "Check your phone" page polls this. If the callback never arrives
+// (for example the server was asleep), it asks Safaricom directly.
 app.get('/payments/status/:id', async (req, res) => {
     const b = bookings.get(String(req.params.id));
     if (!b) return res.status(404).json({ status: 'unknown' });
@@ -334,7 +382,7 @@ app.get('/payments/status/:id', async (req, res) => {
             const q = await stkQuery(b.checkoutRequestId);
             if (String(q.ResultCode) === '0') await markPaid(b, '', true);
             else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') markFailed(b, q.ResultDesc);
-        } catch (_) {}
+        } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
     }
     res.json({ status: b.status });
 });
@@ -350,8 +398,9 @@ function renderPage({ title, activeNav, content }) {
             <title>${title} - Tencent Innovations</title>
             <style>
                 :root { --primary: #0284c7; --bg: #0f172a; --text: #f8fafc; --muted: #94a3b8; --accent: #4ade80; }
-                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; flex-direction: column; min-height: 100vh; }
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; }
                 
+                /* Main Navigation Bar */
                 nav { background: #0b1120; border-bottom: 1px solid #334155; padding: 12px 30px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; }
                 .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
                 .logo-img { height: 48px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
@@ -362,6 +411,7 @@ function renderPage({ title, activeNav, content }) {
                 .nav-links a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.9rem; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
                 .nav-links a:hover, .nav-links a.active { color: white; background: #1e293b; }
                 
+                /* Hero Service Banner */
                 .hero-banner { 
                     background: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.85)), url('/banner.png');
                     background-size: cover;
@@ -374,17 +424,21 @@ function renderPage({ title, activeNav, content }) {
                 .hero-banner p { color: #e2e8f0; font-size: 1.15rem; margin-bottom: 20px; max-width: 800px; margin-left: auto; margin-right: auto; }
                 .ussd-badge { display: inline-block; background: #38bdf8; color: #0f172a; padding: 10px 22px; border-radius: 30px; font-weight: bold; font-size: 1.05rem; box-shadow: 0 4px 15px rgba(56, 189, 248, 0.3); }
 
-                .container { max-width: 900px; margin: 40px auto; padding: 0 20px; flex: 1; width: 100%; box-sizing: border-box; }
+                /* Layout & Content Flow */
+                .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
                 h2 { color: #38bdf8; font-size: 2rem; margin-top: 0; }
                 h3 { color: #38bdf8; margin-top: 30px; }
                 .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
                 .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; border-left: 3px solid var(--primary); padding-left: 15px; }
                 
+                /* Bullet & Feature Lists */
                 ul.feature-list { list-style: none; padding: 0; margin: 20px 0; }
                 ul.feature-list li { margin-bottom: 12px; padding-left: 28px; position: relative; font-size: 1.05rem; color: #f1f5f9; }
                 ul.feature-list li::before { content: "✔"; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
 
+                /* Call to Action & Forms Styling */
                 .cta-box { background: #1e293b; border: 1px solid #334155; padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; }
+                .cta-box p { font-size: 1.1rem; margin-top: 0; color: #f8fafc; }
                 .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; transition: background 0.2s; border: none; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
                 .cta-btn:hover { background: #0369a1; }
 
@@ -392,21 +446,15 @@ function renderPage({ title, activeNav, content }) {
                 .form-group { margin-bottom: 15px; }
                 .form-group label { display: block; margin-bottom: 5px; color: #38bdf8; font-weight: 500; }
                 .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #f8fafc; box-sizing: border-box; }
+                .form-group checkbox-group { display: flex; gap: 15px; flex-wrap: wrap; }
 
                 .contact-bar { background: #0b1120; border-top: 1px solid #334155; padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
                 .contact-bar strong { color: #38bdf8; }
-
-                .site-footer { background: #070b14; border-top: 1px solid #1e293b; color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; }
-                .footer-grid { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; margin-bottom: 40px; }
-                .footer-col h4 { color: #38bdf8; font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #1e293b; padding-bottom: 8px; }
-                .footer-links { list-style: none; padding: 0; margin: 0; }
-                .footer-links li { margin-bottom: 10px; }
-                .footer-links a { color: var(--muted); text-decoration: none; transition: color 0.2s; font-size: 0.95rem; }
-                .footer-links a:hover { color: #38bdf8; padding-left: 4px; }
-                .footer-bottom { max-width: 1000px; margin: 0 auto; border-top: 1px solid #1e293b; padding-top: 20px; text-align: center; font-size: 0.85rem; color: #64748b; }
+                footer { text-align: center; padding: 20px; color: var(--muted); font-size: 0.9rem; }
             </style>
         </head>
         <body>
+            <!-- Main Navigation Menu -->
             <nav>
                 <a href="/" class="logo-container">
                     <img src="/logo.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
@@ -434,46 +482,15 @@ function renderPage({ title, activeNav, content }) {
                 📍 <strong>Rangwe, Homa Bay County</strong> &nbsp;|&nbsp; 📞 <strong>0740 311 014</strong> &nbsp;|&nbsp; ✉️ <strong>tencentbz@gmail.com</strong>
             </div>
 
-            <footer class="site-footer">
-                <div class="footer-grid">
-                    <div class="footer-col">
-                        <h4>Find It Fast</h4>
-                        <ul class="footer-links">
-                            <li><a href="/wifi">WiFi & Hotspot Internet</a></li>
-                            <li><a href="/cctv">CCTV & Security Systems</a></li>
-                            <li><a href="/smart-locks">Smart Locks & Access Control</a></li>
-                            <li><a href="/electric-fence">Electric Fencing</a></li>
-                            <li><a href="/solar">Solar Backup Power</a></li>
-                            <li><a href="/survey">Site Surveys & Quotations</a></li>
-                        </ul>
-                    </div>
-                    <div class="footer-col">
-                        <h4>Customer Care</h4>
-                        <ul class="footer-links">
-                            <li><a href="/survey">Book an Engineer</a></li>
-                            <li><a href="tel:0740311014">Contact Us: 0740 311 014</a></li>
-                            <li><a href="mailto:tencentbz@gmail.com">Email Support</a></li>
-                            <li><a href="#callback-form">Request Callback</a></li>
-                            <li><a href="tel:*384*100#">USSD Quick Code (*384*100#)</a></li>
-                        </ul>
-                    </div>
-                    <div class="footer-col">
-                        <h4>Tencent Innovations</h4>
-                        <p style="font-size: 0.9rem; color: var(--muted); line-height: 1.5;">
-                            Empowering homes, schools, and businesses across Rangwe and Homa Bay County with integrated internet, reliable security, and clean solar backup power.
-                        </p>
-                    </div>
-                </div>
-                <div class="footer-bottom">
-                    <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations.</p>
-                </div>
+            <footer>
+                <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Secure USSD & Multi-Page Web Platform.</p>
             </footer>
         </body>
         </html>
     `;
 }
 
-// 1. Home Page
+// 1. Home Page (Includes Form #2: Quick Callback / Inquiry Form)
 app.get('/', (req, res) => {
     const content = `
         <div class="hero-banner" style="margin: -40px -20px 40px -20px;">
@@ -506,9 +523,18 @@ app.get('/', (req, res) => {
             <h3 style="margin-top:0; color:#38bdf8;">Request a Free Callback</h3>
             <p style="color:var(--muted); font-size:0.95rem;">Not sure where to start? Send us your details and an engineer will call you back shortly.</p>
             <form action="/submit-callback" method="POST">
-                <div class="form-group"><label>Your Name</label><input type="text" name="name" required placeholder="e.g. John Otieno"></div>
-                <div class="form-group"><label>Phone Number</label><input type="tel" name="phone" required placeholder="e.g. 0712345678"></div>
-                <div class="form-group"><label>Project / Problem Description</label><textarea name="message" rows="3" required placeholder="e.g. Need CCTV installed at my shop in Rangwe"></textarea></div>
+                <div class="form-group">
+                    <label>Your Name</label>
+                    <input type="text" name="name" required placeholder="e.g. John Otieno">
+                </div>
+                <div class="form-group">
+                    <label>Phone Number</label>
+                    <input type="tel" name="phone" required placeholder="e.g. 0712345678">
+                </div>
+                <div class="form-group">
+                    <label>Project / Problem Description</label>
+                    <textarea name="message" rows="3" required placeholder="e.g. Need CCTV installed at my shop in Rangwe"></textarea>
+                </div>
                 <button type="submit" class="cta-btn">Request Callback</button>
             </form>
         </div>
@@ -516,9 +542,16 @@ app.get('/', (req, res) => {
     res.send(renderPage({ title: 'Home', activeNav: 'home', content }));
 });
 
+// Handle Callback Submission (emails you instantly)
 app.post('/submit-callback', async (req, res) => {
     const { name, phone, message } = req.body;
-    await notify(`📞 Callback request: ${name || 'Unknown'}`, { Name: name, Phone: phone, Message: message });
+
+    await notify(`📞 Callback request: ${name || 'Unknown'}`, {
+        Name: name,
+        Phone: phone,
+        Message: message
+    });
+
     res.send(renderPage({
         title: 'Callback Requested',
         activeNav: 'home',
@@ -679,7 +712,7 @@ app.get('/electric-fence', (req, res) => {
     res.send(renderPage({ title: 'Electric Fence', activeNav: 'electric-fence', content }));
 });
 
-// 6. Solar Page
+// 6. Solar Page (Includes Form #3: Solar Load & Battery Sizing Form)
 app.get('/solar', (req, res) => {
     const content = `
         <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
@@ -709,11 +742,10 @@ app.get('/solar', (req, res) => {
 
         <div class="form-container">
             <h3 style="margin-top:0; color:#38bdf8;">Solar Load & Battery Sizing Request</h3>
-            <form action="/submit-survey-payment" method="POST">
-                <input type="hidden" name="service" value="Solar Consultation">
-                <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="e.g. Mary Akinyi"></div>
-                <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
-                <div class="form-group"><label>Property Type</label>
+            <p style="color:var(--muted); font-size:0.95rem;">Select your required equipment to get a custom sizing estimate.</p>
+            <form action="/submit-solar" method="POST">
+                <div class="form-group">
+                    <label>Property Type</label>
                     <select name="propertyType">
                         <option value="Home">Home</option>
                         <option value="Shop">Shop / Business</option>
@@ -721,15 +753,53 @@ app.get('/solar', (req, res) => {
                         <option value="Rental Compound">Rental Compound</option>
                     </select>
                 </div>
-                <div class="form-group"><label>Location</label><input type="text" name="location" required placeholder="e.g. Rangwe Town"></div>
-                <button type="submit" class="cta-btn">Pay KES 2,500 & Request Sizing</button>
+                <div class="form-group">
+                    <label>Equipment to Power (Check all that apply):</label>
+                    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 5px; color: #f1f5f9;">
+                        <label><input type="checkbox" name="equipment" value="Lights"> Lights & Phone Charging</label>
+                        <label><input type="checkbox" name="equipment" value="Router"> WiFi Router / Internet</label>
+                        <label><input type="checkbox" name="equipment" value="CCTV"> CCTV Cameras</label>
+                        <label><input type="checkbox" name="equipment" value="Fridge"> Refrigerator / Fridge</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Required Backup Duration</label>
+                    <select name="duration">
+                        <option value="4 Hours">4 Hours (Basic Outage)</option>
+                        <option value="8 Hours">8 Hours (Extended)</option>
+                        <option value="24/7 Off-Grid">24/7 Full Off-Grid</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Phone Number (M-Pesa)</label>
+                    <input type="tel" name="phone" required placeholder="e.g. 0712345678">
+                </div>
+                <button type="submit" class="cta-btn">Calculate & Get Solar Quote</button>
             </form>
         </div>
     `;
     res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
 });
 
-// 7. Surveys Page
+// Handle Solar Request Submission (emails you instantly)
+app.post('/submit-solar', async (req, res) => {
+    const { propertyType, equipment, duration, phone } = req.body;
+
+    await notify(`☀️ Solar request: ${propertyType || 'Unknown'} (${duration || 'n/a'})`, {
+        'Property type': propertyType,
+        Equipment: equipment,
+        'Backup duration': duration,
+        Phone: phone
+    });
+
+    res.send(renderPage({
+        title: 'Solar Sizing Request Received',
+        activeNav: 'solar',
+        content: `<h2>Solar Analysis in Progress</h2><p class="intro-text">We received your requirements for your <strong>${esc(propertyType)}</strong> with <strong>${esc(duration)}</strong> backup. Our solar engineers will compute your panel sizing and call <strong>${esc(phone)}</strong> with a precise quotation.</p><a href="/solar" class="cta-btn">Back to Solar</a>`
+    }));
+});
+
+// 7. Surveys Page (Includes Form #1: Direct M-PESA STK Push Booking & Form #4: Site Inspection Booking)
 app.get('/survey', (req, res) => {
     const content = `
         <h2>Know what your site needs before you spend.</h2>
@@ -765,13 +835,19 @@ app.get('/survey', (req, res) => {
 
         <div class="form-container" style="border-color: var(--accent);">
             <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will trigger an instant M-Pesa prompt on your phone for the survey fee.</p>
-            <form action="/submit-survey-payment" method="POST" id="payment-form">
-                <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="e.g. Mary Akinyi"></div>
-                <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
+            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will send an M-Pesa prompt to your phone for the fee shown next to the service you choose.</p>
+            <form action="/submit-survey-payment" method="POST">
+                <div class="form-group">
+                    <label>Full Name</label>
+                    <input type="text" name="name" required placeholder="e.g. Mary Akinyi">
+                </div>
+                <div class="form-group">
+                    <label>M-Pesa Phone Number</label>
+                    <input type="tel" name="phone" required placeholder="0712345678">
+                </div>
                 <div class="form-group">
                     <label>Service Category</label>
-                    <select name="service" id="service-select">
+                    <select name="service">
                         <option value="Site Survey & Quotation">General Site Survey (KES 1,500)</option>
                         <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 2,500)</option>
                         <option value="CCTV Installation">CCTV System Assessment (KES 2,000)</option>
@@ -780,7 +856,10 @@ app.get('/survey', (req, res) => {
                         <option value="Solar Consultation">Solar Consultation & Sizing (KES 2,500)</option>
                     </select>
                 </div>
-                <div class="form-group"><label>Physical Location / Address</label><input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay"></div>
+                <div class="form-group">
+                    <label>Physical Location / Address</label>
+                    <input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay">
+                </div>
                 <button type="submit" class="cta-btn" style="background: var(--accent); color: #0f172a;">Trigger M-Pesa Payment & Book Survey</button>
             </form>
         </div>
@@ -788,116 +867,92 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-// Safely redirect accidental GET requests on the payment route back to surveys
-app.get('/submit-survey-payment', (req, res) => {
-    res.redirect('/survey');
-});
-
-// Handle Payment Submission & STK Push (Universal for Surveys & Solar)
+// Handle Survey Booking + M-Pesa STK Push
 app.post('/submit-survey-payment', payLimiter, async (req, res) => {
-    const { name, phone: rawPhone, service, location, propertyType } = req.body;
-    const phone = normalizePhone(rawPhone);
+    const str = v => (typeof v === 'string' ? v.trim() : '');
+    const name = str(req.body.name).slice(0, 80);
+    const location = str(req.body.location).slice(0, 120);
+    const service = str(req.body.service);
+    const phone = normalizePhone(str(req.body.phone));
 
-    if (!name || !phone || !service || !location) {
-        return res.status(400).send(renderPage({
-            title: 'Missing Details',
-            activeNav: 'survey',
-            content: `<h2>Incomplete Form</h2><p class="intro-text">Please provide your name, a valid Safaricom phone number, service, and location.</p><a href="/survey" class="cta-btn">Back</a>`
-        }));
-    }
+    const problem = (message, status = 400) => res.status(status).send(renderPage({
+        title: 'Booking Problem',
+        activeNav: 'survey',
+        content: `<h2>We could not start your payment</h2><p class="intro-text">${esc(message)}</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
+    }));
 
-    if (!phoneAttemptAllowed(phone)) {
-        return res.status(429).send(renderPage({
-            title: 'Too Many Attempts',
-            activeNav: 'survey',
-            content: `<h2>Please Wait</h2><p class="intro-text">You have requested several payment prompts recently. Please check your phone or try again later.</p><a href="/survey" class="cta-btn">Back</a>`
-        }));
-    }
+    if (!name || !location) return problem('Please enter your name and location.');
+    if (!Object.hasOwn(SERVICE_PRICES, service)) return problem('Please choose a valid service.');
+    if (!phone) return problem('Please enter a valid Safaricom number, for example 0712345678.');
+    if (!phoneAttemptAllowed(phone)) return problem('Too many payment requests for this number. Please try again later.', 429);
 
-    const amount = SERVICE_PRICES[service] || 1500;
-    const bookingId = crypto.randomUUID();
-    const accountRef = `TI-${Math.floor(1000 + Math.random() * 9000)}`;
-
+    const id = crypto.randomBytes(8).toString('hex');
     const booking = {
-        id: bookingId,
-        name,
-        phone,
-        service,
-        location,
-        propertyType: propertyType || 'N/A',
-        amount,
-        accountRef,
+        id, name, phone, service, location,
+        amount: SERVICE_PRICES[service],            // price comes from the server, never from the form
         status: 'pending',
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        accountRef: 'TNC' + id.slice(0, 8).toUpperCase()
     };
-    bookings.set(bookingId, booking);
+    bookings.set(id, booking);
 
-    if (!MPESA.key || !MPESA.secret || !MPESA.shortcode || !MPESA.passkey || !MPESA.publicBaseUrl) {
-        await notify(`📝 PENDING (M-Pesa unconfigured): ${service} - ${name}`, bookingFields(booking));
-        return res.send(renderPage({
-            title: 'Booking Received',
-            activeNav: 'survey',
-            content: `
-                <h2>Booking Received!</h2>
-                <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our online M-Pesa gateway is currently in offline setup mode. An engineer has received your request for <strong>${esc(service)}</strong> in <strong>${esc(location)}</strong> and will call <strong>${esc(phone)}</strong> shortly.</p>
-                <a href="/" class="cta-btn">Back to Home</a>
-            `
-        }));
+    // Tell you about the lead right away, so it is never lost even if payment fails
+    notify(`📋 Survey booking (awaiting payment): ${name} - ${service}`, bookingFields(booking))
+        .catch(() => {});
+
+    if (!mpesaConfigured()) {
+        booking.status = 'failed';
+        console.error('M-Pesa is not fully configured (check MPESA_* variables and PUBLIC_BASE_URL).');
+        return problem('Online payment is not available right now. We have saved your request and will call you.', 503);
     }
 
     try {
-        const resStk = await stkPush(booking);
-        booking.checkoutRequestId = resStk.CheckoutRequestID;
-        byCheckout.set(resStk.CheckoutRequestID, booking);
-
-        await notify(`📱 STK sent: ${service} - ${name} (KES ${amount})`, bookingFields(booking));
-
-        res.send(renderPage({
-            title: 'Check Your Phone',
-            activeNav: 'survey',
-            content: `
-                <h2>Check Your Phone for M-Pesa</h2>
-                <p class="intro-text">An STK push for <strong>KES ${amount}</strong> has been sent to <strong>${esc(phone)}</strong> for <strong>${esc(service)}</strong>.</p>
-                <p>Please enter your M-Pesa PIN when the prompt appears on your screen.</p>
-                
-                <div id="status-box" style="background:#1e293b; border:1px solid #334155; padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
-                    <p id="status-text" style="font-weight:bold; color:#38bdf8;">Waiting for M-Pesa PIN confirmation...</p>
-                </div>
-
-                <script>
-                    async function checkStatus() {
-                        try {
-                            const r = await fetch('/payments/status/${bookingId}');
-                            const d = await r.json();
-                            if (d.status === 'paid') {
-                                document.getElementById('status-box').innerHTML = '<h3 style="color:#4ade80; margin:0;">Payment Confirmed Successfully!</h3><p>An engineer has been assigned and will call you shortly.</p><a href="/" class="cta-btn" style="margin-top:15px;">Return Home</a>';
-                                clearInterval(timer);
-                            } else if (d.status === 'failed') {
-                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">Payment Cancelled or Failed</h3><p>The transaction was not completed. Please try again.</p><a href="/survey" class="cta-btn" style="margin-top:15px;">Try Again</a>';
-                                clearInterval(timer);
-                            }
-                        } catch(e) {}
-                    }
-                    const timer = setInterval(checkStatus, 4000);
-                </script>
-            `
-        }));
+        const r = await stkPush(booking);
+        booking.checkoutRequestId = r.CheckoutRequestID;
+        booking.merchantRequestId = r.MerchantRequestID;
+        byCheckout.set(r.CheckoutRequestID, booking);
     } catch (err) {
-        booking.status = 'error';
-        console.error('STK Push Error:', err.message);
-        res.status(500).send(renderPage({
-            title: 'Payment Error',
-            activeNav: 'survey',
-            content: `
-                <h2>Could Not Send M-Pesa Prompt</h2>
-                <p class="intro-text">We encountered an error contacting Safaricom: ${esc(err.message)}. Please check your phone number or use our USSD code <strong>*384*100#</strong>.</p>
-                <a href="/survey" class="cta-btn">Try Again</a>
-            `
-        }));
+        console.error('STK push failed:', err.message);
+        booking.status = 'failed';
+        return problem('We could not send the M-Pesa prompt. Please check your number and try again, or call us on 0740 311 014.', 502);
     }
+
+    res.send(renderPage({
+        title: 'Check Your Phone',
+        activeNav: 'survey',
+        content: `
+            <h2>Check your phone</h2>
+            <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa prompt for <strong>KES ${booking.amount}</strong> has been sent to <strong>${esc(phone)}</strong>. Enter your M-Pesa PIN to pay.</p>
+            <p id="pay-status" class="sub-title">Waiting for your payment...</p>
+            <a href="/survey" class="cta-btn">Back to Surveys</a>
+            <script>
+            (function () {
+                var id = ${JSON.stringify(id)}, tries = 0, box = document.getElementById('pay-status');
+                function poll() {
+                    tries++;
+                    fetch('/payments/status/' + id).then(function (r) { return r.json(); }).then(function (d) {
+                        if (d.status === 'paid') {
+                            box.textContent = 'Payment received. Thank you! An engineer will call you to schedule the visit.';
+                        } else if (d.status === 'failed') {
+                            box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
+                        } else if (d.status === 'review') {
+                            box.textContent = 'We are confirming your payment and will call you shortly.';
+                        } else if (tries < 40) {
+                            setTimeout(poll, 4000);
+                        } else {
+                            box.textContent = 'We have not seen the payment yet. If you paid, we will confirm and call you.';
+                        }
+                    }).catch(function () {
+                        if (tries < 40) setTimeout(poll, 4000);
+                    });
+                }
+                setTimeout(poll, 4000);
+            })();
+            </script>`
+    }));
 });
 
-// USSD Endpoint
+// 8. USSD Endpoint
 app.post('/ussd', (req, res) => {
     const { text, phoneNumber } = req.body;
     let response = '';
@@ -939,4 +994,4 @@ app.post('/ussd', (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Tencent Innovations server with interactive forms running on port ${PORT}`));
