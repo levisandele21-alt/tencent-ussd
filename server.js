@@ -483,7 +483,7 @@ function renderPage({ title, activeNav, content }) {
             </div>
 
             <footer>
-                <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Secure USSD & Multi-Page Web Platform.</p>
+                <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform.</p>
             </footer>
         </body>
         </html>
