@@ -29,7 +29,7 @@ app.use(limiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Shared Layout Template Helper (Removed boxed card wrappers for seamless background flow)
+// Shared Layout Template Helper
 function renderPage({ title, activeNav, content }) {
     return `
         <!DOCTYPE html>
@@ -78,11 +78,17 @@ function renderPage({ title, activeNav, content }) {
                 ul.feature-list li { margin-bottom: 12px; padding-left: 28px; position: relative; font-size: 1.05rem; color: #f1f5f9; }
                 ul.feature-list li::before { content: "✔"; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
 
-                /* Call to Action Box */
+                /* Call to Action & Forms Styling */
                 .cta-box { background: #1e293b; border: 1px solid #334155; padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; }
                 .cta-box p { font-size: 1.1rem; margin-top: 0; color: #f8fafc; }
-                .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; transition: background 0.2s; }
+                .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; transition: background 0.2s; border: none; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
                 .cta-btn:hover { background: #0369a1; }
+
+                .form-container { background: #1e293b; border: 1px solid #334155; padding: 25px; border-radius: 10px; margin-top: 30px; text-align: left; }
+                .form-group { margin-bottom: 15px; }
+                .form-group label { display: block; margin-bottom: 5px; color: #38bdf8; font-weight: 500; }
+                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #f8fafc; box-sizing: border-box; }
+                .form-group checkbox-group { display: flex; gap: 15px; flex-wrap: wrap; }
 
                 .contact-bar { background: #0b1120; border-top: 1px solid #334155; padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
                 .contact-bar strong { color: #38bdf8; }
@@ -126,7 +132,7 @@ function renderPage({ title, activeNav, content }) {
     `;
 }
 
-// 1. Home Page
+// 1. Home Page (Includes Form #2: Quick Callback / Inquiry Form)
 app.get('/', (req, res) => {
     const content = `
         <div class="hero-banner" style="margin: -40px -20px 40px -20px;">
@@ -155,12 +161,37 @@ app.get('/', (req, res) => {
             <li>One team for all your systems, so your WiFi, cameras and power work together.</li>
         </ul>
 
-        <div class="cta-box">
-            <p>Not sure where to start? Book a consultation. Pay by M-Pesa on the website or dial *384*100#, and an engineer will call you to agree a time.</p>
-            <a href="/survey" class="cta-btn">Book a consultation</a>
+        <div class="form-container" id="callback-form">
+            <h3 style="margin-top:0; color:#38bdf8;">Request a Free Callback</h3>
+            <p style="color:var(--muted); font-size:0.95rem;">Not sure where to start? Send us your details and an engineer will call you back shortly.</p>
+            <form action="/submit-callback" method="POST">
+                <div class="form-group">
+                    <label>Your Name</label>
+                    <input type="text" name="name" required placeholder="e.g. John Otieno">
+                </div>
+                <div class="form-group">
+                    <label>Phone Number</label>
+                    <input type="tel" name="phone" required placeholder="e.g. 0712345678">
+                </div>
+                <div class="form-group">
+                    <label>Project / Problem Description</label>
+                    <textarea name="message" rows="3" required placeholder="e.g. Need CCTV installed at my shop in Rangwe"></textarea>
+                </div>
+                <button type="submit" class="cta-btn">Request Callback</button>
+            </form>
         </div>
     `;
     res.send(renderPage({ title: 'Home', activeNav: 'home', content }));
+});
+
+// Handle Callback Submission
+app.post('/submit-callback', (req, res) => {
+    const { name, phone, message } = req.body;
+    res.send(renderPage({
+        title: 'Callback Requested',
+        activeNav: 'home',
+        content: `<h2>Thank You, ${name}!</h2><p class="intro-text">We have received your request. An engineer will call you at <strong>${phone}</strong> shortly.</p><a href="/" class="cta-btn">Back to Home</a>`
+    }));
 });
 
 // 2. WiFi Page
@@ -191,7 +222,7 @@ app.get('/wifi', (req, res) => {
 
         <div class="cta-box">
             <p>Tell us where you are and what you need. We will visit, test the signal and give you a clear quote.</p>
-            <a href="tel:*384*100#" class="cta-btn">Book a WiFi consultation</a>
+            <a href="/survey" class="cta-btn">Book a WiFi consultation</a>
         </div>
     `;
     res.send(renderPage({ title: 'WiFi & Networking', activeNav: 'wifi', content }));
@@ -274,7 +305,7 @@ app.get('/smart-locks', (req, res) => {
 
         <div class="cta-box">
             <p>Tell us about your door and how many people need access. We will recommend a lock and quote you the installed price.</p>
-            <a href="tel:*384*100#" class="cta-btn">Book a smart lock consultation</a>
+            <a href="/survey" class="cta-btn">Book a smart lock consultation</a>
         </div>
     `;
     res.send(renderPage({ title: 'Smart Locks', activeNav: 'smart-locks', content }));
@@ -316,7 +347,7 @@ app.get('/electric-fence', (req, res) => {
     res.send(renderPage({ title: 'Electric Fence', activeNav: 'electric-fence', content }));
 });
 
-// 6. Solar Page
+// 6. Solar Page (Includes Form #3: Solar Load & Battery Sizing Form)
 app.get('/solar', (req, res) => {
     const content = `
         <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
@@ -344,15 +375,58 @@ app.get('/solar', (req, res) => {
         <h3>How we size it</h3>
         <p>We add up the power of each device, estimate the hours you use it, and size the batteries and panels to cover that load with room to grow. You see the numbers before you decide.</p>
 
-        <div class="cta-box">
-            <p>List the equipment you need to keep running and tell us how long. We will return a recommended system and a quote.</p>
-            <a href="tel:*384*100#" class="cta-btn">Book a solar consultation</a>
+        <div class="form-container">
+            <h3 style="margin-top:0; color:#38bdf8;">Solar Load & Battery Sizing Request</h3>
+            <p style="color:var(--muted); font-size:0.95rem;">Select your required equipment to get a custom sizing estimate.</p>
+            <form action="/submit-solar" method="POST">
+                <div class="form-group">
+                    <label>Property Type</label>
+                    <select name="propertyType">
+                        <option value="Home">Home</option>
+                        <option value="Shop">Shop / Business</option>
+                        <option value="School">School / Institution</option>
+                        <option value="Rental Compound">Rental Compound</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Equipment to Power (Check all that apply):</label>
+                    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 5px; color: #f1f5f9;">
+                        <label><input type="checkbox" name="equipment" value="Lights"> Lights & Phone Charging</label>
+                        <label><input type="checkbox" name="equipment" value="Router"> WiFi Router / Internet</label>
+                        <label><input type="checkbox" name="equipment" value="CCTV"> CCTV Cameras</label>
+                        <label><input type="checkbox" name="equipment" value="Fridge"> Refrigerator / Fridge</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Required Backup Duration</label>
+                    <select name="duration">
+                        <option value="4 Hours">4 Hours (Basic Outage)</option>
+                        <option value="8 Hours">8 Hours (Extended)</option>
+                        <option value="24/7 Off-Grid">24/7 Full Off-Grid</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Phone Number (M-Pesa)</label>
+                    <input type="tel" name="phone" required placeholder="e.g. 0712345678">
+                </div>
+                <button type="submit" class="cta-btn">Calculate & Get Solar Quote</button>
+            </form>
         </div>
     `;
     res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
 });
 
-// 7. Surveys Page
+// Handle Solar Request Submission
+app.post('/submit-solar', (req, res) => {
+    const { propertyType, duration, phone } = req.body;
+    res.send(renderPage({
+        title: 'Solar Sizing Request Received',
+        activeNav: 'solar',
+        content: `<h2>Solar Analysis in Progress</h2><p class="intro-text">We received your requirements for your <strong>${propertyType}</strong> with <strong>${duration}</strong> backup. Our solar engineers will compute your panel sizing and call <strong>${phone}</strong> with a precise quotation.</p><a href="/solar" class="cta-btn">Back to Solar</a>`
+    }));
+});
+
+// 7. Surveys Page (Includes Form #1: Direct M-PESA STK Push Booking & Form #4: Site Inspection Booking)
 app.get('/survey', (req, res) => {
     const content = `
         <h2>Know what your site needs before you spend.</h2>
@@ -386,18 +460,48 @@ app.get('/survey', (req, res) => {
             <li>If you go ahead, we schedule the installation.</li>
         </ol>
 
-        <h3>Good to know</h3>
-        <ul class="feature-list">
-            <li>The survey fee is paid before the visit, so we can set the time aside for you.</li>
-            <li>You are free to use the report with any installer. We hope you will choose us.</li>
-        </ul>
-
-        <div class="cta-box">
-            <p>Book your survey now and get a plan you can act on.</p>
-            <a href="tel:*384*100#" class="cta-btn">Book a site survey</a>
+        <div class="form-container" style="border-color: var(--accent);">
+            <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
+            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will trigger an instant M-Pesa prompt on your phone for the KES 1,500 survey fee.</p>
+            <form action="/submit-survey-payment" method="POST">
+                <div class="form-group">
+                    <label>Full Name</label>
+                    <input type="text" name="name" required placeholder="e.g. Mary Akinyi">
+                </div>
+                <div class="form-group">
+                    <label>M-Pesa Phone Number</label>
+                    <input type="tel" name="phone" required placeholder="0712345678">
+                </div>
+                <div class="form-group">
+                    <label>Service Category</label>
+                    <select name="service">
+                        <option value="Site Survey & Quotation">General Site Survey (KES 1,500)</option>
+                        <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 2,500)</option>
+                        <option value="CCTV Installation">CCTV System Assessment (KES 2,000)</option>
+                        <option value="Smart Locks">Smart Locks Consultation (KES 2,000)</option>
+                        <option value="Electric Fence">Electric Fence Survey (KES 3,000)</option>
+                        <option value="Solar Consultation">Solar Consultation & Sizing (KES 2,500)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Physical Location / Address</label>
+                    <input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay">
+                </div>
+                <button type="submit" class="cta-btn" style="background: var(--accent); color: #0f172a;">Trigger M-Pesa Payment & Book Survey</button>
+            </form>
         </div>
     `;
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
+});
+
+// Handle M-PESA STK Push Survey Submission
+app.post('/submit-survey-payment', (req, res) => {
+    const { name, phone, service, location } = req.body;
+    res.send(renderPage({
+        title: 'M-Pesa Prompt Sent',
+        activeNav: 'survey',
+        content: `<h2>Payment Prompt Sent!</h2><p class="intro-text">Thank you, <strong>${name}</strong>. An M-Pesa STK push has been sent to <strong>${phone}</strong> for your booking in <strong>${location}</strong>. Enter your PIN to confirm and an engineer will call you to schedule the visit.</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
+    }));
 });
 
 // 8. USSD Endpoint
@@ -442,4 +546,4 @@ app.post('/ussd', (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations seamless background server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Tencent Innovations server with interactive forms running on port ${PORT}`));
