@@ -35,8 +35,12 @@ app.use(express.urlencoded({ extended: true }));
 // Required env vars on Render: GMAIL_USER, GMAIL_APP_PASSWORD
 // Optional: NOTIFY_TO (defaults to GMAIL_USER)
 // ---------------------------------------------------------------
+// Short timeouts so a blocked SMTP connection (Render free tier) cannot hang the form.
 const mailer = nodemailer.createTransport({
     service: 'gmail',
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 10000,
     auth: {
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_APP_PASSWORD
@@ -72,18 +76,39 @@ async function notify(subject, fields) {
         .join('');
     const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
-    try {
+    // Always log the lead first, so it is in Render logs whatever happens next
+    console.log('LEAD:', JSON.stringify({ subject: cleanSubject, fields, time }));
+
+    // Telegram (HTTPS, works on Render free tier)
+    // Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    const sendTelegram = async () => {
+        if (!process.env.TELEGRAM_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
+        const lines = Object.entries(fields).map(([label, val]) => `${label}: ${flat(val)}`);
+        const text = `${cleanSubject}\n\n${lines.join('\n')}\n\n${time} (EAT)`.slice(0, 4000);
+        const resp = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text }),
+            signal: AbortSignal.timeout(8000)
+        });
+        if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
+    };
+
+    // Email (needs SMTP: blocked on Render free tier, works on paid instances)
+    const sendEmail = async () => {
+        if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
         await mailer.sendMail({
             from: `"Tencent Website" <${process.env.GMAIL_USER}>`,
             to: process.env.NOTIFY_TO || process.env.GMAIL_USER,
             subject: cleanSubject,
             html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`
         });
-    } catch (err) {
-        console.error('Notification email failed:', err.message);
-        // Keep the lead in Render logs so it is never lost
-        console.log('LEAD (email failed):', JSON.stringify({ subject: cleanSubject, fields, time }));
-    }
+    };
+
+    // Run both in parallel; one failing never blocks the other or the customer's page
+    const results = await Promise.allSettled([sendTelegram(), sendEmail()]);
+    if (results[0].status === 'rejected') console.error('Telegram notification failed:', results[0].reason && results[0].reason.message);
+    if (results[1].status === 'rejected') console.error('Notification email failed:', results[1].reason && results[1].reason.message);
 }
 
 // Shared Layout Template Helper
