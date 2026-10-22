@@ -123,19 +123,6 @@ async function notify(subject, fields) {
 
 // ---------------------------------------------------------------
 // M-Pesa (Daraja) STK Push for a PAYBILL shortcode
-//
-// Env vars on Render:
-//   MPESA_ENV               sandbox (default) or production
-//   MPESA_CONSUMER_KEY      from the Daraja portal
-//   MPESA_CONSUMER_SECRET   from the Daraja portal
-//   MPESA_SHORTCODE         sandbox test shortcode, later your Paybill number
-//   MPESA_PASSKEY           sandbox test passkey, later your production passkey
-//   MPESA_CALLBACK_SECRET   a long random string (32+ characters) you invent
-//   PUBLIC_BASE_URL         https://tencentinnovations.onrender.com (no trailing slash)
-//
-// NOTE: bookings are kept in memory. They are lost when the server restarts,
-// so add a database before relying on this for real money. Every lead and
-// every confirmed payment is also sent to you by Telegram/email.
 // ---------------------------------------------------------------
 const MPESA = {
     production: process.env.MPESA_ENV === 'production',
@@ -146,7 +133,6 @@ const MPESA = {
     callbackSecret: process.env.MPESA_CALLBACK_SECRET,
     publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
 };
-// MPESA_BASE_URL exists only so tests can point at a mock server
 MPESA.baseUrl = process.env.MPESA_BASE_URL ||
     (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
 
@@ -158,7 +144,6 @@ function mpesaConfigured() {
     );
 }
 
-// The server decides the price. The form only says which service was chosen.
 const SERVICE_PRICES = {
     'Site Survey & Quotation': 3000,
     'WiFi Setup': 3000,
@@ -168,7 +153,6 @@ const SERVICE_PRICES = {
     'Solar Consultation': 4000
 };
 
-// Accepts 0712345678, 712345678, 254712345678, +254712345678 (and 01xx numbers)
 function normalizePhone(raw) {
     let p = String(raw || '').replace(/[\s\-()]/g, '');
     if (p.startsWith('+')) p = p.slice(1);
@@ -177,10 +161,9 @@ function normalizePhone(raw) {
     return /^254[17]\d{8}$/.test(p) ? p : null;
 }
 
-// In-memory stores
-const bookings = new Map();      // booking id -> booking
-const byCheckout = new Map();    // CheckoutRequestID -> booking
-const phoneAttempts = new Map(); // phone -> [timestamps]
+const bookings = new Map();
+const byCheckout = new Map();
+const phoneAttempts = new Map();
 
 function phoneAttemptAllowed(phone) {
     const now = Date.now();
@@ -191,7 +174,6 @@ function phoneAttemptAllowed(phone) {
     return true;
 }
 
-// Tidy old data every 30 minutes
 setInterval(() => {
     const now = Date.now();
     for (const [id, b] of bookings) {
@@ -223,7 +205,6 @@ async function getAccessToken() {
     return tokenCache.value;
 }
 
-// Daraja timestamps are YYYYMMDDHHmmss in Nairobi time (UTC+3)
 function darajaTimestamp() {
     return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
 }
@@ -240,7 +221,7 @@ async function darajaPost(path, payload) {
         signal: AbortSignal.timeout(20000)
     });
     let data = {};
-    try { data = await resp.json(); } catch (_) { /* non-JSON body */ }
+    try { data = await resp.json(); } catch (_) {}
     if (!resp.ok) {
         const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
         err.status = resp.status;
@@ -260,13 +241,12 @@ async function stkPush(booking) {
         PartyA: booking.phone,
         PartyB: MPESA.shortcode,
         PhoneNumber: booking.phone,
-        // Path avoids words like "mpesa"/"safaricom", which Safaricom may reject in callback URLs
         CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: booking.accountRef,   // max 12 chars; shows as the Paybill account number
+        AccountReference: booking.accountRef,
         TransactionDesc: 'Survey fee'
     });
     if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
-    return data; // contains MerchantRequestID and CheckoutRequestID
+    return data;
 }
 
 async function stkQuery(checkoutRequestId) {
@@ -292,7 +272,7 @@ function bookingFields(b, extra = {}) {
 }
 
 async function markPaid(booking, receipt, verified) {
-    if (booking.status === 'paid') return;   // idempotent: duplicate callbacks do nothing
+    if (booking.status === 'paid') return;
     booking.status = 'paid';
     booking.receipt = receipt || '';
     booking.paidAt = Date.now();
@@ -312,10 +292,7 @@ async function handleCallback(body) {
     const cb = body && body.Body && body.Body.stkCallback;
     if (!cb) return;
     const booking = byCheckout.get(cb.CheckoutRequestID);
-    if (!booking) {
-        console.log('Callback for unknown CheckoutRequestID:', cb.CheckoutRequestID);
-        return;
-    }
+    if (!booking) return;
 
     const succeeded = Number(cb.ResultCode) === 0;
     const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
@@ -328,7 +305,6 @@ async function handleCallback(body) {
     }
     if (!succeeded) { markFailed(booking, cb.ResultDesc); return; }
 
-    // The amount paid must match the price we asked for
     if (Number(meta('Amount')) !== booking.amount) {
         booking.status = 'review';
         await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
@@ -338,7 +314,6 @@ async function handleCallback(body) {
         return;
     }
 
-    // Do not trust the callback alone: ask Safaricom directly
     let verified = false;
     try {
         const q = await stkQuery(booking.checkoutRequestId);
@@ -357,20 +332,16 @@ async function handleCallback(body) {
     await markPaid(booking, receipt, verified);
 }
 
-// Safaricom calls this when the customer pays, cancels or times out.
-// The secret in the URL stops strangers from posting fake "payments".
 app.post('/payments/cb/:secret', (req, res) => {
     const given = Buffer.from(String(req.params.secret));
     const expected = Buffer.from(String(MPESA.callbackSecret || ''));
     const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
     if (!ok) return res.sendStatus(404);
 
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     handleCallback(req.body).catch(err => console.error('Callback handling error:', err.message));
 });
 
-// The "Check your phone" page polls this. If the callback never arrives
-// (for example the server was asleep), it asks Safaricom directly.
 app.get('/payments/status/:id', async (req, res) => {
     const b = bookings.get(String(req.params.id));
     if (!b) return res.status(404).json({ status: 'unknown' });
@@ -382,35 +353,69 @@ app.get('/payments/status/:id', async (req, res) => {
             const q = await stkQuery(b.checkoutRequestId);
             if (String(q.ResultCode) === '0') await markPaid(b, '', true);
             else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') markFailed(b, q.ResultDesc);
-        } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
+        } catch (_) {}
     }
     res.json({ status: b.status });
 });
 
-// Shared Layout Template Helper
+// Shared Layout Template Helper with Theme Support
 function renderPage({ title, activeNav, content }) {
     return `
         <!DOCTYPE html>
-        <html lang="en">
+        <html lang="en" data-theme="dark">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>${title} - Tencent Innovations</title>
+            <script>
+                // Prevent flash of wrong theme on load
+                (function() {
+                    const savedTheme = localStorage.getItem('theme') || 'dark';
+                    document.documentElement.setAttribute('data-theme', savedTheme);
+                })();
+            </script>
             <style>
-                :root { --primary: #0284c7; --bg: #0f172a; --text: #f8fafc; --muted: #94a3b8; --accent: #4ade80; }
-                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; }
+                /* Theme Variables */
+                :root {
+                    --bg: #0f172a;
+                    --surface: #1e293b;
+                    --nav-bg: #0b1120;
+                    --text: #f8fafc;
+                    --muted: #94a3b8;
+                    --border: #334155;
+                    --primary: #0284c7;
+                    --accent: #4ade80;
+                    --card-hover: #1e293b;
+                }
+                [data-theme="light"] {
+                    --bg: #f8fafc;
+                    --surface: #ffffff;
+                    --nav-bg: #ffffff;
+                    --text: #0f172a;
+                    --muted: #64748b;
+                    --border: #cbd5e1;
+                    --primary: #0284c7;
+                    --accent: #16a34a;
+                    --card-hover: #f1f5f9;
+                }
+
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; transition: background 0.3s, color 0.3s; }
                 
                 /* Main Navigation Bar */
-                nav { background: #0b1120; border-bottom: 1px solid #334155; padding: 12px 30px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; }
+                nav { background: var(--nav-bg); border-bottom: 1px solid var(--border); padding: 12px 30px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; transition: background 0.3s, border-color 0.3s; }
                 .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
                 .logo-img { height: 48px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
                 .logo-text-group { display: flex; flex-direction: column; }
                 .logo-text { font-size: 1.25rem; font-weight: bold; color: #38bdf8; text-decoration: none; line-height: 1.1; }
                 .logo-tagline { font-size: 0.75rem; color: var(--muted); }
-                .nav-links { display: flex; gap: 8px; list-style: none; margin: 0; padding: 0; flex-wrap: wrap; }
+                .nav-links { display: flex; gap: 8px; list-style: none; margin: 0; padding: 0; align-items: center; flex-wrap: wrap; }
                 .nav-links a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.9rem; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
-                .nav-links a:hover, .nav-links a.active { color: white; background: #1e293b; }
+                .nav-links a:hover, .nav-links a.active { color: var(--text); background: var(--surface); }
                 
+                /* Theme Toggle Button */
+                .theme-toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
+                .theme-toggle-btn:hover { background: var(--surface); }
+
                 /* Hero Service Banner */
                 .hero-banner { 
                     background: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.85)), url('/banner.png');
@@ -418,7 +423,7 @@ function renderPage({ title, activeNav, content }) {
                     background-position: center;
                     padding: 60px 20px; 
                     text-align: center; 
-                    border-bottom: 1px solid #334155; 
+                    border-bottom: 1px solid var(--border); 
                 }
                 .hero-banner h1 { font-size: 2.3rem; margin: 0 0 10px 0; color: #ffffff; }
                 .hero-banner p { color: #e2e8f0; font-size: 1.15rem; margin-bottom: 20px; max-width: 800px; margin-left: auto; margin-right: auto; }
@@ -426,40 +431,39 @@ function renderPage({ title, activeNav, content }) {
 
                 /* Layout & Content Flow */
                 .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
-                h2 { color: #38bdf8; font-size: 2rem; margin-top: 0; }
-                h3 { color: #38bdf8; margin-top: 30px; }
+                h2 { color: var(--primary); font-size: 2rem; margin-top: 0; }
+                h3 { color: var(--primary); margin-top: 30px; }
                 .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
-                .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; }
+                .intro-text { font-size: 1.1rem; color: var(--text); margin-bottom: 25px; }
                 
                 /* Bullet & Feature Lists */
                 ul.feature-list { list-style: none; padding: 0; margin: 20px 0; }
-                ul.feature-list li { margin-bottom: 12px; padding-left: 28px; position: relative; font-size: 1.05rem; color: #f1f5f9; }
+                ul.feature-list li { margin-bottom: 12px; padding-left: 28px; position: relative; font-size: 1.05rem; color: var(--text); }
                 ul.feature-list li::before { content: "✔"; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
 
                 /* Call to Action & Forms Styling */
-                .cta-box { background: #1e293b; border: 1px solid #334155; padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; }
-                .cta-box p { font-size: 1.1rem; margin-top: 0; color: #f8fafc; }
+                .cta-box { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; transition: background 0.3s, border-color 0.3s; }
+                .cta-box p { font-size: 1.1rem; margin-top: 0; color: var(--text); }
                 .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; transition: background 0.2s; border: none; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
                 .cta-btn:hover { background: #0369a1; }
 
-                .form-container { background: #1e293b; border: 1px solid #334155; padding: 25px; border-radius: 10px; margin-top: 30px; text-align: left; }
+                .form-container { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 30px; text-align: left; transition: background 0.3s, border-color 0.3s; }
                 .form-group { margin-bottom: 15px; }
-                .form-group label { display: block; margin-bottom: 5px; color: #38bdf8; font-weight: 500; }
-                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #f8fafc; box-sizing: border-box; }
-                .form-group checkbox-group { display: flex; gap: 15px; flex-wrap: wrap; }
+                .form-group label { display: block; margin-bottom: 5px; color: var(--primary); font-weight: 500; }
+                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; transition: background 0.3s, color 0.3s, border-color 0.3s; }
 
-                .contact-bar { background: #0b1120; border-top: 1px solid #334155; padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
-                .contact-bar strong { color: #38bdf8; }
+                .contact-bar { background: var(--nav-bg); border-top: 1px solid var(--border); padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; transition: background 0.3s, border-color 0.3s; }
+                .contact-bar strong { color: var(--primary); }
 
                 /* Footer Styling */
-                .site-footer { background: #070b14; border-top: 1px solid #1e293b; color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; }
+                .site-footer { background: var(--nav-bg); border-top: 1px solid var(--border); color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; transition: background 0.3s, border-color 0.3s; }
                 .footer-grid { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; margin-bottom: 40px; }
-                .footer-col h4 { color: #38bdf8; font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #1e293b; padding-bottom: 8px; }
+                .footer-col h4 { color: var(--primary); font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); padding-bottom: 8px; }
                 .footer-links { list-style: none; padding: 0; margin: 0; }
                 .footer-links li { margin-bottom: 10px; }
                 .footer-links a { color: var(--muted); text-decoration: none; transition: color 0.2s; font-size: 0.95rem; }
-                .footer-links a:hover { color: #38bdf8; padding-left: 4px; }
-                .footer-bottom { max-width: 1000px; margin: 0 auto; border-top: 1px solid #1e293b; padding-top: 20px; text-align: center; font-size: 0.85rem; color: #64748b; }
+                .footer-links a:hover { color: var(--primary); padding-left: 4px; }
+                .footer-bottom { max-width: 1000px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 20px; text-align: center; font-size: 0.85rem; color: var(--muted); }
             </style>
         </head>
         <body>
@@ -481,6 +485,11 @@ function renderPage({ title, activeNav, content }) {
                     <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">Solar</a></li>
                     <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">Surveys</a></li>
                     <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">Terms</a></li>
+                    <li>
+                        <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle Theme">
+                            <span id="theme-icon">☀️</span> <span id="theme-text">Light</span>
+                        </button>
+                    </li>
                 </ul>
             </nav>
 
@@ -528,12 +537,37 @@ function renderPage({ title, activeNav, content }) {
                     <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform. | <a href="/terms" style="color: var(--muted); text-decoration: underline;">Terms and Conditions</a></p>
                 </div>
             </footer>
+
+            <script>
+                function updateThemeUI(theme) {
+                    const icon = document.getElementById('theme-icon');
+                    const text = document.getElementById('theme-text');
+                    if (theme === 'light') {
+                        if (icon) icon.textContent = '🌙';
+                        if (text) text.textContent = 'Dark';
+                    } else {
+                        if (icon) icon.textContent = '☀️';
+                        if (text) text.textContent = 'Light';
+                    }
+                }
+
+                const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+                updateThemeUI(currentTheme);
+
+                document.getElementById('theme-toggle').addEventListener('click', () => {
+                    const current = document.documentElement.getAttribute('data-theme') || 'dark';
+                    const next = current === 'dark' ? 'light' : 'dark';
+                    document.documentElement.setAttribute('data-theme', next);
+                    localStorage.setItem('theme', next);
+                    updateThemeUI(next);
+                });
+            </script>
         </body>
         </html>
     `;
 }
 
-// 1. Home Page (Includes Form #2: Quick Callback / Inquiry Form)
+// 1. Home Page
 app.get('/', (req, res) => {
     const content = `
         <div class="hero-banner" style="margin: -40px -20px 40px -20px;">
@@ -563,7 +597,7 @@ app.get('/', (req, res) => {
         </ul>
 
         <div class="form-container" id="callback-form">
-            <h3 style="margin-top:0; color:#38bdf8;">Request a Free Callback</h3>
+            <h3 style="margin-top:0; color:var(--primary);">Request a Free Callback</h3>
             <p style="color:var(--muted); font-size:0.95rem;">Not sure where to start? Send us your details and an engineer will call you back shortly.</p>
             <form action="/submit-callback" method="POST">
                 <div class="form-group">
@@ -585,7 +619,7 @@ app.get('/', (req, res) => {
     res.send(renderPage({ title: 'Home', activeNav: 'home', content }));
 });
 
-// Handle Callback Submission (emails you instantly)
+// Handle Callback Submission
 app.post('/submit-callback', async (req, res) => {
     const { name, phone, message } = req.body;
 
@@ -655,7 +689,7 @@ app.get('/cctv', (req, res) => {
         </ul>
 
         <h3>How it works</h3>
-        <ol style="color: #f1f5f9; padding-left: 20px; line-height: 1.8;">
+        <ol style="color: var(--text); padding-left: 20px; line-height: 1.8;">
             <li>We visit and walk the site with you.</li>
             <li>You receive a camera layout and a written quote.</li>
             <li>We install, test every camera and set up your phone.</li>
@@ -756,14 +790,14 @@ app.get('/terms', (req, res) => {
         </ul>
 
         <h3>4. Acceptable Use</h3>
-        <p style="color: #f1f5f9;">The Service may not be used to:</p>
+        <p style="color: var(--text);">The Service may not be used to:</p>
         <ul class="feature-list">
             <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred[cite: 8];</li>
             <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system[cite: 8];</li>
             <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users[cite: 8];</li>
             <li>Impersonate another person or misrepresent your affiliation in connection with the Service[cite: 8].</li>
         </ul>
-        <p style="color: #f1f5f9;">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities[cite: 8].</p>
+        <p style="color: var(--text);">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities[cite: 8].</p>
 
         <h3>5. Equipment (CPE)</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
@@ -774,55 +808,31 @@ app.get('/terms', (req, res) => {
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service (for example, a Customer-owned router under a Commercial/Rental WiFi installation), that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company[cite: 8].</li>
         </ul>
 
-        <h3>6. Installation Services (CCTV, Electric Fence, Solar Standby, Fingerprint Door Locks)</h3>
+        <h3>6. Installation Services</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice[cite: 9]. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear[cite: 9]. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss, and accepts no liability for such incidents[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.4</strong> Solar standby systems are sized to the load and backup duration agreed with the Customer at the point of sale. Connecting additional appliances beyond the agreed load may reduce backup duration or damage the system, and is done at the Customer's own risk[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.5</strong> CCTV, electric fence, solar standby, and fingerprint door lock installation services are offered nationwide across Kenya, subject to logistics and travel costs for sites outside the Company's normal service radius, communicated to the Customer at the point of quotation[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.6</strong> Fingerprint door locks are powered by internal batteries. The Customer is responsible for replacing batteries as needed and for keeping any backup mechanical key or master code safe. Loss of access due to depleted batteries, lost backup keys or codes, or manufacturer firmware issues is not covered by the workmanship warranty[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss[cite: 9].</li>
         </ul>
 
         <h3>7. Service Availability</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service[cite: 9]. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.2</strong> Where practical, the Company will give advance notice of planned maintenance that is expected to interrupt Service[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.3</strong> The Company is not liable for losses arising from Service interruption, including business losses, except where caused by the Company's proven negligence[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service[cite: 9].</li>
         </ul>
 
         <h3>8. Suspension and Termination</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or where continued connection poses a risk to the network or other customers[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.2</strong> A Customer may discontinue Service at any time; Packages already paid for are consumed as described in Clause 3.3 and are not refunded on voluntary discontinuation[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.3</strong> Where equipment remains the Company's property, the Company may retrieve it on termination of an instalment or lease arrangement, giving reasonable notice to the Customer[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.4</strong> Upon termination of Service, any Customer-supplied equipment remains the property of the Customer, except the outdoor LiteBeam (LBE) CPE unit, which remains the property of the Company and will be retrieved regardless of who originally supplied or paid for it[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or network risk[cite: 9].</li>
         </ul>
 
         <h3>9. Limitation of Liability</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months[cite: 10].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.2</strong> The Company is not liable for indirect, incidental, or consequential loss, including loss of income, data, or business opportunity[cite: 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months[cite: 10].</li>
         </ul>
 
-        <h3>10. Privacy</h3>
+        <h3>10. Privacy & Governing Law</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>10.1</strong> Customer information collected at registration is used for billing, service delivery, and support, and is kept confidential save where disclosure is required by law or necessary to enforce these Terms[cite: 10].</li>
-        </ul>
-
-        <h3>11. Amendments</h3>
-        <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>11.1</strong> The Company may update these Terms from time to time[cite: 10]. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office[cite: 10]. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms[cite: 10].</li>
-        </ul>
-
-        <h3>12. Governing Law</h3>
-        <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>12.1</strong> These Terms are governed by the laws of Kenya[cite: 10]. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts[cite: 10].</li>
-        </ul>
-
-        <h3>13. Contact</h3>
-        <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>13.1</strong> For billing, support, or installation enquiries, contact Tencent Innovations on Calls 0740 311 014, WhatsApp 0769 306 917, or visit the office in Rangwe, Homa Bay County[cite: 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>10.1</strong> Customer information collected at registration is kept confidential[cite: 10]. These Terms are governed by the laws of Kenya[cite: 10].</li>
         </ul>
     `;
     res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
@@ -889,11 +899,8 @@ app.get('/solar', (req, res) => {
             <li>Support and maintenance</li>
         </ul>
 
-        <h3>How we size it</h3>
-        <p>We add up the power of each device, estimate the hours you use it, and size the batteries and panels to cover that load with room to grow. You see the numbers before you decide.</p>
-
         <div class="form-container">
-            <h3 style="margin-top:0; color:#38bdf8;">Solar Load & Battery Sizing Request</h3>
+            <h3 style="margin-top:0; color:var(--primary);">Solar Load & Battery Sizing Request</h3>
             <form action="/submit-survey-payment" method="POST">
                 <input type="hidden" name="service" value="Solar Consultation">
                 <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="e.g. Mary Akinyi"></div>
@@ -939,15 +946,6 @@ app.get('/survey', (req, res) => {
             <li>An estimated installation time</li>
         </ul>
 
-        <h3>How it works</h3>
-        <ol style="color: #f1f5f9; padding-left: 20px; line-height: 1.8;">
-            <li>Book a survey on this website or by USSD, and pay the survey fee by M-Pesa.</li>
-            <li>We call you to agree a time.</li>
-            <li>An engineer visits and inspects your site.</li>
-            <li>You receive the report and quote.</li>
-            <li>If you go ahead, we schedule the installation.</li>
-        </ol>
-
         <div class="form-container" style="border-color: var(--accent);">
             <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
             <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will trigger an instant M-Pesa prompt on your phone for the survey fee.</p>
@@ -973,12 +971,10 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-// Safely handle accidental GET requests to the payment route by redirecting back to surveys
 app.get('/submit-survey-payment', (req, res) => {
     res.redirect('/survey');
 });
 
-// Handle Payment Submission & STK Push
 app.post('/submit-survey-payment', payLimiter, async (req, res) => {
     const { name, phone: rawPhone, service, location } = req.body;
     const phone = normalizePhone(rawPhone);
@@ -1044,8 +1040,8 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
                 <p class="intro-text">An STK push for <strong>KES ${amount}</strong> has been sent to <strong>${esc(phone)}</strong> for <strong>${esc(service)}</strong>.</p>
                 <p>Please enter your M-Pesa PIN when the prompt appears on your screen.</p>
                 
-                <div id="status-box" style="background:#1e293b; border:1px solid #334155; padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
-                    <p id="status-text" style="font-weight:bold; color:#38bdf8;">Waiting for M-Pesa PIN confirmation...</p>
+                <div id="status-box" style="background:var(--surface); border:1px solid var(--border); padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
+                    <p id="status-text" style="font-weight:bold; color:var(--primary);">Waiting for M-Pesa PIN confirmation...</p>
                 </div>
 
                 <script>
