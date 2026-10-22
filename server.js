@@ -25,11 +25,9 @@ const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: 'Too many requests from this IP, please try again later.',
-    // Safaricom callbacks and the payment status poll must never be throttled by this general limit
     skip: (req) => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
 });
 
-// Strict limit on the payment form: stops people spamming M-Pesa prompts
 const payLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     max: 10,
@@ -42,10 +40,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // ---------------------------------------------------------------
 // Email notifications (Gmail via Nodemailer)
-// Required env vars on Render: GMAIL_USER, GMAIL_APP_PASSWORD
-// Optional: NOTIFY_TO (defaults to GMAIL_USER)
 // ---------------------------------------------------------------
-// Short timeouts so a blocked SMTP connection (Render free tier) cannot hang the form.
 const mailer = nodemailer.createTransport({
     service: 'gmail',
     connectionTimeout: 8000,
@@ -57,7 +52,6 @@ const mailer = nodemailer.createTransport({
     }
 });
 
-// Escape user input so nobody can inject HTML into pages or emails
 function esc(value = '') {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -67,12 +61,10 @@ function esc(value = '') {
         .replace(/'/g, '&#39;');
 }
 
-// Form fields may arrive as strings or arrays (e.g. checkboxes)
 function flat(value) {
     return Array.isArray(value) ? value.join(', ') : (value || '');
 }
 
-// Send a lead alert. Never throws: a mail failure must not break the customer's page.
 async function notify(subject, fields) {
     const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
     const rows = Object.entries(fields)
@@ -86,11 +78,8 @@ async function notify(subject, fields) {
         .join('');
     const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
-    // Always log the lead first, so it is in Render logs whatever happens next
     console.log('LEAD:', JSON.stringify({ subject: cleanSubject, fields, time }));
 
-    // Telegram (HTTPS, works on Render free tier)
-    // Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     const sendTelegram = async () => {
         if (!process.env.TELEGRAM_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
         const lines = Object.entries(fields).map(([label, val]) => `${label}: ${flat(val)}`);
@@ -104,7 +93,6 @@ async function notify(subject, fields) {
         if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
     };
 
-    // Email (needs SMTP: blocked on Render free tier, works on paid instances)
     const sendEmail = async () => {
         if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
         await mailer.sendMail({
@@ -115,14 +103,13 @@ async function notify(subject, fields) {
         });
     };
 
-    // Run both in parallel; one failing never blocks the other or the customer's page
     const results = await Promise.allSettled([sendTelegram(), sendEmail()]);
     if (results[0].status === 'rejected') console.error('Telegram notification failed:', results[0].reason && results[0].reason.message);
     if (results[1].status === 'rejected') console.error('Notification email failed:', results[1].reason && results[1].reason.message);
 }
 
 // ---------------------------------------------------------------
-// M-Pesa (Daraja) STK Push for a PAYBILL shortcode
+// M-Pesa (Daraja) STK Push
 // ---------------------------------------------------------------
 const MPESA = {
     production: process.env.MPESA_ENV === 'production',
@@ -358,7 +345,7 @@ app.get('/payments/status/:id', async (req, res) => {
     res.json({ status: b.status });
 });
 
-// Shared Layout Template Helper with Theme Support
+// Shared Layout Template Helper with Theme Support & Cleaned List Styling
 function renderPage({ title, activeNav, content }) {
     return `
         <!DOCTYPE html>
@@ -368,14 +355,12 @@ function renderPage({ title, activeNav, content }) {
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>${title} - Tencent Innovations</title>
             <script>
-                // Prevent flash of wrong theme on load
                 (function() {
                     const savedTheme = localStorage.getItem('theme') || 'dark';
                     document.documentElement.setAttribute('data-theme', savedTheme);
                 })();
             </script>
             <style>
-                /* Theme Variables */
                 :root {
                     --bg: #0f172a;
                     --surface: #1e293b;
@@ -385,7 +370,6 @@ function renderPage({ title, activeNav, content }) {
                     --border: #334155;
                     --primary: #0284c7;
                     --accent: #4ade80;
-                    --card-hover: #1e293b;
                 }
                 [data-theme="light"] {
                     --bg: #f8fafc;
@@ -396,12 +380,10 @@ function renderPage({ title, activeNav, content }) {
                     --border: #cbd5e1;
                     --primary: #0284c7;
                     --accent: #16a34a;
-                    --card-hover: #f1f5f9;
                 }
 
                 body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; transition: background 0.3s, color 0.3s; }
                 
-                /* Main Navigation Bar */
                 nav { background: var(--nav-bg); border-bottom: 1px solid var(--border); padding: 12px 30px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; flex-wrap: wrap; transition: background 0.3s, border-color 0.3s; }
                 .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
                 .logo-img { height: 48px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
@@ -412,11 +394,9 @@ function renderPage({ title, activeNav, content }) {
                 .nav-links a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.9rem; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; }
                 .nav-links a:hover, .nav-links a.active { color: var(--text); background: var(--surface); }
                 
-                /* Theme Toggle Button */
                 .theme-toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
                 .theme-toggle-btn:hover { background: var(--surface); }
 
-                /* Hero Service Banner */
                 .hero-banner { 
                     background: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.85)), url('/banner.png');
                     background-size: cover;
@@ -429,19 +409,16 @@ function renderPage({ title, activeNav, content }) {
                 .hero-banner p { color: #e2e8f0; font-size: 1.15rem; margin-bottom: 20px; max-width: 800px; margin-left: auto; margin-right: auto; }
                 .ussd-badge { display: inline-block; background: #38bdf8; color: #0f172a; padding: 10px 22px; border-radius: 30px; font-weight: bold; font-size: 1.05rem; box-shadow: 0 4px 15px rgba(56, 189, 248, 0.3); }
 
-                /* Layout & Content Flow */
                 .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
                 h2 { color: var(--primary); font-size: 2rem; margin-top: 0; }
                 h3 { color: var(--primary); margin-top: 30px; }
                 .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
                 .intro-text { font-size: 1.1rem; color: var(--text); margin-bottom: 25px; }
                 
-                /* Bullet & Feature Lists */
-                ul.feature-list { list-style: none; padding: 0; margin: 20px 0; }
-                ul.feature-list li { margin-bottom: 12px; padding-left: 28px; position: relative; font-size: 1.05rem; color: var(--text); }
-                ul.feature-list li::before { content: "✔"; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
+                /* Clean feature lists without ticks */
+                ul.feature-list { list-style: disc; padding-left: 20px; margin: 20px 0; }
+                ul.feature-list li { margin-bottom: 12px; font-size: 1.05rem; color: var(--text); }
 
-                /* Call to Action & Forms Styling */
                 .cta-box { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; transition: background 0.3s, border-color 0.3s; }
                 .cta-box p { font-size: 1.1rem; margin-top: 0; color: var(--text); }
                 .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; transition: background 0.2s; border: none; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
@@ -455,7 +432,6 @@ function renderPage({ title, activeNav, content }) {
                 .contact-bar { background: var(--nav-bg); border-top: 1px solid var(--border); padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; transition: background 0.3s, border-color 0.3s; }
                 .contact-bar strong { color: var(--primary); }
 
-                /* Footer Styling */
                 .site-footer { background: var(--nav-bg); border-top: 1px solid var(--border); color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; transition: background 0.3s, border-color 0.3s; }
                 .footer-grid { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; margin-bottom: 40px; }
                 .footer-col h4 { color: var(--primary); font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); padding-bottom: 8px; }
@@ -467,7 +443,6 @@ function renderPage({ title, activeNav, content }) {
             </style>
         </head>
         <body>
-            <!-- Main Navigation Menu -->
             <nav>
                 <a href="/" class="logo-container">
                     <img src="/logo.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
@@ -753,86 +728,86 @@ app.get('/smart-locks', (req, res) => {
     res.send(renderPage({ title: 'Smart Locks', activeNav: 'smart-locks', content }));
 });
 
-// Terms and Conditions Page
+// Terms and Conditions Page (Citations completely removed)
 app.get('/terms', (req, res) => {
     const content = `
         <h2>Terms and Conditions of Service</h2>
         <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
         <p class="intro-text" style="font-size: 0.95rem; line-height: 1.7;">
             Calls: 0740 311 014 | WhatsApp: 0769 306 917<br>
-            These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you")[cite: 7]. By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms[cite: 7].
+            These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you"). By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms.
         </p>
 
         <h3>1. Definitions</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.1</strong> "Service" means any of the WiFi/internet access, CCTV installation, electric fence installation, solar standby system, or fingerprint door lock installation services offered by the Company[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.2</strong> "Package" means a specific data, speed, or duration bundle purchased for internet access, as published by the Company from time to time[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.3</strong> "Customer Premises Equipment" or "CPE" means routers, antennas, cameras, fence energisers, solar panels, batteries, fingerprint door locks, cabling, and any other hardware installed at the Customer's premises[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.4</strong> "Hotspot" means the Company's WiFi network accessible via login portal and voucher, PIN, or M-Pesa payment[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.1</strong> "Service" means any of the WiFi/internet access, CCTV installation, electric fence installation, solar standby system, or fingerprint door lock installation services offered by the Company.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.2</strong> "Package" means a specific data, speed, or duration bundle purchased for internet access, as published by the Company from time to time.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.3</strong> "Customer Premises Equipment" or "CPE" means routers, antennas, cameras, fence energisers, solar panels, batteries, fingerprint door locks, cabling, and any other hardware installed at the Customer's premises.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.4</strong> "Hotspot" means the Company's WiFi network accessible via login portal and voucher, PIN, or M-Pesa payment.</li>
         </ul>
 
         <h3>2. Account Registration</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.1</strong> Customers must register using accurate name and phone number details. This information is used for billing, support, and network security, and will not be sold to third parties[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.2</strong> A customer is responsible for keeping their account PIN, voucher codes, and WiFi password confidential. The Company is not liable for usage arising from a shared or leaked password[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.3</strong> One account and connection are intended for a single household or business premises unless a business/enterprise package has been agreed in writing[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.1</strong> Customers must register using accurate name and phone number details. This information is used for billing, support, and network security, and will not be sold to third parties.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.2</strong> A customer is responsible for keeping their account PIN, voucher codes, and WiFi password confidential. The Company is not liable for usage arising from a shared or leaked password.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.3</strong> One account and connection are intended for a single household or business premises unless a business/enterprise package has been agreed in writing.</li>
         </ul>
 
         <h3>3. WiFi and Internet Service</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.1</strong> Internet access is sold in prepaid Packages (hourly, daily, weekly, or monthly) as displayed on the Hotspot login page or communicated by the Company. Prices may be revised from time to time; the price in effect at the moment of payment applies to that purchase[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises[cite: 7]. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.1</strong> Internet access is sold in prepaid Packages (hourly, daily, weekly, or monthly) as displayed on the Hotspot login page or communicated by the Company. Prices may be revised from time to time; the price in effect at the moment of payment applies to that purchase.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available.</li>
         </ul>
 
         <h3>4. Acceptable Use</h3>
         <p style="color: var(--text);">The Service may not be used to:</p>
         <ul class="feature-list">
-            <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred[cite: 8];</li>
-            <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system[cite: 8];</li>
-            <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users[cite: 8];</li>
-            <li>Impersonate another person or misrepresent your affiliation in connection with the Service[cite: 8].</li>
+            <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred;</li>
+            <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system;</li>
+            <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users;</li>
+            <li>Impersonate another person or misrepresent your affiliation in connection with the Service.</li>
         </ul>
-        <p style="color: var(--text);">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities[cite: 8].</p>
+        <p style="color: var(--text);">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities.</p>
 
         <h3>5. Equipment (CPE)</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.1</strong> Where the Company supplies and installs equipment (router, antenna, CCTV camera, fence energiser, solar panel, battery, or fingerprint door lock), ownership of that equipment remains with the Company until it has been fully paid for, unless otherwise agreed in writing[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.2</strong> The Customer must provide a safe mounting location, stable power supply, and reasonable access for installation and future maintenance[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.3</strong> The Customer is responsible for equipment once installed and accepted, and must promptly report any fault, damage, or tampering. Damage caused by the Customer, third parties, lightning, rodents, theft, or vandalism is not covered by any workmanship warranty and may attract a call-out and repair or replacement fee[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.4</strong> Where a device remains the Company's property under an instalment or lease arrangement, the Customer may not relocate, resell, or allow a third party to tamper with it without the Company's written consent[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service (for example, a Customer-owned router under a Commercial/Rental WiFi installation), that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.1</strong> Where the Company supplies and installs equipment (router, antenna, CCTV camera, fence energiser, solar panel, battery, or fingerprint door lock), ownership of that equipment remains with the Company until it has been fully paid for, unless otherwise agreed in writing.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.2</strong> The Customer must provide a safe mounting location, stable power supply, and reasonable access for installation and future maintenance.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.3</strong> The Customer is responsible for equipment once installed and accepted, and must promptly report any fault, damage, or tampering. Damage caused by the Customer, third parties, lightning, rodents, theft, or vandalism is not covered by any workmanship warranty and may attract a call-out and repair or replacement fee.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.4</strong> Where a device remains the Company's property under an instalment or lease arrangement, the Customer may not relocate, resell, or allow a third party to tamper with it without the Company's written consent.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service, that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company.</li>
         </ul>
 
         <h3>6. Installation Services</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment[cite: 8].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice[cite: 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice.</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss.</li>
         </ul>
 
         <h3>7. Service Availability</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service.</li>
         </ul>
 
         <h3>8. Suspension and Termination</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or network risk[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or network risk.</li>
         </ul>
 
         <h3>9. Limitation of Liability</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months[cite: 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months.</li>
         </ul>
 
         <h3>10. Privacy & Governing Law</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>10.1</strong> Customer information collected at registration is kept confidential[cite: 10]. These Terms are governed by the laws of Kenya[cite: 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>10.1</strong> Customer information collected at registration is kept confidential. These Terms are governed by the laws of Kenya.</li>
         </ul>
     `;
     res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
