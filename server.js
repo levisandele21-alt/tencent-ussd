@@ -125,13 +125,13 @@ async function notify(subject, fields) {
 // M-Pesa (Daraja) STK Push for a PAYBILL shortcode
 //
 // Env vars on Render:
-//   MPESA_ENV              sandbox (default) or production
-//   MPESA_CONSUMER_KEY     from the Daraja portal
-//   MPESA_CONSUMER_SECRET  from the Daraja portal
-//   MPESA_SHORTCODE        sandbox test shortcode, later your Paybill number
-//   MPESA_PASSKEY          sandbox test passkey, later your production passkey
-//   MPESA_CALLBACK_SECRET  a long random string (32+ characters) you invent
-//   PUBLIC_BASE_URL        https://tencent-ussd.onrender.com (no trailing slash)
+//   MPESA_ENV               sandbox (default) or production
+//   MPESA_CONSUMER_KEY      from the Daraja portal
+//   MPESA_CONSUMER_SECRET   from the Daraja portal
+//   MPESA_SHORTCODE         sandbox test shortcode, later your Paybill number
+//   MPESA_PASSKEY           sandbox test passkey, later your production passkey
+//   MPESA_CALLBACK_SECRET   a long random string (32+ characters) you invent
+//   PUBLIC_BASE_URL         https://tencent-ussd.onrender.com (no trailing slash)
 //
 // NOTE: bookings are kept in memory. They are lost when the server restarts,
 // so add a database before relying on this for real money. Every lead and
@@ -471,6 +471,7 @@ function renderPage({ title, activeNav, content }) {
                     <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">Electric Fence</a></li>
                     <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">Solar</a></li>
                     <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">Surveys</a></li>
+                    <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">Terms</a></li>
                 </ul>
             </nav>
 
@@ -483,7 +484,7 @@ function renderPage({ title, activeNav, content }) {
             </div>
 
             <footer>
-                <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform.</p>
+                <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform. | <a href="/terms" style="color: var(--muted); text-decoration: underline;">Terms and Conditions</a></p>
             </footer>
         </body>
         </html>
@@ -676,6 +677,115 @@ app.get('/smart-locks', (req, res) => {
     res.send(renderPage({ title: 'Smart Locks', activeNav: 'smart-locks', content }));
 });
 
+// Terms and Conditions Page
+app.get('/terms', (req, res) => {
+    const content = `
+        <h2>Terms and Conditions of Service</h2>
+        <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
+        <p class="intro-text" style="font-size: 0.95rem; line-height: 1.7;">
+            Calls: 0740 311 014 | WhatsApp: 0769 306 917<br>
+            These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you"). By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms.
+        </p>
+
+        <h3>1. Definitions</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.1</strong> "Service" means any of the WiFi/internet access, CCTV installation, electric fence installation, solar standby system, or fingerprint door lock installation services offered by the Company[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.2</strong> "Package" means a specific data, speed, or duration bundle purchased for internet access, as published by the Company from time to time[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.3</strong> "Customer Premises Equipment" or "CPE" means routers, antennas, cameras, fence energisers, solar panels, batteries, fingerprint door locks, cabling, and any other hardware installed at the Customer's premises[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>1.4</strong> "Hotspot" means the Company's WiFi network accessible via login portal and voucher, PIN, or M-Pesa payment[cite: 7].</li>
+        </ul>
+
+        <h3>2. Account Registration</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.1</strong> Customers must register using accurate name and phone number details. This information is used for billing, support, and network security, and will not be sold to third parties[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.2</strong> A customer is responsible for keeping their account PIN, voucher codes, and WiFi password confidential. The Company is not liable for usage arising from a shared or leaked password[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>2.3</strong> One account and connection are intended for a single household or business premises unless a business/enterprise package has been agreed in writing[cite: 7].</li>
+        </ul>
+
+        <h3>3. WiFi and Internet Service</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.1</strong> Internet access is sold in prepaid Packages (hourly, daily, weekly, or monthly) as displayed on the Hotspot login page or communicated by the Company. Prices may be revised from time to time; the price in effect at the moment of payment applies to that purchase[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed[cite: 7].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable[cite: 7, 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available[cite: 8].</li>
+        </ul>
+
+        <h3>4. Acceptable Use</h3>
+        <p style="color: #f1f5f9;">The Service may not be used to:</p>
+        <ul class="feature-list">
+            <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred[cite: 8];</li>
+            <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system[cite: 8];</li>
+            <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users[cite: 8];</li>
+            <li>Impersonate another person or misrepresent your affiliation in connection with the Service[cite: 8].</li>
+        </ul>
+        <p style="color: #f1f5f9;">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities[cite: 8].</p>
+
+        <h3>5. Equipment (CPE)</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.1</strong> Where the Company supplies and installs equipment (router, antenna, CCTV camera, fence energiser, solar panel, battery, or fingerprint door lock), ownership of that equipment remains with the Company until it has been fully paid for, unless otherwise agreed in writing[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.2</strong> The Customer must provide a safe mounting location, stable power supply, and reasonable access for installation and future maintenance[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.3</strong> The Customer is responsible for equipment once installed and accepted, and must promptly report any fault, damage, or tampering. Damage caused by the Customer, third parties, lightning, rodents, theft, or vandalism is not covered by any workmanship warranty and may attract a call-out and repair or replacement fee[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.4</strong> Where a device remains the Company's property under an instalment or lease arrangement, the Customer may not relocate, resell, or allow a third party to tamper with it without the Company's written consent[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service (for example, a Customer-owned router under a Commercial/Rental WiFi installation), that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company[cite: 8].</li>
+        </ul>
+
+        <h3>6. Installation Services (CCTV, Electric Fence, Solar Standby, Fingerprint Door Locks)</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding[cite: 8, 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss, and accepts no liability for such incidents[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.4</strong> Solar standby systems are sized to the load and backup duration agreed with the Customer at the point of sale. Connecting additional appliances beyond the agreed load may reduce backup duration or damage the system, and is done at the Customer's own risk[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.5</strong> CCTV, electric fence, solar standby, and fingerprint door lock installation services are offered nationwide across Kenya, subject to logistics and travel costs for sites outside the Company's normal service radius, communicated to the Customer at the point of quotation[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.6</strong> Fingerprint door locks are powered by internal batteries. The Customer is responsible for replacing batteries as needed and for keeping any backup mechanical key or master code safe. Loss of access due to depleted batteries, lost backup keys or codes, or manufacturer firmware issues is not covered by the workmanship warranty[cite: 9].</li>
+        </ul>
+
+        <h3>7. Service Availability</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.2</strong> Where practical, the Company will give advance notice of planned maintenance that is expected to interrupt Service[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.3</strong> The Company is not liable for losses arising from Service interruption, including business losses, except where caused by the Company's proven negligence[cite: 9].</li>
+        </ul>
+
+        <h3>8. Suspension and Termination</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or where continued connection poses a risk to the network or other customers[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.2</strong> A Customer may discontinue Service at any time; Packages already paid for are consumed as described in Clause 3.3 and are not refunded on voluntary discontinuation[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.3</strong> Where equipment remains the Company's property, the Company may retrieve it on termination of an instalment or lease arrangement, giving reasonable notice to the Customer[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>8.4</strong> Upon termination of Service, any Customer-supplied equipment remains the property of the Customer, except the outdoor LiteBeam (LBE) CPE unit, which remains the property of the Company and will be retrieved regardless of who originally supplied or paid for it[cite: 9].</li>
+        </ul>
+
+        <h3>9. Limitation of Liability</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months[cite: 9, 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.2</strong> The Company is not liable for indirect, incidental, or consequential loss, including loss of income, data, or business opportunity[cite: 10].</li>
+        </ul>
+
+        <h3>10. Privacy</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>10.1</strong> Customer information collected at registration is used for billing, service delivery, and support, and is kept confidential save where disclosure is required by law or necessary to enforce these Terms[cite: 10].</li>
+        </ul>
+
+        <h3>11. Amendments</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>11.1</strong> The Company may update these Terms from time to time. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms[cite: 10].</li>
+        </ul>
+
+        <h3>12. Governing Law</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>12.1</strong> These Terms are governed by the laws of Kenya. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts[cite: 10].</li>
+        </ul>
+
+        <h3>13. Contact</h3>
+        <ul class="feature-list" style="list-style: none; padding-left: 0;">
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>13.1</strong> For billing, support, or installation enquiries, contact Tencent Innovations on Calls 0740 311 014, WhatsApp 0769 306 917, or visit the office in Rangwe, Homa Bay County[cite: 10].</li>
+        </ul>
+    `;
+    res.res ? res.res(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content })) : res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
+});
+
 // 5. Electric Fence Page
 app.get('/electric-fence', (req, res) => {
     const content = `
@@ -712,7 +822,7 @@ app.get('/electric-fence', (req, res) => {
     res.send(renderPage({ title: 'Electric Fence', activeNav: 'electric-fence', content }));
 });
 
-// 6. Solar Page (Includes Form #3: Solar Load & Battery Sizing Form)
+// 6. Solar Page
 app.get('/solar', (req, res) => {
     const content = `
         <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
@@ -742,10 +852,11 @@ app.get('/solar', (req, res) => {
 
         <div class="form-container">
             <h3 style="margin-top:0; color:#38bdf8;">Solar Load & Battery Sizing Request</h3>
-            <p style="color:var(--muted); font-size:0.95rem;">Select your required equipment to get a custom sizing estimate.</p>
-            <form action="/submit-solar" method="POST">
-                <div class="form-group">
-                    <label>Property Type</label>
+            <form action="/submit-survey-payment" method="POST">
+                <input type="hidden" name="service" value="Solar Consultation">
+                <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="e.g. Mary Akinyi"></div>
+                <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
+                <div class="form-group"><label>Property Type</label>
                     <select name="propertyType">
                         <option value="Home">Home</option>
                         <option value="Shop">Shop / Business</option>
@@ -753,53 +864,15 @@ app.get('/solar', (req, res) => {
                         <option value="Rental Compound">Rental Compound</option>
                     </select>
                 </div>
-                <div class="form-group">
-                    <label>Equipment to Power (Check all that apply):</label>
-                    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 5px; color: #f1f5f9;">
-                        <label><input type="checkbox" name="equipment" value="Lights"> Lights & Phone Charging</label>
-                        <label><input type="checkbox" name="equipment" value="Router"> WiFi Router / Internet</label>
-                        <label><input type="checkbox" name="equipment" value="CCTV"> CCTV Cameras</label>
-                        <label><input type="checkbox" name="equipment" value="Fridge"> Refrigerator / Fridge</label>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Required Backup Duration</label>
-                    <select name="duration">
-                        <option value="4 Hours">4 Hours (Basic Outage)</option>
-                        <option value="8 Hours">8 Hours (Extended)</option>
-                        <option value="24/7 Off-Grid">24/7 Full Off-Grid</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Phone Number (M-Pesa)</label>
-                    <input type="tel" name="phone" required placeholder="e.g. 0712345678">
-                </div>
-                <button type="submit" class="cta-btn">Calculate & Get Solar Quote</button>
+                <div class="form-group"><label>Location</label><input type="text" name="location" required placeholder="e.g. Rangwe Town"></div>
+                <button type="submit" class="cta-btn">Pay KES 4,000 & Request Sizing</button>
             </form>
         </div>
     `;
     res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
 });
 
-// Handle Solar Request Submission (emails you instantly)
-app.post('/submit-solar', async (req, res) => {
-    const { propertyType, equipment, duration, phone } = req.body;
-
-    await notify(`☀️ Solar request: ${propertyType || 'Unknown'} (${duration || 'n/a'})`, {
-        'Property type': propertyType,
-        Equipment: equipment,
-        'Backup duration': duration,
-        Phone: phone
-    });
-
-    res.send(renderPage({
-        title: 'Solar Sizing Request Received',
-        activeNav: 'solar',
-        content: `<h2>Solar Analysis in Progress</h2><p class="intro-text">We received your requirements for your <strong>${esc(propertyType)}</strong> with <strong>${esc(duration)}</strong> backup. Our solar engineers will compute your panel sizing and call <strong>${esc(phone)}</strong> with a precise quotation.</p><a href="/solar" class="cta-btn">Back to Solar</a>`
-    }));
-});
-
-// 7. Surveys Page (Includes Form #1: Direct M-PESA STK Push Booking & Form #4: Site Inspection Booking)
+// 7. Surveys Page
 app.get('/survey', (req, res) => {
     const content = `
         <h2>Know what your site needs before you spend.</h2>
@@ -835,19 +908,13 @@ app.get('/survey', (req, res) => {
 
         <div class="form-container" style="border-color: var(--accent);">
             <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will send an M-Pesa prompt to your phone for the fee shown next to the service you choose.</p>
-            <form action="/submit-survey-payment" method="POST">
-                <div class="form-group">
-                    <label>Full Name</label>
-                    <input type="text" name="name" required placeholder="e.g. Mary Akinyi">
-                </div>
-                <div class="form-group">
-                    <label>M-Pesa Phone Number</label>
-                    <input type="tel" name="phone" required placeholder="0712345678">
-                </div>
+            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will trigger an instant M-Pesa prompt on your phone for the survey fee.</p>
+            <form action="/submit-survey-payment" method="POST" id="payment-form">
+                <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="e.g. Mary Akinyi"></div>
+                <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
                 <div class="form-group">
                     <label>Service Category</label>
-                    <select name="service">
+                    <select name="service" id="service-select">
                         <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
                         <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
                         <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
@@ -855,12 +922,8 @@ app.get('/survey', (req, res) => {
                         <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
                         <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
                     </select>
-                    <small style="display:block; margin-top:6px; color:var(--muted);">Prices can change according to the location and urgency. Thank you.</small>
                 </div>
-                <div class="form-group">
-                    <label>Physical Location / Address</label>
-                    <input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay">
-                </div>
+                <div class="form-group"><label>Physical Location / Address</label><input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay"></div>
                 <button type="submit" class="cta-btn" style="background: var(--accent); color: #0f172a;">Trigger M-Pesa Payment & Book Survey</button>
             </form>
         </div>
@@ -868,92 +931,115 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-// Handle Survey Booking + M-Pesa STK Push
+// Safely handle accidental GET requests to the payment route by redirecting back to surveys
+app.get('/submit-survey-payment', (req, res) => {
+    res.redirect('/survey');
+});
+
+// Handle Payment Submission & STK Push
 app.post('/submit-survey-payment', payLimiter, async (req, res) => {
-    const str = v => (typeof v === 'string' ? v.trim() : '');
-    const name = str(req.body.name).slice(0, 80);
-    const location = str(req.body.location).slice(0, 120);
-    const service = str(req.body.service);
-    const phone = normalizePhone(str(req.body.phone));
+    const { name, phone: rawPhone, service, location } = req.body;
+    const phone = normalizePhone(rawPhone);
 
-    const problem = (message, status = 400) => res.status(status).send(renderPage({
-        title: 'Booking Problem',
-        activeNav: 'survey',
-        content: `<h2>We could not start your payment</h2><p class="intro-text">${esc(message)}</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
-    }));
+    if (!name || !phone || !service || !location) {
+        return res.status(400).send(renderPage({
+            title: 'Missing Details',
+            activeNav: 'survey',
+            content: `<h2>Incomplete Form</h2><p class="intro-text">Please provide your name, a valid Safaricom phone number, service, and location.</p><a href="/survey" class="cta-btn">Back</a>`
+        }));
+    }
 
-    if (!name || !location) return problem('Please enter your name and location.');
-    if (!Object.hasOwn(SERVICE_PRICES, service)) return problem('Please choose a valid service.');
-    if (!phone) return problem('Please enter a valid Safaricom number, for example 0712345678.');
-    if (!phoneAttemptAllowed(phone)) return problem('Too many payment requests for this number. Please try again later.', 429);
+    if (!phoneAttemptAllowed(phone)) {
+        return res.status(429).send(renderPage({
+            title: 'Too Many Attempts',
+            activeNav: 'survey',
+            content: `<h2>Please Wait</h2><p class="intro-text">You have requested several payment prompts recently. Please check your phone or try again later.</p><a href="/survey" class="cta-btn">Back</a>`
+        }));
+    }
 
-    const id = crypto.randomBytes(8).toString('hex');
+    const amount = SERVICE_PRICES[service] || 3000;
+    const bookingId = crypto.randomUUID();
+    const accountRef = `TI-${Math.floor(1000 + Math.random() * 9000)}`;
+
     const booking = {
-        id, name, phone, service, location,
-        amount: SERVICE_PRICES[service],            // price comes from the server, never from the form
+        id: bookingId,
+        name,
+        phone,
+        service,
+        location,
+        amount,
+        accountRef,
         status: 'pending',
-        createdAt: Date.now(),
-        accountRef: 'TNC' + id.slice(0, 8).toUpperCase()
+        createdAt: Date.now()
     };
-    bookings.set(id, booking);
-
-    // Tell you about the lead right away, so it is never lost even if payment fails
-    notify(`📋 Survey booking (awaiting payment): ${name} - ${service}`, bookingFields(booking))
-        .catch(() => {});
+    bookings.set(bookingId, booking);
 
     if (!mpesaConfigured()) {
-        booking.status = 'failed';
-        console.error('M-Pesa is not fully configured (check MPESA_* variables and PUBLIC_BASE_URL).');
-        return problem('Online payment is not available right now. We have saved your request and will call you.', 503);
+        await notify(`📝 PENDING (M-Pesa unconfigured): ${service} - ${name}`, bookingFields(booking));
+        return res.send(renderPage({
+            title: 'Booking Received',
+            activeNav: 'survey',
+            content: `
+                <h2>Booking Received!</h2>
+                <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our online M-Pesa gateway is currently in offline setup mode. An engineer has received your request for <strong>${esc(service)}</strong> in <strong>${esc(location)}</strong> and will call <strong>${esc(phone)}</strong> shortly.</p>
+                <a href="/" class="cta-btn">Back to Home</a>
+            `
+        }));
     }
 
     try {
-        const r = await stkPush(booking);
-        booking.checkoutRequestId = r.CheckoutRequestID;
-        booking.merchantRequestId = r.MerchantRequestID;
-        byCheckout.set(r.CheckoutRequestID, booking);
-    } catch (err) {
-        console.error('STK push failed:', err.message);
-        booking.status = 'failed';
-        return problem('We could not send the M-Pesa prompt. Please check your number and try again, or call us on 0740 311 014.', 502);
-    }
+        const resStk = await stkPush(booking);
+        booking.checkoutRequestId = resStk.CheckoutRequestID;
+        byCheckout.set(resStk.CheckoutRequestID, booking);
 
-    res.send(renderPage({
-        title: 'Check Your Phone',
-        activeNav: 'survey',
-        content: `
-            <h2>Check your phone</h2>
-            <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa prompt for <strong>KES ${booking.amount}</strong> has been sent to <strong>${esc(phone)}</strong>. Enter your M-Pesa PIN to pay.</p>
-            <p id="pay-status" class="sub-title">Waiting for your payment...</p>
-            <a href="/survey" class="cta-btn">Back to Surveys</a>
-            <script>
-            (function () {
-                var id = ${JSON.stringify(id)}, tries = 0, box = document.getElementById('pay-status');
-                function poll() {
-                    tries++;
-                    fetch('/payments/status/' + id).then(function (r) { return r.json(); }).then(function (d) {
-                        if (d.status === 'paid') {
-                            box.textContent = 'Payment received. Thank you! An engineer will call you to schedule the visit.';
-                        } else if (d.status === 'failed') {
-                            box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
-                        } else if (d.status === 'review') {
-                            box.textContent = 'We are confirming your payment and will call you shortly.';
-                        } else if (tries < 40) {
-                            setTimeout(poll, 4000);
-                        } else {
-                            box.textContent = 'We have not seen the payment yet. If you paid, we will confirm and call you.';
-                        }
-                    }).catch(function () {
-                        if (tries < 40) setTimeout(poll, 4000);
-                    });
-                }
-                setTimeout(poll, 4000);
-            })();
-            </script>`
-    }));
+        await notify(`📱 STK sent: ${service} - ${name} (KES ${amount})`, bookingFields(booking));
+
+        res.send(renderPage({
+            title: 'Check Your Phone',
+            activeNav: 'survey',
+            content: `
+                <h2>Check Your Phone for M-Pesa</h2>
+                <p class="intro-text">An STK push for <strong>KES ${amount}</strong> has been sent to <strong>${esc(phone)}</strong> for <strong>${esc(service)}</strong>.</p>
+                <p>Please enter your M-Pesa PIN when the prompt appears on your screen.</p>
+                
+                <div id="status-box" style="background:#1e293b; border:1px solid #334155; padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
+                    <p id="status-text" style="font-weight:bold; color:#38bdf8;">Waiting for M-Pesa PIN confirmation...</p>
+                </div>
+
+                <script>
+                    async function checkStatus() {
+                        try {
+                            const r = await fetch('/payments/status/${bookingId}');
+                            const d = await r.json();
+                            if (d.status === 'paid') {
+                                document.getElementById('status-box').innerHTML = '<h3 style="color:#4ade80; margin:0;">Payment Confirmed Successfully!</h3><p>An engineer has been assigned and will call you shortly.</p><a href="/" class="cta-btn" style="margin-top:15px;">Return Home</a>';
+                                clearInterval(timer);
+                            } else if (d.status === 'failed') {
+                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">Payment Cancelled or Failed</h3><p>The transaction was not completed. Please try again.</p><a href="/survey" class="cta-btn" style="margin-top:15px;">Try Again</a>';
+                                clearInterval(timer);
+                            }
+                        } catch(e) {}
+                    }
+                    const timer = setInterval(checkStatus, 4000);
+                </script>
+            `
+        }));
+    } catch (err) {
+        booking.status = 'error';
+        console.error('STK Push Error:', err.message);
+        res.status(500).send(renderPage({
+            title: 'Payment Error',
+            activeNav: 'survey',
+            content: `
+                <h2>Could Not Send M-Pesa Prompt</h2>
+                <p class="intro-text">We encountered an error contacting Safaricom: ${esc(err.message)}. Please check your phone number or use our USSD code <strong>*384*100#</strong>.</p>
+                <a href="/survey" class="cta-btn">Try Again</a>
+            `
+        }));
+    }
 });
 
-// 8. USSD Endpoint
+// USSD Endpoint
 app.post('/ussd', (req, res) => {
     const { text, phoneNumber } = req.body;
     let response = '';
@@ -968,27 +1054,21 @@ app.post('/ussd', (req, res) => {
 6. Site Survey & Visit`;
     } else if (text === '1') {
         response = `CON WiFi Consultation: KES 3,000
-(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '2') {
         response = `CON CCTV Survey: KES 3,000
-(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '3') {
         response = `CON Smart Locks Consultation: KES 2,500
-(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '4') {
         response = `CON Electric Fence Survey: KES 5,000
-(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '5') {
         response = `CON Solar Consultation: KES 4,000
-(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '6') {
         response = `CON Site Survey: KES 3,000
-(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text.endsWith('*1')) {
         response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
@@ -1001,4 +1081,4 @@ app.post('/ussd', (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations server with interactive forms running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
