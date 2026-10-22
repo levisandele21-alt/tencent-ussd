@@ -119,7 +119,7 @@ const MPESA = {
     shortcode: process.env.MPESA_SHORTCODE,
     passkey: process.env.MPESA_PASSKEY,
     callbackSecret: process.env.MPESA_CALLBACK_SECRET,
-    publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+\$/, '')
+    publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
 };
 MPESA.baseUrl = process.env.MPESA_BASE_URL ||
     (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
@@ -136,9 +136,9 @@ const SERVICE_PRICES = {
 function normalizePhone(raw) {
     let p = String(raw || '').replace(/[\s\-()]/g, '');
     if (p.startsWith('+')) p = p.slice(1);
-    if (/^0[17]\d{8}\$/.test(p)) p = '254' + p.slice(1);
-    else if (/^[17]\d{8}\$/.test(p)) p = '254' + p;
-    return /^254[17]\d{8}\$/.test(p) ? p : null;
+    if (/^0[17]\d{8}$/.test(p)) p = '254' + p.slice(1);
+    else if (/^[17]\d{8}$/.test(p)) p = '254' + p;
+    return /^254[17]\d{8}$/.test(p) ? p : null;
 }
 
 const bookings = new Map();
@@ -245,6 +245,7 @@ function bookingFields(b, extra = {}) {
         Phone: b.phone,
         Service: b.service,
         Location: b.location,
+        ...(b.propertyType && b.propertyType !== 'N/A' ? { 'Property Type': b.propertyType } : {}),
         Amount: `KES ${b.amount}`,
         Reference: b.accountRef,
         ...extra
@@ -787,9 +788,9 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-// Handle Payment Submission & STK Push
+// Handle Payment Submission & STK Push (Universal for Surveys & Solar)
 app.post('/submit-survey-payment', payLimiter, async (req, res) => {
-    const { name, phone: rawPhone, service, location } = req.body;
+    const { name, phone: rawPhone, service, location, propertyType } = req.body;
     const phone = normalizePhone(rawPhone);
 
     if (!name || !phone || !service || !location) {
@@ -818,6 +819,7 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
         phone,
         service,
         location,
+        propertyType: propertyType || 'N/A',
         amount,
         accountRef,
         status: 'pending',
