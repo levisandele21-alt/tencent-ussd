@@ -450,7 +450,16 @@ function renderPage({ title, activeNav, content }) {
 
                 .contact-bar { background: #0b1120; border-top: 1px solid #334155; padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
                 .contact-bar strong { color: #38bdf8; }
-                footer { text-align: center; padding: 20px; color: var(--muted); font-size: 0.9rem; }
+
+                /* Footer Styling matching reference */
+                .site-footer { background: #070b14; border-top: 1px solid #1e293b; color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; }
+                .footer-grid { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; margin-bottom: 40px; }
+                .footer-col h4 { color: #38bdf8; font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #1e293b; padding-bottom: 8px; }
+                .footer-links { list-style: none; padding: 0; margin: 0; }
+                .footer-links li { margin-bottom: 10px; }
+                .footer-links a { color: var(--muted); text-decoration: none; transition: color 0.2s; font-size: 0.95rem; }
+                .footer-links a:hover { color: #38bdf8; padding-left: 4px; }
+                .footer-bottom { max-width: 1000px; margin: 0 auto; border-top: 1px solid #1e293b; padding-top: 20px; text-align: center; font-size: 0.85rem; color: #64748b; }
             </style>
         </head>
         <body>
@@ -483,8 +492,41 @@ function renderPage({ title, activeNav, content }) {
                 📍 <strong>Rangwe, Homa Bay County</strong> &nbsp;|&nbsp; 📞 <strong>0740 311 014</strong> &nbsp;|&nbsp; ✉️ <strong>tencentbz@gmail.com</strong>
             </div>
 
-            <footer>
-                <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform. | <a href="/terms" style="color: var(--muted); text-decoration: underline;">Terms and Conditions</a></p>
+            <footer class="site-footer">
+                <div class="footer-grid">
+                    <div class="footer-col">
+                        <h4>Find It Fast</h4>
+                        <ul class="footer-links">
+                            <li><a href="/smart-locks">Access Control</a></li>
+                            <li><a href="/cctv">Security Systems</a></li>
+                            <li><a href="/wifi">Telephony Systems</a></li>
+                            <li><a href="/wifi">Ethernet Cables</a></li>
+                            <li><a href="/survey">Fire Extinguisher</a></li>
+                            <li><a href="/solar">Power & Electrical</a></li>
+                            <li><a href="/solar">Solar Systems</a></li>
+                        </ul>
+                    </div>
+                    <div class="footer-col">
+                        <h4>Customer Care</h4>
+                        <ul class="footer-links">
+                            <li><a href="/survey">My account</a></li>
+                            <li><a href="/survey">Track your order</a></li>
+                            <li><a href="tel:0740311014">Contact Us</a></li>
+                            <li><a href="/survey">Wishlist</a></li>
+                            <li><a href="/survey">Returns/Exchange</a></li>
+                            <li><a href="/survey">FAQs</a></li>
+                        </ul>
+                    </div>
+                    <div class="footer-col">
+                        <h4>Tencent Innovations</h4>
+                        <p style="font-size: 0.9rem; color: var(--muted); line-height: 1.5;">
+                            Empowering homes, schools, and businesses across Rangwe and Homa Bay County with integrated internet, reliable security, and clean solar backup power.
+                        </p>
+                    </div>
+                </div>
+                <div class="footer-bottom">
+                    <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform. | <a href="/terms" style="color: var(--muted); text-decoration: underline;">Terms and Conditions</a></p>
+                </div>
             </footer>
         </body>
         </html>
