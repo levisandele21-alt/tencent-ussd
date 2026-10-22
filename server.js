@@ -931,6 +931,13 @@ app.post('/ussd', (req, res) => {
 
     res.set('Content-Type', 'text/plain');
     res.send(response);
+    // Universal timeout helper compatible with all Node.js versions
+function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { ...options, signal: controller.signal })
+        .finally(() => clearTimeout(timer));
+}
 });
 
 const PORT = process.env.PORT || 10000;
