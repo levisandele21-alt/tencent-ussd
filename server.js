@@ -17,10 +17,10 @@ app.use(
     })
 );
 
-// 3. Trust Render's Proxy
+// 3. Trust Render's Proxy (Prevents IP-spoofing and fixes rate limiter behind cloud load balancers)
 app.set('trust proxy', 1);
 
-// 4. Rate Limiting
+// 4. Rate Limiting & Payload Body Limits
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
@@ -28,7 +28,6 @@ const limiter = rateLimit({
     skip: (req) => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
 });
 
-// Strict limit on the payment form: stops people spamming M-Pesa prompts
 const payLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     max: 10,
@@ -36,11 +35,12 @@ const payLimiter = rateLimit({
 });
 app.use(limiter);
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Prevent payload-based denial of service (DoS) attacks
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
 // ---------------------------------------------------------------
-// Email notifications (Gmail via Nodemailer)
+// Email & Telegram Notifications
 // ---------------------------------------------------------------
 const mailer = nodemailer.createTransport({
     service: 'gmail',
@@ -53,7 +53,6 @@ const mailer = nodemailer.createTransport({
     }
 });
 
-// Escape user input to prevent injection
 function esc(value = '') {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -339,7 +338,7 @@ app.get('/payments/status/:id', async (req, res) => {
     res.json({ status: b.status });
 });
 
-// Shared Layout Template Helper with Enhanced Footer & "Find It Fast"
+// Shared Layout Template Helper
 function renderPage({ title, activeNav, content }) {
     return `
         <!DOCTYPE html>
@@ -396,7 +395,6 @@ function renderPage({ title, activeNav, content }) {
                 .contact-bar { background: #0b1120; border-top: 1px solid #334155; padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
                 .contact-bar strong { color: #38bdf8; }
 
-                /* Enhanced Footer Sections ("Find It Fast" & "Customer Care") */
                 .site-footer { background: #070b14; border-top: 1px solid #1e293b; color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; }
                 .footer-grid { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; margin-bottom: 40px; }
                 .footer-col h4 { color: #38bdf8; font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #1e293b; padding-bottom: 8px; }
