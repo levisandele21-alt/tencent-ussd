@@ -131,7 +131,7 @@ async function notify(subject, fields) {
 //   MPESA_SHORTCODE         sandbox test shortcode, later your Paybill number
 //   MPESA_PASSKEY           sandbox test passkey, later your production passkey
 //   MPESA_CALLBACK_SECRET   a long random string (32+ characters) you invent
-//   PUBLIC_BASE_URL         https://tencent-ussd.onrender.com (no trailing slash)
+//   PUBLIC_BASE_URL         https://tencentinnovations.onrender.com (no trailing slash)
 //
 // NOTE: bookings are kept in memory. They are lost when the server restarts,
 // so add a database before relying on this for real money. Every lead and
@@ -451,7 +451,7 @@ function renderPage({ title, activeNav, content }) {
                 .contact-bar { background: #0b1120; border-top: 1px solid #334155; padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
                 .contact-bar strong { color: #38bdf8; }
 
-                /* Footer Styling matching reference */
+                /* Footer Styling */
                 .site-footer { background: #070b14; border-top: 1px solid #1e293b; color: var(--muted); padding: 50px 20px 20px 20px; margin-top: 60px; }
                 .footer-grid { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 40px; margin-bottom: 40px; }
                 .footer-col h4 { color: #38bdf8; font-size: 1.1rem; margin-top: 0; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #1e293b; padding-bottom: 8px; }
@@ -726,7 +726,7 @@ app.get('/terms', (req, res) => {
         <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
         <p class="intro-text" style="font-size: 0.95rem; line-height: 1.7;">
             Calls: 0740 311 014 | WhatsApp: 0769 306 917<br>
-            These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you"). By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms.
+            These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you")[cite: 7]. By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms[cite: 7].
         </p>
 
         <h3>1. Definitions</h3>
@@ -750,7 +750,7 @@ app.get('/terms', (req, res) => {
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection[cite: 7].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion[cite: 7].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed[cite: 7].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable[cite: 7, 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises[cite: 7]. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable[cite: 8].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company[cite: 8].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available[cite: 8].</li>
         </ul>
@@ -776,8 +776,8 @@ app.get('/terms', (req, res) => {
 
         <h3>6. Installation Services (CCTV, Electric Fence, Solar Standby, Fingerprint Door Locks)</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding[cite: 8, 9].</li>
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding[cite: 8].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice[cite: 9]. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear[cite: 9]. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms[cite: 9].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss, and accepts no liability for such incidents[cite: 9].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.4</strong> Solar standby systems are sized to the load and backup duration agreed with the Customer at the point of sale. Connecting additional appliances beyond the agreed load may reduce backup duration or damage the system, and is done at the Customer's own risk[cite: 9].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>6.5</strong> CCTV, electric fence, solar standby, and fingerprint door lock installation services are offered nationwide across Kenya, subject to logistics and travel costs for sites outside the Company's normal service radius, communicated to the Customer at the point of quotation[cite: 9].</li>
@@ -786,7 +786,7 @@ app.get('/terms', (req, res) => {
 
         <h3>7. Service Availability</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance[cite: 9].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service[cite: 9]. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance[cite: 9].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.2</strong> Where practical, the Company will give advance notice of planned maintenance that is expected to interrupt Service[cite: 9].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>7.3</strong> The Company is not liable for losses arising from Service interruption, including business losses, except where caused by the Company's proven negligence[cite: 9].</li>
         </ul>
@@ -801,7 +801,7 @@ app.get('/terms', (req, res) => {
 
         <h3>9. Limitation of Liability</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months[cite: 9, 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months[cite: 10].</li>
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>9.2</strong> The Company is not liable for indirect, incidental, or consequential loss, including loss of income, data, or business opportunity[cite: 10].</li>
         </ul>
 
@@ -812,12 +812,12 @@ app.get('/terms', (req, res) => {
 
         <h3>11. Amendments</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>11.1</strong> The Company may update these Terms from time to time. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms[cite: 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>11.1</strong> The Company may update these Terms from time to time[cite: 10]. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office[cite: 10]. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms[cite: 10].</li>
         </ul>
 
         <h3>12. Governing Law</h3>
         <ul class="feature-list" style="list-style: none; padding-left: 0;">
-            <li style="padding-left: 0; margin-bottom: 10px;"><strong>12.1</strong> These Terms are governed by the laws of Kenya. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts[cite: 10].</li>
+            <li style="padding-left: 0; margin-bottom: 10px;"><strong>12.1</strong> These Terms are governed by the laws of Kenya[cite: 10]. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts[cite: 10].</li>
         </ul>
 
         <h3>13. Contact</h3>
