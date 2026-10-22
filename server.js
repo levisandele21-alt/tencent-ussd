@@ -429,7 +429,7 @@ function renderPage({ title, activeNav, content }) {
                 h2 { color: #38bdf8; font-size: 2rem; margin-top: 0; }
                 h3 { color: #38bdf8; margin-top: 30px; }
                 .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
-                .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; border-left: 3px solid var(--primary); padding-left: 15px; }
+                .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; }
                 
                 /* Bullet & Feature Lists */
                 ul.feature-list { list-style: none; padding: 0; margin: 20px 0; }
@@ -783,7 +783,7 @@ app.get('/terms', (req, res) => {
             <li style="padding-left: 0; margin-bottom: 10px;"><strong>13.1</strong> For billing, support, or installation enquiries, contact Tencent Innovations on Calls 0740 311 014, WhatsApp 0769 306 917, or visit the office in Rangwe, Homa Bay County[cite: 10].</li>
         </ul>
     `;
-    res.res ? res.res(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content })) : res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
+    res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
 });
 
 // 5. Electric Fence Page
