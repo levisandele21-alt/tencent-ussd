@@ -160,12 +160,12 @@ function mpesaConfigured() {
 
 // The server decides the price. The form only says which service was chosen.
 const SERVICE_PRICES = {
-    'Site Survey & Quotation': 1500,
-    'WiFi Setup': 2500,
-    'CCTV Installation': 2000,
-    'Smart Locks': 2000,
-    'Electric Fence': 3000,
-    'Solar Consultation': 2500
+    'Site Survey & Quotation': 3000,
+    'WiFi Setup': 3000,
+    'CCTV Installation': 3000,
+    'Smart Locks': 2500,
+    'Electric Fence': 5000,
+    'Solar Consultation': 4000
 };
 
 // Accepts 0712345678, 712345678, 254712345678, +254712345678 (and 01xx numbers)
@@ -966,22 +966,22 @@ app.post('/ussd', (req, res) => {
 5. Solar Backup Power
 6. Site Survey & Visit`;
     } else if (text === '1') {
-        response = `CON WiFi Consultation: KES 2,500
+        response = `CON WiFi Consultation: KES 3,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '2') {
-        response = `CON CCTV Survey: KES 2,000
+        response = `CON CCTV Survey: KES 3,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '3') {
-        response = `CON Smart Locks Consultation: KES 2,000
+        response = `CON Smart Locks Consultation: KES 2,500
 1. Confirm & Pay via M-PESA`;
     } else if (text === '4') {
-        response = `CON Electric Fence Survey: KES 3,000
+        response = `CON Electric Fence Survey: KES 5,000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '5') {
-        response = `CON Solar Consultation: KES 2,500
+        response = `CON Solar Consultation: KES 4000
 1. Confirm & Pay via M-PESA`;
     } else if (text === '6') {
-        response = `CON Site Survey: KES 1,500
+        response = `CON Site Survey: KES 3000
 1. Confirm & Pay via M-PESA`;
     } else if (text.endsWith('*1')) {
         response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
