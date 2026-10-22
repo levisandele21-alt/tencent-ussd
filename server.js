@@ -466,7 +466,7 @@ function renderPage({ title, activeNav, content }) {
                     </div>
                 </div>
                 <div class="footer-bottom">
-                    <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Secure USSD & Multi-Page Web Platform.</p>
+                    <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations.</p>
                 </div>
             </footer>
         </body>
