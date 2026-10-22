@@ -848,13 +848,14 @@ app.get('/survey', (req, res) => {
                 <div class="form-group">
                     <label>Service Category</label>
                     <select name="service">
-                        <option value="Site Survey & Quotation">General Site Survey (KES 1,500)</option>
-                        <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 2,500)</option>
-                        <option value="CCTV Installation">CCTV System Assessment (KES 2,000)</option>
-                        <option value="Smart Locks">Smart Locks Consultation (KES 2,000)</option>
-                        <option value="Electric Fence">Electric Fence Survey (KES 3,000)</option>
-                        <option value="Solar Consultation">Solar Consultation & Sizing (KES 2,500)</option>
+                        <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
+                        <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
+                        <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
+                        <option value="Smart Locks">Smart Locks Consultation (KES 2,500)</option>
+                        <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
+                        <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
                     </select>
+                    <small style="display:block; margin-top:6px; color:var(--muted);">Prices can change according to the location and urgency. Thank you.</small>
                 </div>
                 <div class="form-group">
                     <label>Physical Location / Address</label>
@@ -967,21 +968,27 @@ app.post('/ussd', (req, res) => {
 6. Site Survey & Visit`;
     } else if (text === '1') {
         response = `CON WiFi Consultation: KES 3,000
+(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '2') {
         response = `CON CCTV Survey: KES 3,000
+(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '3') {
         response = `CON Smart Locks Consultation: KES 2,500
+(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '4') {
         response = `CON Electric Fence Survey: KES 5,000
+(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '5') {
-        response = `CON Solar Consultation: KES 4000
+        response = `CON Solar Consultation: KES 4,000
+(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text === '6') {
-        response = `CON Site Survey: KES 3000
+        response = `CON Site Survey: KES 3,000
+(Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
     } else if (text.endsWith('*1')) {
         response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
