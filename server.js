@@ -17,7 +17,7 @@ app.use(
     })
 );
 
-// 3. Trust Render's Proxy (Prevents IP-spoofing and fixes rate limiter behind cloud load balancers)
+// 3. Trust Render's Proxy (Ensures accurate client IP tracking for rate limiters)
 app.set('trust proxy', 1);
 
 // 4. Rate Limiting & Payload Body Limits
@@ -788,6 +788,11 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
+// Safely redirect accidental GET requests on the payment route back to surveys
+app.get('/submit-survey-payment', (req, res) => {
+    res.redirect('/survey');
+});
+
 // Handle Payment Submission & STK Push (Universal for Surveys & Solar)
 app.post('/submit-survey-payment', payLimiter, async (req, res) => {
     const { name, phone: rawPhone, service, location, propertyType } = req.body;
@@ -827,7 +832,7 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
     };
     bookings.set(bookingId, booking);
 
-    if (!mpesaConfigured()) {
+    if (!MPESA.key || !MPESA.secret || !MPESA.shortcode || !MPESA.passkey || !MPESA.publicBaseUrl) {
         await notify(`📝 PENDING (M-Pesa unconfigured): ${service} - ${name}`, bookingFields(booking));
         return res.send(renderPage({
             title: 'Booking Received',
@@ -931,13 +936,6 @@ app.post('/ussd', (req, res) => {
 
     res.set('Content-Type', 'text/plain');
     res.send(response);
-    // Universal timeout helper compatible with all Node.js versions
-function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    return fetch(url, { ...options, signal: controller.signal })
-        .finally(() => clearTimeout(timer));
-}
 });
 
 const PORT = process.env.PORT || 10000;
