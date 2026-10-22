@@ -3,6 +3,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -23,7 +24,16 @@ app.set('trust proxy', 1);
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
-    message: 'Too many requests from this IP, please try again later.'
+    message: 'Too many requests from this IP, please try again later.',
+    // Safaricom callbacks and the payment status poll must never be throttled by this general limit
+    skip: (req) => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
+});
+
+// Strict limit on the payment form: stops people spamming M-Pesa prompts
+const payLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 10,
+    message: 'Too many payment attempts from this network. Please try again later.'
 });
 app.use(limiter);
 
@@ -110,6 +120,272 @@ async function notify(subject, fields) {
     if (results[0].status === 'rejected') console.error('Telegram notification failed:', results[0].reason && results[0].reason.message);
     if (results[1].status === 'rejected') console.error('Notification email failed:', results[1].reason && results[1].reason.message);
 }
+
+// ---------------------------------------------------------------
+// M-Pesa (Daraja) STK Push for a PAYBILL shortcode
+//
+// Env vars on Render:
+//   MPESA_ENV              sandbox (default) or production
+//   MPESA_CONSUMER_KEY     from the Daraja portal
+//   MPESA_CONSUMER_SECRET  from the Daraja portal
+//   MPESA_SHORTCODE        sandbox test shortcode, later your Paybill number
+//   MPESA_PASSKEY          sandbox test passkey, later your production passkey
+//   MPESA_CALLBACK_SECRET  a long random string (32+ characters) you invent
+//   PUBLIC_BASE_URL        https://tencent-ussd.onrender.com (no trailing slash)
+//
+// NOTE: bookings are kept in memory. They are lost when the server restarts,
+// so add a database before relying on this for real money. Every lead and
+// every confirmed payment is also sent to you by Telegram/email.
+// ---------------------------------------------------------------
+const MPESA = {
+    production: process.env.MPESA_ENV === 'production',
+    key: process.env.MPESA_CONSUMER_KEY,
+    secret: process.env.MPESA_CONSUMER_SECRET,
+    shortcode: process.env.MPESA_SHORTCODE,
+    passkey: process.env.MPESA_PASSKEY,
+    callbackSecret: process.env.MPESA_CALLBACK_SECRET,
+    publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
+};
+// MPESA_BASE_URL exists only so tests can point at a mock server
+MPESA.baseUrl = process.env.MPESA_BASE_URL ||
+    (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
+
+function mpesaConfigured() {
+    return Boolean(
+        MPESA.key && MPESA.secret && MPESA.shortcode && MPESA.passkey &&
+        MPESA.callbackSecret && MPESA.callbackSecret.length >= 16 &&
+        MPESA.publicBaseUrl.startsWith('https://')
+    );
+}
+
+// The server decides the price. The form only says which service was chosen.
+const SERVICE_PRICES = {
+    'Site Survey & Quotation': 1500,
+    'WiFi Setup': 2500,
+    'CCTV Installation': 2000,
+    'Smart Locks': 2000,
+    'Electric Fence': 3000,
+    'Solar Consultation': 2500
+};
+
+// Accepts 0712345678, 712345678, 254712345678, +254712345678 (and 01xx numbers)
+function normalizePhone(raw) {
+    let p = String(raw || '').replace(/[\s\-()]/g, '');
+    if (p.startsWith('+')) p = p.slice(1);
+    if (/^0[17]\d{8}$/.test(p)) p = '254' + p.slice(1);
+    else if (/^[17]\d{8}$/.test(p)) p = '254' + p;
+    return /^254[17]\d{8}$/.test(p) ? p : null;
+}
+
+// In-memory stores
+const bookings = new Map();      // booking id -> booking
+const byCheckout = new Map();    // CheckoutRequestID -> booking
+const phoneAttempts = new Map(); // phone -> [timestamps]
+
+function phoneAttemptAllowed(phone) {
+    const now = Date.now();
+    const recent = (phoneAttempts.get(phone) || []).filter(t => now - t < 60 * 60 * 1000);
+    if (recent.length >= 3) { phoneAttempts.set(phone, recent); return false; }
+    recent.push(now);
+    phoneAttempts.set(phone, recent);
+    return true;
+}
+
+// Tidy old data every 30 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, b] of bookings) {
+        if (now - b.createdAt > 24 * 60 * 60 * 1000) {
+            bookings.delete(id);
+            if (b.checkoutRequestId) byCheckout.delete(b.checkoutRequestId);
+        }
+    }
+    for (const [p, arr] of phoneAttempts) {
+        const recent = arr.filter(t => now - t < 60 * 60 * 1000);
+        if (recent.length) phoneAttempts.set(p, recent); else phoneAttempts.delete(p);
+    }
+}, 30 * 60 * 1000).unref();
+
+let tokenCache = { value: null, expiresAt: 0 };
+async function getAccessToken() {
+    if (tokenCache.value && Date.now() < tokenCache.expiresAt) return tokenCache.value;
+    const auth = Buffer.from(`${MPESA.key}:${MPESA.secret}`).toString('base64');
+    const resp = await fetch(`${MPESA.baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
+        headers: { Authorization: `Basic ${auth}` },
+        signal: AbortSignal.timeout(15000)
+    });
+    if (!resp.ok) throw new Error(`Daraja authentication failed (HTTP ${resp.status})`);
+    const data = await resp.json();
+    tokenCache = {
+        value: data.access_token,
+        expiresAt: Date.now() + (Number(data.expires_in || 3599) - 60) * 1000
+    };
+    return tokenCache.value;
+}
+
+// Daraja timestamps are YYYYMMDDHHmmss in Nairobi time (UTC+3)
+function darajaTimestamp() {
+    return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
+}
+function darajaPassword(timestamp) {
+    return Buffer.from(`${MPESA.shortcode}${MPESA.passkey}${timestamp}`).toString('base64');
+}
+
+async function darajaPost(path, payload) {
+    const token = await getAccessToken();
+    const resp = await fetch(`${MPESA.baseUrl}${path}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000)
+    });
+    let data = {};
+    try { data = await resp.json(); } catch (_) { /* non-JSON body */ }
+    if (!resp.ok) {
+        const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
+        err.status = resp.status;
+        throw err;
+    }
+    return data;
+}
+
+async function stkPush(booking) {
+    const timestamp = darajaTimestamp();
+    const data = await darajaPost('/mpesa/stkpush/v1/processrequest', {
+        BusinessShortCode: MPESA.shortcode,
+        Password: darajaPassword(timestamp),
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: booking.amount,
+        PartyA: booking.phone,
+        PartyB: MPESA.shortcode,
+        PhoneNumber: booking.phone,
+        // Path avoids words like "mpesa"/"safaricom", which Safaricom may reject in callback URLs
+        CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
+        AccountReference: booking.accountRef,   // max 12 chars; shows as the Paybill account number
+        TransactionDesc: 'Survey fee'
+    });
+    if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
+    return data; // contains MerchantRequestID and CheckoutRequestID
+}
+
+async function stkQuery(checkoutRequestId) {
+    const timestamp = darajaTimestamp();
+    return darajaPost('/mpesa/stkpushquery/v1/query', {
+        BusinessShortCode: MPESA.shortcode,
+        Password: darajaPassword(timestamp),
+        Timestamp: timestamp,
+        CheckoutRequestID: checkoutRequestId
+    });
+}
+
+function bookingFields(b, extra = {}) {
+    return {
+        Name: b.name,
+        Phone: b.phone,
+        Service: b.service,
+        Location: b.location,
+        Amount: `KES ${b.amount}`,
+        Reference: b.accountRef,
+        ...extra
+    };
+}
+
+async function markPaid(booking, receipt, verified) {
+    if (booking.status === 'paid') return;   // idempotent: duplicate callbacks do nothing
+    booking.status = 'paid';
+    booking.receipt = receipt || '';
+    booking.paidAt = Date.now();
+    await notify(`✅ PAID: ${booking.service} - ${booking.name}`, bookingFields(booking, {
+        'M-Pesa receipt': receipt || '(see M-Pesa statement, match the Reference)',
+        Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only (status query was unavailable)'
+    }));
+}
+
+function markFailed(booking, reason) {
+    if (booking.status !== 'pending') return;
+    booking.status = 'failed';
+    console.log('PAYMENT NOT COMPLETED:', JSON.stringify({ id: booking.id, reason }));
+}
+
+async function handleCallback(body) {
+    const cb = body && body.Body && body.Body.stkCallback;
+    if (!cb) return;
+    const booking = byCheckout.get(cb.CheckoutRequestID);
+    if (!booking) {
+        console.log('Callback for unknown CheckoutRequestID:', cb.CheckoutRequestID);
+        return;
+    }
+
+    const succeeded = Number(cb.ResultCode) === 0;
+    const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
+    const meta = name => { const it = items.find(i => i.Name === name); return it ? it.Value : undefined; };
+    const receipt = String(meta('MpesaReceiptNumber') || '');
+
+    if (booking.status === 'paid') {
+        if (succeeded && receipt && !booking.receipt) booking.receipt = receipt;
+        return;
+    }
+    if (!succeeded) { markFailed(booking, cb.ResultDesc); return; }
+
+    // The amount paid must match the price we asked for
+    if (Number(meta('Amount')) !== booking.amount) {
+        booking.status = 'review';
+        await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
+            'Amount reported by callback': String(meta('Amount')),
+            'M-Pesa receipt': receipt
+        }));
+        return;
+    }
+
+    // Do not trust the callback alone: ask Safaricom directly
+    let verified = false;
+    try {
+        const q = await stkQuery(booking.checkoutRequestId);
+        verified = String(q.ResultCode) === '0';
+        if (!verified) {
+            booking.status = 'review';
+            await notify(`⚠️ CHECK PAYMENT: callback and status query disagree for ${booking.name}`, bookingFields(booking, {
+                'M-Pesa receipt': receipt,
+                'Query result': `${q.ResultCode} ${q.ResultDesc || ''}`
+            }));
+            return;
+        }
+    } catch (err) {
+        console.error('STK status query failed, accepting callback only:', err.message);
+    }
+    await markPaid(booking, receipt, verified);
+}
+
+// Safaricom calls this when the customer pays, cancels or times out.
+// The secret in the URL stops strangers from posting fake "payments".
+app.post('/payments/cb/:secret', (req, res) => {
+    const given = Buffer.from(String(req.params.secret));
+    const expected = Buffer.from(String(MPESA.callbackSecret || ''));
+    const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
+    if (!ok) return res.sendStatus(404);
+
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
+    handleCallback(req.body).catch(err => console.error('Callback handling error:', err.message));
+});
+
+// The "Check your phone" page polls this. If the callback never arrives
+// (for example the server was asleep), it asks Safaricom directly.
+app.get('/payments/status/:id', async (req, res) => {
+    const b = bookings.get(String(req.params.id));
+    if (!b) return res.status(404).json({ status: 'unknown' });
+
+    if (b.status === 'pending' && b.checkoutRequestId &&
+        Date.now() - b.createdAt > 25000 && Date.now() - (b.lastQuery || 0) > 12000) {
+        b.lastQuery = Date.now();
+        try {
+            const q = await stkQuery(b.checkoutRequestId);
+            if (String(q.ResultCode) === '0') await markPaid(b, '', true);
+            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') markFailed(b, q.ResultDesc);
+        } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
+    }
+    res.json({ status: b.status });
+});
 
 // Shared Layout Template Helper
 function renderPage({ title, activeNav, content }) {
@@ -559,7 +835,7 @@ app.get('/survey', (req, res) => {
 
         <div class="form-container" style="border-color: var(--accent);">
             <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will trigger an instant M-Pesa prompt on your phone for the KES 1,500 survey fee.</p>
+            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will send an M-Pesa prompt to your phone for the fee shown next to the service you choose.</p>
             <form action="/submit-survey-payment" method="POST">
                 <div class="form-group">
                     <label>Full Name</label>
@@ -591,22 +867,88 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-// Handle M-PESA STK Push Survey Submission (emails you instantly)
-// NOTE: the real Daraja STK push call is not implemented yet; this only records the booking.
-app.post('/submit-survey-payment', async (req, res) => {
-    const { name, phone, service, location } = req.body;
+// Handle Survey Booking + M-Pesa STK Push
+app.post('/submit-survey-payment', payLimiter, async (req, res) => {
+    const str = v => (typeof v === 'string' ? v.trim() : '');
+    const name = str(req.body.name).slice(0, 80);
+    const location = str(req.body.location).slice(0, 120);
+    const service = str(req.body.service);
+    const phone = normalizePhone(str(req.body.phone));
 
-    await notify(`📋 Survey booking: ${name || 'Unknown'} - ${service || 'n/a'}`, {
-        Name: name,
-        Phone: phone,
-        Service: service,
-        Location: location
-    });
+    const problem = (message, status = 400) => res.status(status).send(renderPage({
+        title: 'Booking Problem',
+        activeNav: 'survey',
+        content: `<h2>We could not start your payment</h2><p class="intro-text">${esc(message)}</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
+    }));
+
+    if (!name || !location) return problem('Please enter your name and location.');
+    if (!Object.hasOwn(SERVICE_PRICES, service)) return problem('Please choose a valid service.');
+    if (!phone) return problem('Please enter a valid Safaricom number, for example 0712345678.');
+    if (!phoneAttemptAllowed(phone)) return problem('Too many payment requests for this number. Please try again later.', 429);
+
+    const id = crypto.randomBytes(8).toString('hex');
+    const booking = {
+        id, name, phone, service, location,
+        amount: SERVICE_PRICES[service],            // price comes from the server, never from the form
+        status: 'pending',
+        createdAt: Date.now(),
+        accountRef: 'TNC' + id.slice(0, 8).toUpperCase()
+    };
+    bookings.set(id, booking);
+
+    // Tell you about the lead right away, so it is never lost even if payment fails
+    notify(`📋 Survey booking (awaiting payment): ${name} - ${service}`, bookingFields(booking))
+        .catch(() => {});
+
+    if (!mpesaConfigured()) {
+        booking.status = 'failed';
+        console.error('M-Pesa is not fully configured (check MPESA_* variables and PUBLIC_BASE_URL).');
+        return problem('Online payment is not available right now. We have saved your request and will call you.', 503);
+    }
+
+    try {
+        const r = await stkPush(booking);
+        booking.checkoutRequestId = r.CheckoutRequestID;
+        booking.merchantRequestId = r.MerchantRequestID;
+        byCheckout.set(r.CheckoutRequestID, booking);
+    } catch (err) {
+        console.error('STK push failed:', err.message);
+        booking.status = 'failed';
+        return problem('We could not send the M-Pesa prompt. Please check your number and try again, or call us on 0740 311 014.', 502);
+    }
 
     res.send(renderPage({
-        title: 'M-Pesa Prompt Sent',
+        title: 'Check Your Phone',
         activeNav: 'survey',
-        content: `<h2>Payment Prompt Sent!</h2><p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa STK push has been sent to <strong>${esc(phone)}</strong> for your booking in <strong>${esc(location)}</strong>. Enter your PIN to confirm and an engineer will call you to schedule the visit.</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
+        content: `
+            <h2>Check your phone</h2>
+            <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa prompt for <strong>KES ${booking.amount}</strong> has been sent to <strong>${esc(phone)}</strong>. Enter your M-Pesa PIN to pay.</p>
+            <p id="pay-status" class="sub-title">Waiting for your payment...</p>
+            <a href="/survey" class="cta-btn">Back to Surveys</a>
+            <script>
+            (function () {
+                var id = ${JSON.stringify(id)}, tries = 0, box = document.getElementById('pay-status');
+                function poll() {
+                    tries++;
+                    fetch('/payments/status/' + id).then(function (r) { return r.json(); }).then(function (d) {
+                        if (d.status === 'paid') {
+                            box.textContent = 'Payment received. Thank you! An engineer will call you to schedule the visit.';
+                        } else if (d.status === 'failed') {
+                            box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
+                        } else if (d.status === 'review') {
+                            box.textContent = 'We are confirming your payment and will call you shortly.';
+                        } else if (tries < 40) {
+                            setTimeout(poll, 4000);
+                        } else {
+                            box.textContent = 'We have not seen the payment yet. If you paid, we will confirm and call you.';
+                        }
+                    }).catch(function () {
+                        if (tries < 40) setTimeout(poll, 4000);
+                    });
+                }
+                setTimeout(poll, 4000);
+            })();
+            </script>`
     }));
 });
 
