@@ -1,6 +1,7 @@
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
 const path = require('path');
 
 const app = express();
@@ -28,6 +29,62 @@ app.use(limiter);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ---------------------------------------------------------------
+// Email notifications (Gmail via Nodemailer)
+// Required env vars on Render: GMAIL_USER, GMAIL_APP_PASSWORD
+// Optional: NOTIFY_TO (defaults to GMAIL_USER)
+// ---------------------------------------------------------------
+const mailer = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD
+    }
+});
+
+// Escape user input so nobody can inject HTML into pages or emails
+function esc(value = '') {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Form fields may arrive as strings or arrays (e.g. checkboxes)
+function flat(value) {
+    return Array.isArray(value) ? value.join(', ') : (value || '');
+}
+
+// Send a lead alert. Never throws: a mail failure must not break the customer's page.
+async function notify(subject, fields) {
+    const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
+    const rows = Object.entries(fields)
+        .map(([label, val]) => {
+            const safe = esc(flat(val));
+            const display = /phone/i.test(label)
+                ? `<a href="tel:${safe}">${safe}</a>`
+                : safe;
+            return `<p><strong>${esc(label)}:</strong> ${display}</p>`;
+        })
+        .join('');
+    const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
+
+    try {
+        await mailer.sendMail({
+            from: `"Tencent Website" <${process.env.GMAIL_USER}>`,
+            to: process.env.NOTIFY_TO || process.env.GMAIL_USER,
+            subject: cleanSubject,
+            html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`
+        });
+    } catch (err) {
+        console.error('Notification email failed:', err.message);
+        // Keep the lead in Render logs so it is never lost
+        console.log('LEAD (email failed):', JSON.stringify({ subject: cleanSubject, fields, time }));
+    }
+}
 
 // Shared Layout Template Helper
 function renderPage({ title, activeNav, content }) {
@@ -184,13 +241,20 @@ app.get('/', (req, res) => {
     res.send(renderPage({ title: 'Home', activeNav: 'home', content }));
 });
 
-// Handle Callback Submission
-app.post('/submit-callback', (req, res) => {
+// Handle Callback Submission (emails you instantly)
+app.post('/submit-callback', async (req, res) => {
     const { name, phone, message } = req.body;
+
+    await notify(`📞 Callback request: ${name || 'Unknown'}`, {
+        Name: name,
+        Phone: phone,
+        Message: message
+    });
+
     res.send(renderPage({
         title: 'Callback Requested',
         activeNav: 'home',
-        content: `<h2>Thank You, ${name}!</h2><p class="intro-text">We have received your request. An engineer will call you at <strong>${phone}</strong> shortly.</p><a href="/" class="cta-btn">Back to Home</a>`
+        content: `<h2>Thank You, ${esc(name)}!</h2><p class="intro-text">We have received your request. An engineer will call you at <strong>${esc(phone)}</strong> shortly.</p><a href="/" class="cta-btn">Back to Home</a>`
     }));
 });
 
@@ -416,13 +480,21 @@ app.get('/solar', (req, res) => {
     res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
 });
 
-// Handle Solar Request Submission
-app.post('/submit-solar', (req, res) => {
-    const { propertyType, duration, phone } = req.body;
+// Handle Solar Request Submission (emails you instantly)
+app.post('/submit-solar', async (req, res) => {
+    const { propertyType, equipment, duration, phone } = req.body;
+
+    await notify(`☀️ Solar request: ${propertyType || 'Unknown'} (${duration || 'n/a'})`, {
+        'Property type': propertyType,
+        Equipment: equipment,
+        'Backup duration': duration,
+        Phone: phone
+    });
+
     res.send(renderPage({
         title: 'Solar Sizing Request Received',
         activeNav: 'solar',
-        content: `<h2>Solar Analysis in Progress</h2><p class="intro-text">We received your requirements for your <strong>${propertyType}</strong> with <strong>${duration}</strong> backup. Our solar engineers will compute your panel sizing and call <strong>${phone}</strong> with a precise quotation.</p><a href="/solar" class="cta-btn">Back to Solar</a>`
+        content: `<h2>Solar Analysis in Progress</h2><p class="intro-text">We received your requirements for your <strong>${esc(propertyType)}</strong> with <strong>${esc(duration)}</strong> backup. Our solar engineers will compute your panel sizing and call <strong>${esc(phone)}</strong> with a precise quotation.</p><a href="/solar" class="cta-btn">Back to Solar</a>`
     }));
 });
 
@@ -494,13 +566,22 @@ app.get('/survey', (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-// Handle M-PESA STK Push Survey Submission
-app.post('/submit-survey-payment', (req, res) => {
+// Handle M-PESA STK Push Survey Submission (emails you instantly)
+// NOTE: the real Daraja STK push call is not implemented yet; this only records the booking.
+app.post('/submit-survey-payment', async (req, res) => {
     const { name, phone, service, location } = req.body;
+
+    await notify(`📋 Survey booking: ${name || 'Unknown'} - ${service || 'n/a'}`, {
+        Name: name,
+        Phone: phone,
+        Service: service,
+        Location: location
+    });
+
     res.send(renderPage({
         title: 'M-Pesa Prompt Sent',
         activeNav: 'survey',
-        content: `<h2>Payment Prompt Sent!</h2><p class="intro-text">Thank you, <strong>${name}</strong>. An M-Pesa STK push has been sent to <strong>${phone}</strong> for your booking in <strong>${location}</strong>. Enter your PIN to confirm and an engineer will call you to schedule the visit.</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
+        content: `<h2>Payment Prompt Sent!</h2><p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa STK push has been sent to <strong>${esc(phone)}</strong> for your booking in <strong>${esc(location)}</strong>. Enter your PIN to confirm and an engineer will call you to schedule the visit.</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
     }));
 });
 
