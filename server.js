@@ -78,9 +78,11 @@ async function notify(subject, fields) {
     const rows = Object.entries(fields)
         .map(([label, val]) => {
             const safe = esc(flat(val));
-            const display = /phone/i.test(label)
-                ? `<a href="tel:${safe}">${safe}</a>`
-                : safe;
+            const display = /^https:\/\//.test(safe)
+                ? `<a href="${safe}">Tap to open</a>`
+                : /phone/i.test(label)
+                    ? `<a href="tel:${safe}">${safe}</a>`
+                    : safe;
             return `<p><strong>${esc(label)}:</strong> ${display}</p>`;
         })
         .join('');
@@ -132,6 +134,9 @@ async function notify(subject, fields) {
 //   MPESA_PASSKEY          sandbox test passkey, later your production passkey
 //   MPESA_CALLBACK_SECRET  a long random string (32+ characters) you invent
 //   PUBLIC_BASE_URL        https://tencent-ussd.onrender.com (no trailing slash)
+//   LINK_SECRET            optional: long random string that signs booking links.
+//                          Set it once and never change it, or old links stop working.
+//                          If missing, MPESA_CALLBACK_SECRET is used instead.
 //
 // NOTE: bookings are kept in memory. They are lost when the server restarts,
 // so add a database before relying on this for real money. Every lead and
@@ -291,15 +296,54 @@ function bookingFields(b, extra = {}) {
     };
 }
 
+// ---- Signed booking links -------------------------------------------------
+// The link carries the booking details and a signature, so nothing needs to be
+// stored: it keeps working after restarts, and nobody can forge or edit one.
+const LINK_SECRET = process.env.LINK_SECRET || MPESA.callbackSecret || '';
+
+function linksEnabled() {
+    return LINK_SECRET.length >= 16 && MPESA.publicBaseUrl.startsWith('https://');
+}
+function signLinkPart(part) {
+    return crypto.createHmac('sha256', LINK_SECRET).update(part).digest('base64url');
+}
+function makeBookingLink(b) {
+    if (!linksEnabled()) return '';
+    const part = Buffer.from(JSON.stringify({
+        n: b.name, p: b.phone, s: b.service, a: b.amount,
+        r: b.receipt || '', f: b.accountRef, l: b.location, t: b.paidAt || Date.now()
+    })).toString('base64url');
+    return `${MPESA.publicBaseUrl}/booking/${part}.${signLinkPart(part)}`;
+}
+function readBookingLink(token) {
+    if (LINK_SECRET.length < 16) return null;
+    const dot = token.lastIndexOf('.');
+    if (dot < 1) return null;
+    const part = token.slice(0, dot);
+    const given = Buffer.from(token.slice(dot + 1));
+    const expected = Buffer.from(signLinkPart(part));
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+    try { return JSON.parse(Buffer.from(part, 'base64url').toString('utf8')); } catch (_) { return null; }
+}
+
 async function markPaid(booking, receipt, verified) {
     if (booking.status === 'paid') return;   // idempotent: duplicate callbacks do nothing
     booking.status = 'paid';
     booking.receipt = receipt || '';
     booking.paidAt = Date.now();
-    await notify(`✅ PAID: ${booking.service} - ${booking.name}`, bookingFields(booking, {
+    booking.link = makeBookingLink(booking);
+
+    const extra = {
         'M-Pesa receipt': receipt || '(see M-Pesa statement, match the Reference)',
         Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only (status query was unavailable)'
-    }));
+    };
+    if (booking.link) {
+        extra['Booking link'] = booking.link;
+        // One tap opens WhatsApp with the client's number and the message already typed
+        const msg = `Hello ${booking.name}, your Tencent Innovations booking is confirmed (${booking.service}, KES ${booking.amount} paid). Your booking details: ${booking.link}`;
+        extra['Send to client on WhatsApp'] = `https://wa.me/${booking.phone}?text=${encodeURIComponent(msg)}`;
+    }
+    await notify(`✅ PAID: ${booking.service} - ${booking.name}`, bookingFields(booking, extra));
 }
 
 function markFailed(booking, reason) {
@@ -384,7 +428,7 @@ app.get('/payments/status/:id', async (req, res) => {
             else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') markFailed(b, q.ResultDesc);
         } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
     }
-    res.json({ status: b.status });
+    res.json({ status: b.status, link: b.status === 'paid' ? (b.link || '') : '' });
 });
 
 // Shared Layout Template Helper
@@ -429,7 +473,7 @@ function renderPage({ title, activeNav, content }) {
                 h2 { color: #38bdf8; font-size: 2rem; margin-top: 0; }
                 h3 { color: #38bdf8; margin-top: 30px; }
                 .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
-                .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; border-left: 3px solid var(--primary); padding-left: 15px; }
+                .intro-text { font-size: 1.1rem; color: #e2e8f0; margin-bottom: 25px; }
                 
                 /* Bullet & Feature Lists */
                 ul.feature-list { list-style: none; padding: 0; margin: 20px 0; }
@@ -936,6 +980,7 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
             <h2>Check your phone</h2>
             <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa prompt for <strong>KES ${booking.amount}</strong> has been sent to <strong>${esc(phone)}</strong>. Enter your M-Pesa PIN to pay.</p>
             <p id="pay-status" class="sub-title">Waiting for your payment...</p>
+            <div id="pay-links"></div>
             <a href="/survey" class="cta-btn">Back to Surveys</a>
             <script>
             (function () {
@@ -945,6 +990,23 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
                     fetch('/payments/status/' + id).then(function (r) { return r.json(); }).then(function (d) {
                         if (d.status === 'paid') {
                             box.textContent = 'Payment received. Thank you! An engineer will call you to schedule the visit.';
+                            var holder = document.getElementById('pay-links');
+                            if (d.link && d.link.indexOf('https://') === 0 && holder && !holder.firstChild) {
+                                var view = document.createElement('a');
+                                view.href = d.link;
+                                view.className = 'cta-btn';
+                                view.style.marginBottom = '12px';
+                                view.textContent = 'View your booking confirmation';
+                                var share = document.createElement('a');
+                                share.href = 'https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking confirmation: ' + d.link);
+                                share.className = 'cta-btn';
+                                share.style.marginBottom = '12px';
+                                share.target = '_blank';
+                                share.rel = 'noopener';
+                                share.textContent = 'Share on WhatsApp';
+                                holder.appendChild(view);
+                                holder.appendChild(share);
+                            }
                         } else if (d.status === 'failed') {
                             box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
                         } else if (d.status === 'review') {
@@ -961,6 +1023,49 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
                 setTimeout(poll, 4000);
             })();
             </script>`
+    }));
+});
+
+// Private booking confirmation page. The link is signed, so it cannot be forged or edited.
+app.get('/booking/:token', (req, res) => {
+    res.set('X-Robots-Tag', 'noindex, nofollow');
+    res.set('Cache-Control', 'private, no-store');
+    const d = readBookingLink(String(req.params.token));
+    if (!d) {
+        return res.status(404).send(renderPage({
+            title: 'Link Not Valid',
+            activeNav: 'survey',
+            content: `<h2>This link is not valid</h2><p class="intro-text">Please check the link you were sent, or call us on 0740 311 014.</p><a href="/" class="cta-btn">Back to Home</a>`
+        }));
+    }
+
+    const row = (label, value) => `<tr><td style="padding:10px 8px; color:var(--muted); border-bottom:1px solid #334155;">${label}</td><td style="padding:10px 8px; text-align:right; border-bottom:1px solid #334155;">${value}</td></tr>`;
+    const phone = esc(d.p);
+    const paidAt = new Date(Number(d.t) || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
+    const amount = Number(d.a).toLocaleString('en-KE');
+
+    res.send(renderPage({
+        title: 'Booking Confirmed',
+        activeNav: 'survey',
+        content: `
+            <h2>Booking confirmed</h2>
+            <p class="sub-title">Payment received. Keep this page as your receipt.</p>
+            <div class="form-container" style="border-color: var(--accent);">
+                <table style="width:100%; border-collapse:collapse;">
+                    ${row('Status', '<strong style="color:var(--accent);">PAID</strong>')}
+                    ${row('Name', esc(d.n))}
+                    ${row('Phone', '<a href="tel:' + phone + '" style="color:#38bdf8;">' + phone + '</a>')}
+                    ${row('Service', esc(d.s))}
+                    ${row('Location', esc(d.l))}
+                    ${row('Amount paid', 'KES ' + esc(amount))}
+                    ${row('M-Pesa receipt', esc(d.r) || 'See your M-Pesa SMS')}
+                    ${row('Reference', esc(d.f))}
+                    ${row('Paid on', esc(paidAt) + ' (EAT)')}
+                </table>
+            </div>
+            <p style="margin-top:20px;">An engineer will call you to agree a time for the visit.</p>
+            <a href="tel:0740311014" class="cta-btn" style="margin-top:10px;">Call Tencent Innovations: 0740 311 014</a>
+            <a href="https://wa.me/254769306917" class="cta-btn" style="margin-top:12px;">WhatsApp us</a>`
     }));
 });
 
