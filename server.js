@@ -4,6 +4,16 @@ const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+
+// PDF receipts need the "pdfkit" package. If it is missing the site still runs,
+// and the download buttons simply do not appear.
+let PDFDocument = null;
+try {
+    PDFDocument = require('pdfkit');
+} catch (_) {
+    console.error('pdfkit is not installed: PDF receipts are disabled. Add "pdfkit" to package.json dependencies.');
+}
 
 const app = express();
 
@@ -343,6 +353,7 @@ async function markPaid(booking, receipt, verified) {
     };
     if (booking.link) {
         extra['Booking link'] = booking.link;
+        if (PDFDocument) extra['Receipt PDF'] = booking.link + '/receipt.pdf';
         // One tap opens WhatsApp with the client's number and the message already typed
         const msg = `Hello ${booking.name}, your Tencent Innovations booking is confirmed (${booking.service}, KES ${booking.amount} paid). Your booking details: ${booking.link}`;
         extra['Send to client on WhatsApp'] = `https://wa.me/${booking.phone}?text=${encodeURIComponent(msg)}`;
@@ -432,7 +443,8 @@ app.get('/payments/status/:id', async (req, res) => {
             else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') markFailed(b, q.ResultDesc);
         } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
     }
-    res.json({ status: b.status, link: b.status === 'paid' ? (b.link || '') : '' });
+    const paidLink = b.status === 'paid' ? (b.link || '') : '';
+    res.json({ status: b.status, link: paidLink, pdf: (paidLink && PDFDocument) ? paidLink + '/receipt.pdf' : '' });
 });
 
 // Shared Layout Template Helper
@@ -1008,6 +1020,16 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
                                 viewBtn.textContent = 'View your booking confirmation';
                                 if (shareBtn) shareBtn.href = 'https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking confirmation: ' + d.link);
                             }
+                            var linksBox = document.getElementById('pay-links');
+                            if (d.pdf && d.pdf.indexOf('https://') === 0 && linksBox && !document.getElementById('pay-pdf')) {
+                                var pdfBtn = document.createElement('a');
+                                pdfBtn.id = 'pay-pdf';
+                                pdfBtn.href = d.pdf;
+                                pdfBtn.className = 'cta-btn';
+                                pdfBtn.style.marginBottom = '12px';
+                                pdfBtn.textContent = 'Download receipt (PDF)';
+                                linksBox.appendChild(pdfBtn);
+                            }
                         } else if (d.status === 'failed') {
                             box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
                         } else if (d.status === 'review') {
@@ -1109,11 +1131,107 @@ app.get('/booking/:token', (req, res) => {
                 <table style="width:100%; border-collapse:collapse;">${rows}</table>
             </div>
             <p style="margin-top:20px;">${isPaid ? 'An engineer will call you to agree a time for the visit.' : 'Questions? Call or WhatsApp us below.'}</p>
+            ${isPaid && PDFDocument ? '<a href="/booking/' + esc(req.params.token) + '/receipt.pdf" class="cta-btn" style="margin-top:10px;">Download receipt (PDF)</a>' : ''}
             ${state === 'failed' ? '<a href="/survey" class="cta-btn" style="margin-top:10px;">Book again</a>' : ''}
             <a href="tel:0740311014" class="cta-btn" style="margin-top:12px;">Call Tencent Innovations: 0740 311 014</a>
             <a href="https://wa.me/254769306917" class="cta-btn" style="margin-top:12px;">WhatsApp us</a>
             ${poller}`
     }));
+});
+
+// ---- Downloadable PDF receipt ---------------------------------------------
+// Built on the fly from the signed link, so nothing is stored.
+// The built-in PDF fonts only cover Latin characters, so anything else becomes "?".
+const pdfText = v => String(v == null ? '' : v)
+    .replace(/[ -​  　]/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[^\x20-\x7E -ÿ]/g, '?');
+
+function sendReceiptPdf(d, res) {
+    const doc = new PDFDocument({
+        size: 'A5',
+        margin: 40,
+        info: { Title: 'Payment Receipt - Tencent Innovations', Author: 'Tencent Innovations' }
+    });
+    const ref = pdfText(d.f).replace(/[^A-Za-z0-9_-]/g, '') || 'receipt';
+    res.set({
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': `attachment; filename="Tencent-Receipt-${ref}.pdf"`,
+        'Cache-Control': 'private, no-store',
+        'X-Robots-Tag': 'noindex, nofollow'
+    });
+    doc.on('error', err => { console.error('PDF error:', err.message); res.destroy(); });
+    doc.pipe(res);
+
+    const left = 40, right = doc.page.width - 40, width = right - left;
+    const navy = '#0f172a', grey = '#64748b', green = '#16a34a';
+
+    // Header: logo (if logo.png is in the project folder) and company details
+    let textX = left;
+    try {
+        const logoPath = path.join(__dirname, 'logo.png');
+        if (fs.existsSync(logoPath)) { doc.image(logoPath, left, 40, { fit: [56, 56] }); textX = left + 68; }
+    } catch (_) { textX = left; }
+    doc.fillColor(navy).font('Helvetica-Bold').fontSize(16).text('Tencent Innovations', textX, 42);
+    doc.fillColor(grey).font('Helvetica').fontSize(8.5)
+        .text('Rangwe, Homa Bay County, Kenya', textX, doc.y + 1)
+        .text('Calls: 0740 311 014  |  WhatsApp: 0769 306 917', textX, doc.y)
+        .text('tencentbz@gmail.com', textX, doc.y);
+    let y = Math.max(doc.y, 100) + 14;
+
+    doc.moveTo(left, y).lineTo(right, y).lineWidth(1).strokeColor('#cbd5e1').stroke();
+    y += 16;
+
+    // Title and PAID badge
+    doc.fillColor(navy).font('Helvetica-Bold').fontSize(14).text('PAYMENT RECEIPT', left, y);
+    doc.roundedRect(right - 54, y - 2, 54, 20, 4).fill(green);
+    doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(10).text('PAID', right - 54, y + 3, { width: 54, align: 'center' });
+    y += 34;
+
+    // Detail rows
+    const valueX = left + 112, valueW = right - valueX;
+    const line = (label, value, big = false) => {
+        const v = pdfText(value);
+        doc.font(big ? 'Helvetica-Bold' : 'Helvetica').fontSize(big ? 12 : 10);
+        const h = Math.max(doc.heightOfString(v, { width: valueW }), 13);
+        doc.fillColor(grey).font('Helvetica').fontSize(9).text(pdfText(label), left, y + 1, { width: 104 });
+        doc.fillColor(navy).font(big ? 'Helvetica-Bold' : 'Helvetica').fontSize(big ? 12 : 10).text(v, valueX, y, { width: valueW });
+        y += h + 9;
+        doc.moveTo(left, y - 5).lineTo(right, y - 5).lineWidth(0.5).strokeColor('#e2e8f0').stroke();
+    };
+    const when = new Date(Number(d.t) || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) + ' EAT';
+    line('M-Pesa receipt no.', d.r || 'See your M-Pesa SMS');
+    line('Booking reference', d.f);
+    line('Date paid', when);
+    line('Customer', d.n);
+    line('Phone', d.p);
+    line('Service', d.s);
+    line('Location', d.l);
+    line('Payment method', 'M-Pesa');
+    line('Amount paid', 'KES ' + Number(d.a).toLocaleString('en-KE'), true);
+
+    // Footer
+    y += 10;
+    doc.fillColor(navy).font('Helvetica-Bold').fontSize(10).text('Thank you for choosing Tencent Innovations.', left, y, { width });
+    doc.fillColor(grey).font('Helvetica').fontSize(8).text(
+        'This receipt confirms payment received for the service above and is generated automatically, so it is valid without a signature. ' +
+        'Terms and Conditions apply' + (MPESA.publicBaseUrl ? ': ' + MPESA.publicBaseUrl + '/terms' : '.'),
+        left, doc.y + 4, { width }
+    );
+    doc.end();
+}
+
+app.get('/booking/:token/receipt.pdf', (req, res) => {
+    if (!PDFDocument) return res.status(503).type('text/plain').send('Receipt download is not available right now.');
+    const d = readBookingLink(String(req.params.token));
+    if (!d) return res.status(404).type('text/plain').send('This link is not valid.');
+    if (d.k === 0) {
+        // Link from before payment: send them to the receipt once paid, otherwise to the status page
+        const live = bookings.get(String(d.i || ''));
+        if (live && live.accountRef === d.f && live.status === 'paid' && live.link) return res.redirect(302, live.link + '/receipt.pdf');
+        return res.redirect(302, '/booking/' + encodeURIComponent(req.params.token));
+    }
+    sendReceiptPdf(d, res);
 });
 
 // Terms and Conditions page
