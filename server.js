@@ -307,11 +307,15 @@ function linksEnabled() {
 function signLinkPart(part) {
     return crypto.createHmac('sha256', LINK_SECRET).update(part).digest('base64url');
 }
-function makeBookingLink(b) {
+// paid = false makes the link given to the client right after they request the booking:
+// it shows live payment status. paid = true makes the permanent receipt link.
+function makeBookingLink(b, paid = true) {
     if (!linksEnabled()) return '';
     const part = Buffer.from(JSON.stringify({
         n: b.name, p: b.phone, s: b.service, a: b.amount,
-        r: b.receipt || '', f: b.accountRef, l: b.location, t: b.paidAt || Date.now()
+        r: paid ? (b.receipt || '') : '', f: b.accountRef, l: b.location,
+        t: paid ? (b.paidAt || Date.now()) : b.createdAt,
+        i: b.id, k: paid ? 1 : 0
     })).toString('base64url');
     return `${MPESA.publicBaseUrl}/booking/${part}.${signLinkPart(part)}`;
 }
@@ -967,6 +971,7 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
         booking.checkoutRequestId = r.CheckoutRequestID;
         booking.merchantRequestId = r.MerchantRequestID;
         byCheckout.set(r.CheckoutRequestID, booking);
+        booking.requestLink = makeBookingLink(booking, false);   // shown to the client straight away
     } catch (err) {
         console.error('STK push failed:', err.message);
         booking.status = 'failed';
@@ -980,7 +985,12 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
             <h2>Check your phone</h2>
             <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa prompt for <strong>KES ${booking.amount}</strong> has been sent to <strong>${esc(phone)}</strong>. Enter your M-Pesa PIN to pay.</p>
             <p id="pay-status" class="sub-title">Waiting for your payment...</p>
-            <div id="pay-links"></div>
+            ${booking.requestLink ? `
+            <p style="color:var(--muted);">Save your booking link. It shows your payment status and becomes your receipt once you pay.</p>
+            <div id="pay-links">
+                <a id="pay-view" href="${esc(booking.requestLink)}" class="cta-btn" style="margin-bottom:12px;">Open your booking page</a>
+                <a id="pay-share" href="${esc('https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking: ' + booking.requestLink))}" target="_blank" rel="noopener" class="cta-btn" style="margin-bottom:12px;">Share on WhatsApp</a>
+            </div>` : ''}
             <a href="/survey" class="cta-btn">Back to Surveys</a>
             <script>
             (function () {
@@ -990,22 +1000,13 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
                     fetch('/payments/status/' + id).then(function (r) { return r.json(); }).then(function (d) {
                         if (d.status === 'paid') {
                             box.textContent = 'Payment received. Thank you! An engineer will call you to schedule the visit.';
-                            var holder = document.getElementById('pay-links');
-                            if (d.link && d.link.indexOf('https://') === 0 && holder && !holder.firstChild) {
-                                var view = document.createElement('a');
-                                view.href = d.link;
-                                view.className = 'cta-btn';
-                                view.style.marginBottom = '12px';
-                                view.textContent = 'View your booking confirmation';
-                                var share = document.createElement('a');
-                                share.href = 'https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking confirmation: ' + d.link);
-                                share.className = 'cta-btn';
-                                share.style.marginBottom = '12px';
-                                share.target = '_blank';
-                                share.rel = 'noopener';
-                                share.textContent = 'Share on WhatsApp';
-                                holder.appendChild(view);
-                                holder.appendChild(share);
+                            var viewBtn = document.getElementById('pay-view');
+                            var shareBtn = document.getElementById('pay-share');
+                            if (d.link && d.link.indexOf('https://') === 0 && viewBtn) {
+                                // swap to the permanent receipt link
+                                viewBtn.href = d.link;
+                                viewBtn.textContent = 'View your booking confirmation';
+                                if (shareBtn) shareBtn.href = 'https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking confirmation: ' + d.link);
                             }
                         } else if (d.status === 'failed') {
                             box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
@@ -1026,7 +1027,8 @@ app.post('/submit-survey-payment', payLimiter, async (req, res) => {
     }));
 });
 
-// Private booking confirmation page. The link is signed, so it cannot be forged or edited.
+// Private booking page. The link is signed, so it cannot be forged or edited.
+// Before payment it shows live status; after payment it is the receipt.
 app.get('/booking/:token', (req, res) => {
     res.set('X-Robots-Tag', 'noindex, nofollow');
     res.set('Cache-Control', 'private, no-store');
@@ -1039,33 +1041,78 @@ app.get('/booking/:token', (req, res) => {
         }));
     }
 
+    // k === 0: link given right after the request (before payment).
+    // k === 1: permanent receipt link. Older links have no k and were always receipts.
+    let state = 'paid';
+    let receipt = d.r;
+    let when = Number(d.t) || Date.now();
+    if (d.k === 0) {
+        const live = bookings.get(String(d.i || ''));
+        if (live && live.accountRef === d.f) {
+            if (live.status === 'paid' && live.link) return res.redirect(302, live.link);   // go to the permanent receipt
+            state = live.status;
+            if (state === 'paid') { receipt = live.receipt; when = live.paidAt || when; }
+        } else {
+            state = 'unknown';   // server restarted or booking older than 24 hours
+        }
+    }
+
+    const views = {
+        paid:    { h: 'Booking confirmed', sub: 'Payment received. Keep this page as your receipt.', badge: '<strong style="color:var(--accent);">PAID</strong>' },
+        pending: { h: 'Booking received', sub: 'We are waiting for your M-Pesa payment. This page updates by itself.', badge: '<strong style="color:#fbbf24;">AWAITING PAYMENT</strong>' },
+        failed:  { h: 'Payment not completed', sub: 'The payment was cancelled or did not go through. You can book again.', badge: '<strong style="color:#f87171;">NOT PAID</strong>' },
+        review:  { h: 'Confirming your payment', sub: 'We are checking your payment and will call you shortly.', badge: '<strong style="color:#fbbf24;">CHECKING</strong>' },
+        unknown: { h: 'Booking details', sub: 'We cannot see the payment status right now. If you have paid, we will confirm and call you.', badge: '<strong style="color:#fbbf24;">STATUS UNKNOWN</strong>' }
+    };
+    const v = views[state] || views.unknown;
+    const isPaid = state === 'paid';
+
     const row = (label, value) => `<tr><td style="padding:10px 8px; color:var(--muted); border-bottom:1px solid #334155;">${label}</td><td style="padding:10px 8px; text-align:right; border-bottom:1px solid #334155;">${value}</td></tr>`;
     const phone = esc(d.p);
-    const paidAt = new Date(Number(d.t) || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-    const amount = Number(d.a).toLocaleString('en-KE');
+    const whenText = new Date(when).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) + ' (EAT)';
+    const amount = esc(Number(d.a).toLocaleString('en-KE'));
+
+    const rows = [
+        row('Status', v.badge),
+        row('Name', esc(d.n)),
+        row('Phone', '<a href="tel:' + phone + '" style="color:#38bdf8;">' + phone + '</a>'),
+        row('Service', esc(d.s)),
+        row('Location', esc(d.l)),
+        row(isPaid ? 'Amount paid' : 'Amount due', 'KES ' + amount),
+        isPaid ? row('M-Pesa receipt', esc(receipt) || 'See your M-Pesa SMS') : '',
+        row('Reference', esc(d.f)),
+        row(isPaid ? 'Paid on' : 'Requested on', esc(whenText))
+    ].join('');
+
+    const poller = state === 'pending' ? `
+        <script>
+        (function () {
+            var id = ${JSON.stringify(String(d.i || '')).replace(/</g, '\\u003c')}, tries = 0;
+            function poll() {
+                tries++;
+                fetch('/payments/status/' + encodeURIComponent(id)).then(function (r) { return r.json(); }).then(function (x) {
+                    if (x.status && x.status !== 'pending') { location.reload(); }
+                    else if (tries < 60) { setTimeout(poll, 5000); }
+                }).catch(function () { if (tries < 60) setTimeout(poll, 5000); });
+            }
+            setTimeout(poll, 5000);
+        })();
+        </script>` : '';
 
     res.send(renderPage({
-        title: 'Booking Confirmed',
+        title: v.h,
         activeNav: 'survey',
         content: `
-            <h2>Booking confirmed</h2>
-            <p class="sub-title">Payment received. Keep this page as your receipt.</p>
-            <div class="form-container" style="border-color: var(--accent);">
-                <table style="width:100%; border-collapse:collapse;">
-                    ${row('Status', '<strong style="color:var(--accent);">PAID</strong>')}
-                    ${row('Name', esc(d.n))}
-                    ${row('Phone', '<a href="tel:' + phone + '" style="color:#38bdf8;">' + phone + '</a>')}
-                    ${row('Service', esc(d.s))}
-                    ${row('Location', esc(d.l))}
-                    ${row('Amount paid', 'KES ' + esc(amount))}
-                    ${row('M-Pesa receipt', esc(d.r) || 'See your M-Pesa SMS')}
-                    ${row('Reference', esc(d.f))}
-                    ${row('Paid on', esc(paidAt) + ' (EAT)')}
-                </table>
+            <h2>${v.h}</h2>
+            <p class="sub-title">${v.sub}</p>
+            <div class="form-container" style="border-color: ${isPaid ? 'var(--accent)' : '#334155'};">
+                <table style="width:100%; border-collapse:collapse;">${rows}</table>
             </div>
-            <p style="margin-top:20px;">An engineer will call you to agree a time for the visit.</p>
-            <a href="tel:0740311014" class="cta-btn" style="margin-top:10px;">Call Tencent Innovations: 0740 311 014</a>
-            <a href="https://wa.me/254769306917" class="cta-btn" style="margin-top:12px;">WhatsApp us</a>`
+            <p style="margin-top:20px;">${isPaid ? 'An engineer will call you to agree a time for the visit.' : 'Questions? Call or WhatsApp us below.'}</p>
+            ${state === 'failed' ? '<a href="/survey" class="cta-btn" style="margin-top:10px;">Book again</a>' : ''}
+            <a href="tel:0740311014" class="cta-btn" style="margin-top:12px;">Call Tencent Innovations: 0740 311 014</a>
+            <a href="https://wa.me/254769306917" class="cta-btn" style="margin-top:12px;">WhatsApp us</a>
+            ${poller}`
     }));
 });
 
