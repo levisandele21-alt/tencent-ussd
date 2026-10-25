@@ -4,23 +4,19 @@ const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const path = require('path');
 const crypto = require('crypto');
-const fs = require('fs');
-const { Pool } = require('pg');
+const { AsyncLocalStorage } = require('async_hooks');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
-
-let PDFDocument = null;
-try {
-    PDFDocument = require('pdfkit');
-} catch (_) {
-    console.error('pdfkit is not installed: PDF receipts are disabled.');
-}
+const PDFDocument = require('pdfkit');
 
 const app = express();
 
-// 1. Static file serving for images (logo.png, banner.png)
-app.use(express.static(__dirname));
+// 1. Static images (logo.png, banner.png) - only these two files are public.
+// (Serving the whole folder would also expose server.js and package.json.)
+app.get('/logo.png', (req, res) => res.sendFile(path.join(__dirname, 'logo.png')));
+app.get('/banner.png', (req, res) => res.sendFile(path.join(__dirname, 'banner.png')));
 
 // 2. Security Headers via Helmet
 app.use(
@@ -32,91 +28,112 @@ app.use(
 // 3. Trust Render's Proxy
 app.set('trust proxy', 1);
 
-// 4. Database Setup (PostgreSQL)
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
-
-async function initDb() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS bookings (
-                id VARCHAR(64) PRIMARY KEY,
-                user_id INT REFERENCES users(id),
-                name VARCHAR(255) NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                service VARCHAR(255) NOT NULL,
-                location VARCHAR(255) NOT NULL,
-                amount INT NOT NULL,
-                account_ref VARCHAR(50) NOT NULL,
-                status VARCHAR(50) NOT NULL,
-                receipt VARCHAR(100),
-                checkout_request_id VARCHAR(100),
-                created_at BIGINT NOT NULL,
-                paid_at BIGINT
-            );
-        `);
-        console.log('PostgreSQL tables initialized successfully.');
-    } catch (err) {
-        console.error('Database initialization error:', err.message);
-    }
-}
-initDb();
-
-// 5. Session Middleware with PostgreSQL Store
-app.use(session({
-    store: new pgSession({
-        pool: pool,
-        tableName: 'session',
-        createTableIfMissing: true
-    }),
-    secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        secure: process.env.NODE_ENV === 'production',
-        maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
-    }
-}));
-
-// 6. Rate Limiting
+// 4. Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: 'Too many requests from this IP, please try again later.',
+    // Safaricom callbacks and the payment status poll must never be throttled by this general limit
     skip: (req) => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
 });
 
+// Strict limit on the payment form: stops people spamming M-Pesa prompts
 const payLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     max: 10,
     message: 'Too many payment attempts from this network. Please try again later.'
+});
+
+// Limit on register / login attempts: slows down password guessing
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    message: 'Too many sign-in attempts from this network. Please try again later.'
 });
 app.use(limiter);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Make user session data available in all templates
-app.use((req, res, next) => {
-    res.locals.user = req.session.user || null;
-    next();
-});
+// ---------------------------------------------------------------
+// Database, sessions and accounts
+//
+// Env vars on Render:
+//   DATABASE_URL      Postgres connection string (Render gives you this)
+//   DATABASE_SSL      optional: set to "false" to turn SSL off (default is on)
+//   SESSION_SECRET    long random string that signs login cookies. If missing,
+//                     LINK_SECRET or MPESA_CALLBACK_SECRET is used instead.
+// ---------------------------------------------------------------
+const pool = process.env.DATABASE_URL
+    ? new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false }
+    })
+    : null;
+if (pool) pool.on('error', err => console.error('Postgres pool error:', err.message));
+else console.error('DATABASE_URL is not set: sign up and login will not work until you add a Postgres database.');
+
+let sessionSecret = process.env.SESSION_SECRET || process.env.LINK_SECRET || process.env.MPESA_CALLBACK_SECRET;
+if (!sessionSecret || sessionSecret.length < 16) {
+    sessionSecret = crypto.randomBytes(32).toString('hex');
+    console.error('SESSION_SECRET is missing or too short: using a temporary one. Everyone is logged out on each restart.');
+}
+
+app.use(session({
+    name: 'tnc.sid',
+    store: pool ? new pgSession({ pool, createTableIfMissing: true }) : undefined,
+    secret: sessionSecret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: 'auto',          // secure on https (Render), works on http for local testing
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+    }
+}));
+
+// Lets renderPage() know who is logged in without changing every page handler
+const requestContext = new AsyncLocalStorage();
+app.use((req, res, next) => requestContext.run(req, next));
+function currentUser() {
+    const r = requestContext.getStore();
+    return (r && r.session && r.session.user) || null;
+}
+
+async function initDb() {
+    if (!pool) return;
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )`);
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS users_email_key ON users (LOWER(email))');
+}
+
+// Anyone who is not logged in is sent to the login page and then brought back
+function requireAuth(req, res, next) {
+    if (req.session && req.session.user) return next();
+    const target = req.method === 'GET' ? req.originalUrl : '/survey';
+    res.redirect('/login?need=1&next=' + encodeURIComponent(target));
+}
+
+// Only allow redirects to pages on this site
+function safeNext(n) {
+    n = typeof n === 'string' ? n : '';
+    return (n.startsWith('/') && !n.startsWith('//') && !n.startsWith('/\\')) ? n : '/';
+}
 
 // ---------------------------------------------------------------
-// Email notifications & PDF generation
+// Email notifications (Gmail via Nodemailer)
+// Required env vars on Render: GMAIL_USER, GMAIL_APP_PASSWORD
+// Optional: NOTIFY_TO (defaults to GMAIL_USER)
 // ---------------------------------------------------------------
+// Short timeouts so a blocked SMTP connection (Render free tier) cannot hang the form.
 const mailer = nodemailer.createTransport({
     service: 'gmail',
     connectionTimeout: 8000,
@@ -128,6 +145,7 @@ const mailer = nodemailer.createTransport({
     }
 });
 
+// Escape user input so nobody can inject HTML into pages or emails
 function esc(value = '') {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -137,55 +155,13 @@ function esc(value = '') {
         .replace(/'/g, '&#39;');
 }
 
+// Form fields may arrive as strings or arrays (e.g. checkboxes)
 function flat(value) {
     return Array.isArray(value) ? value.join(', ') : (value || '');
 }
 
-function generatePdfBuffer(bookingData) {
-    return new Promise((resolve, reject) => {
-        if (!PDFDocument) return reject(new Error('PDFKit not available'));
-        const doc = new PDFDocument({ size: 'A4', margin: 50 });
-        let buffers = [];
-        doc.on('data', chunk => buffers.push(chunk));
-        doc.on('end', () => resolve(Buffer.concat(buffers)));
-
-        doc.fillColor('#0284c7').fontSize(22).text('TENCENT INNOVATIONS', { align: 'center' });
-        doc.fillColor('#64748b').fontSize(10).text('Rangwe, Homa Bay County | Tel: 0740 311 014 | tencentbz@gmail.com', { align: 'center' });
-        doc.moveDown(2);
-
-        doc.fillColor('#0f172a').fontSize(16).text('OFFICIAL PAYMENT RECEIPT', { align: 'center' });
-        doc.moveDown(1.5);
-
-        doc.fontSize(12);
-        const dateStr = new Date(bookingData.paidAt || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-
-        const rows = [
-            ['Reference / Account:', bookingData.accountRef],
-            ['Client Name:', bookingData.name],
-            ['Phone Number:', bookingData.phone],
-            ['Service Rendered:', bookingData.service],
-            ['Location:', bookingData.location],
-            ['Amount Paid:', `KES ${bookingData.amount}`],
-            ['M-Pesa Receipt:', bookingData.receipt || 'Confirmed via Daraja'],
-            ['Date & Time:', dateStr],
-            ['Payment Status:', 'PAID & CONFIRMED']
-        ];
-
-        let y = doc.y;
-        rows.forEach(([label, val]) => {
-            doc.font('Helvetica-Bold').text(label, 50, y, { width: 160 });
-            doc.font('Helvetica').text(val, 220, y, { width: 320 });
-            y += 24;
-        });
-
-        doc.moveDown(4);
-        doc.fontSize(10).fillColor('#64748b').text('Thank you for choosing Tencent Innovations. This is an electronically generated receipt.', 50, y + 40, { align: 'center', width: 500 });
-
-        doc.end();
-    });
-}
-
-async function notify(subject, fields, userEmail = null, pdfBuffer = null) {
+// Send a lead alert. Never throws: a mail failure must not break the customer's page.
+async function notify(subject, fields) {
     const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
     const rows = Object.entries(fields)
         .map(([label, val]) => {
@@ -200,8 +176,11 @@ async function notify(subject, fields, userEmail = null, pdfBuffer = null) {
         .join('');
     const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
+    // Always log the lead first, so it is in Render logs whatever happens next
     console.log('LEAD:', JSON.stringify({ subject: cleanSubject, fields, time }));
 
+    // Telegram (HTTPS, works on Render free tier)
+    // Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     const sendTelegram = async () => {
         if (!process.env.TELEGRAM_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
         const lines = Object.entries(fields).map(([label, val]) => `${label}: ${flat(val)}`);
@@ -215,44 +194,41 @@ async function notify(subject, fields, userEmail = null, pdfBuffer = null) {
         if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
     };
 
-    const sendAdminEmail = async () => {
+    // Email (needs SMTP: blocked on Render free tier, works on paid instances)
+    const sendEmail = async () => {
         if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
-        let attachments = [];
-        if (pdfBuffer) {
-            attachments.push({ filename: 'Tencent-Receipt.pdf', content: pdfBuffer });
-        }
         await mailer.sendMail({
             from: `"Tencent Website" <${process.env.GMAIL_USER}>`,
             to: process.env.NOTIFY_TO || process.env.GMAIL_USER,
             subject: cleanSubject,
-            html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`,
-            attachments
+            html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`
         });
     };
 
-    const sendUserEmail = async () => {
-        if (!userEmail || !process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
-        let attachments = [];
-        if (pdfBuffer) {
-            attachments.push({ filename: 'Tencent-Receipt.pdf', content: pdfBuffer });
-        }
-        await mailer.sendMail({
-            from: `"Tencent Innovations" <${process.env.GMAIL_USER}>`,
-            to: userEmail,
-            subject: `Receipt & Booking Confirmation: ${cleanSubject}`,
-            html: `<h3>Hello, your booking is confirmed!</h3>${rows}<p>Please find attached your official payment receipt PDF.</p><p style="color:#888">Tencent Innovations | Rangwe, Homa Bay County</p>`,
-            attachments
-        });
-    };
-
-    const results = await Promise.allSettled([sendTelegram(), sendAdminEmail(), sendUserEmail()]);
-    if (results[0].status === 'rejected') console.error('Telegram failed:', results[0].reason?.message);
-    if (results[1].status === 'rejected') console.error('Admin email failed:', results[1].reason?.message);
-    if (results[2].status === 'rejected') console.error('User email failed:', results[2].reason?.message);
+    // Run both in parallel; one failing never blocks the other or the customer's page
+    const results = await Promise.allSettled([sendTelegram(), sendEmail()]);
+    if (results[0].status === 'rejected') console.error('Telegram notification failed:', results[0].reason && results[0].reason.message);
+    if (results[1].status === 'rejected') console.error('Notification email failed:', results[1].reason && results[1].reason.message);
 }
 
 // ---------------------------------------------------------------
-// M-Pesa (Daraja) Configuration & Helpers
+// M-Pesa (Daraja) STK Push for a PAYBILL shortcode
+//
+// Env vars on Render:
+//   MPESA_ENV              sandbox (default) or production
+//   MPESA_CONSUMER_KEY     from the Daraja portal
+//   MPESA_CONSUMER_SECRET  from the Daraja portal
+//   MPESA_SHORTCODE        sandbox test shortcode, later your Paybill number
+//   MPESA_PASSKEY          sandbox test passkey, later your production passkey
+//   MPESA_CALLBACK_SECRET  a long random string (32+ characters) you invent
+//   PUBLIC_BASE_URL        https://tencent-ussd.onrender.com (no trailing slash)
+//   LINK_SECRET            optional: long random string that signs booking links.
+//                          Set it once and never change it, or old links stop working.
+//                          If missing, MPESA_CALLBACK_SECRET is used instead.
+//
+// NOTE: bookings are kept in memory. They are lost when the server restarts,
+// so add a database before relying on this for real money. Every lead and
+// every confirmed payment is also sent to you by Telegram/email.
 // ---------------------------------------------------------------
 const MPESA = {
     production: process.env.MPESA_ENV === 'production',
@@ -263,6 +239,7 @@ const MPESA = {
     callbackSecret: process.env.MPESA_CALLBACK_SECRET,
     publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
 };
+// MPESA_BASE_URL exists only so tests can point at a mock server
 MPESA.baseUrl = process.env.MPESA_BASE_URL ||
     (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
 
@@ -274,6 +251,7 @@ function mpesaConfigured() {
     );
 }
 
+// The server decides the price. The form only says which service was chosen.
 const SERVICE_PRICES = {
     'Site Survey & Quotation': 3000,
     'WiFi Setup': 3000,
@@ -283,6 +261,7 @@ const SERVICE_PRICES = {
     'Solar Consultation': 4000
 };
 
+// Accepts 0712345678, 712345678, 254712345678, +254712345678 (and 01xx numbers)
 function normalizePhone(raw) {
     let p = String(raw || '').replace(/[\s\-()]/g, '');
     if (p.startsWith('+')) p = p.slice(1);
@@ -291,7 +270,10 @@ function normalizePhone(raw) {
     return /^254[17]\d{8}$/.test(p) ? p : null;
 }
 
-const phoneAttempts = new Map();
+// In-memory stores
+const bookings = new Map();      // booking id -> booking
+const byCheckout = new Map();    // CheckoutRequestID -> booking
+const phoneAttempts = new Map(); // phone -> [timestamps]
 
 function phoneAttemptAllowed(phone) {
     const now = Date.now();
@@ -301,6 +283,21 @@ function phoneAttemptAllowed(phone) {
     phoneAttempts.set(phone, recent);
     return true;
 }
+
+// Tidy old data every 30 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, b] of bookings) {
+        if (now - b.createdAt > 24 * 60 * 60 * 1000) {
+            bookings.delete(id);
+            if (b.checkoutRequestId) byCheckout.delete(b.checkoutRequestId);
+        }
+    }
+    for (const [p, arr] of phoneAttempts) {
+        const recent = arr.filter(t => now - t < 60 * 60 * 1000);
+        if (recent.length) phoneAttempts.set(p, recent); else phoneAttempts.delete(p);
+    }
+}, 30 * 60 * 1000).unref();
 
 let tokenCache = { value: null, expiresAt: 0 };
 async function getAccessToken() {
@@ -319,6 +316,7 @@ async function getAccessToken() {
     return tokenCache.value;
 }
 
+// Daraja timestamps are YYYYMMDDHHmmss in Nairobi time (UTC+3)
 function darajaTimestamp() {
     return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
 }
@@ -335,7 +333,7 @@ async function darajaPost(path, payload) {
         signal: AbortSignal.timeout(20000)
     });
     let data = {};
-    try { data = await resp.json(); } catch (_) {}
+    try { data = await resp.json(); } catch (_) { /* non-JSON body */ }
     if (!resp.ok) {
         const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
         err.status = resp.status;
@@ -355,12 +353,13 @@ async function stkPush(booking) {
         PartyA: booking.phone,
         PartyB: MPESA.shortcode,
         PhoneNumber: booking.phone,
+        // Path avoids words like "mpesa"/"safaricom", which Safaricom may reject in callback URLs
         CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: booking.accountRef,
+        AccountReference: booking.accountRef,   // max 12 chars; shows as the Paybill account number
         TransactionDesc: 'Survey fee'
     });
     if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
-    return data;
+    return data; // contains MerchantRequestID and CheckoutRequestID
 }
 
 async function stkQuery(checkoutRequestId) {
@@ -377,6 +376,7 @@ function bookingFields(b, extra = {}) {
     return {
         Name: b.name,
         Phone: b.phone,
+        ...(b.email ? { Email: b.email } : {}),
         Service: b.service,
         Location: b.location,
         Amount: `KES ${b.amount}`,
@@ -385,14 +385,19 @@ function bookingFields(b, extra = {}) {
     };
 }
 
-// Signed booking links
+// ---- Signed booking links -------------------------------------------------
+// The link carries the booking details and a signature, so nothing needs to be
+// stored: it keeps working after restarts, and nobody can forge or edit one.
 const LINK_SECRET = process.env.LINK_SECRET || MPESA.callbackSecret || '';
+
 function linksEnabled() {
     return LINK_SECRET.length >= 16 && MPESA.publicBaseUrl.startsWith('https://');
 }
 function signLinkPart(part) {
     return crypto.createHmac('sha256', LINK_SECRET).update(part).digest('base64url');
 }
+// paid = false makes the link given to the client right after they request the booking:
+// it shows live payment status. paid = true makes the permanent receipt link.
 function makeBookingLink(b, paid = true) {
     if (!linksEnabled()) return '';
     const part = Buffer.from(JSON.stringify({
@@ -414,68 +419,155 @@ function readBookingLink(token) {
     try { return JSON.parse(Buffer.from(part, 'base64url').toString('utf8')); } catch (_) { return null; }
 }
 
-async function markPaid(bookingId, receipt, verified) {
-    const res = await pool.query('SELECT * FROM bookings WHERE id = $1', [bookingId]);
-    if (res.rows.length === 0) return;
-    let b = res.rows[0];
-    if (b.status === 'paid') return;
-
-    const paidAt = Date.now();
-    await pool.query('UPDATE bookings SET status = $1, receipt = $2, paid_at = $3 WHERE id = $4', ['paid', receipt || '', paidAt, bookingId]);
-
-    b.status = 'paid';
-    b.receipt = receipt || '';
-    b.paidAt = paidAt;
-    b.link = makeBookingLink(b);
-
-    let userEmail = null;
-    if (b.user_id) {
-        const uRes = await pool.query('SELECT email FROM users WHERE id = $1', [b.user_id]);
-        if (uRes.rows.length > 0) userEmail = uRes.rows[0].email;
-    }
-
-    let pdfBuffer = null;
-    if (PDFDocument) {
-        try {
-            pdfBuffer = await generatePdfBuffer({
-                accountRef: b.account_ref,
-                name: b.name,
-                phone: b.phone,
-                service: b.service,
-                location: b.location,
-                amount: b.amount,
-                receipt: b.receipt,
-                paidAt: b.paid_at
-            });
-        } catch (e) {
-            console.error('PDF generation error:', e.message);
-        }
-    }
-
-    const pdfDownloadUrl = `${MPESA.publicBaseUrl}/payments/receipt/${b.id}/download.pdf`;
-    const extra = {
-        'M-Pesa receipt': receipt || '(see M-Pesa statement)',
-        Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only'
-    };
-    if (pdfBuffer) extra['Download Receipt PDF'] = pdfDownloadUrl;
-    if (b.link) extra['Booking link'] = b.link;
-
-    await notify(`✅ PAID: ${b.service} - ${b.name}`, bookingFields(b, extra), userEmail, pdfBuffer);
+// ---- PDF receipts -----------------------------------------------------------
+// One shape for both a live booking and a decoded booking link
+function receiptFromBooking(b) {
+    return { name: b.name, phone: b.phone, service: b.service, location: b.location, amount: b.amount,
+             receipt: b.receipt, reference: b.accountRef, paidAt: b.paidAt };
+}
+function receiptFromLink(d) {
+    return { name: d.n, phone: d.p, service: d.s, location: d.l, amount: Number(d.a),
+             receipt: d.r, reference: d.f, paidAt: Number(d.t) };
+}
+function receiptFileName(r) {
+    return `Tencent-Receipt-${String(r.reference || 'booking').replace(/[^A-Za-z0-9_-]/g, '')}.pdf`;
 }
 
-async function markFailed(bookingId, reason) {
-    await pool.query('UPDATE bookings SET status = $1 WHERE id = $2 AND status = $3', ['failed', bookingId, 'pending']);
-    console.log('PAYMENT NOT COMPLETED:', JSON.stringify({ id: bookingId, reason }));
+function buildReceiptPdf(r) {
+    return new Promise((resolve, reject) => {
+        const doc = new PDFDocument({
+            size: 'A4',
+            margin: 50,
+            info: { Title: `Receipt ${r.reference || ''}`, Author: 'Tencent Innovations' }
+        });
+        const chunks = [];
+        doc.on('data', c => chunks.push(c));
+        doc.on('end', () => resolve(Buffer.concat(chunks)));
+        doc.on('error', reject);
+
+        const left = 50, right = doc.page.width - 50, width = right - left;
+        const when = new Date(Number(r.paidAt) || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) + ' (EAT)';
+
+        // Header band
+        doc.rect(0, 0, doc.page.width, 110).fill('#0b1120');
+        doc.fillColor('#38bdf8').font('Helvetica-Bold').fontSize(24).text('Tencent Innovations', left, 36);
+        doc.fillColor('#94a3b8').font('Helvetica').fontSize(11).text('Connecting You, Faster.', left, 68);
+        doc.fillColor('#94a3b8').fontSize(10).text('Rangwe, Homa Bay County', left, 38, { width, align: 'right' });
+        doc.text('0740 311 014', left, 52, { width, align: 'right' });
+        doc.text('tencentbz@gmail.com', left, 66, { width, align: 'right' });
+
+        // Title + paid badge
+        doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(22).text('PAYMENT RECEIPT', left, 140);
+        doc.roundedRect(right - 90, 138, 90, 28, 6).fill('#16a34a');
+        doc.fillColor('#ffffff').fontSize(13).text('PAID', right - 90, 146, { width: 90, align: 'center' });
+
+        // Detail rows
+        const rows = [
+            ['Receipt for', r.service],
+            ['Customer', r.name],
+            ['Phone', r.phone],
+            ['Location', r.location],
+            ['Reference', r.reference],
+            ['M-Pesa receipt', r.receipt || 'See your M-Pesa SMS'],
+            ['Paid on', when]
+        ];
+        let y = 190;
+        doc.moveTo(left, y - 8).lineTo(right, y - 8).strokeColor('#cbd5e1').lineWidth(1).stroke();
+        rows.forEach(([label, value]) => {
+            doc.fillColor('#64748b').font('Helvetica').fontSize(10).text(label, left, y, { width: 140 });
+            doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(11)
+                .text(String(value || '-'), left + 150, y, { width: width - 150 });
+            y = Math.max(y + 22, doc.y + 8);
+            doc.moveTo(left, y - 6).lineTo(right, y - 6).strokeColor('#e2e8f0').lineWidth(0.5).stroke();
+        });
+
+        // Amount box
+        y += 14;
+        doc.roundedRect(left, y, width, 60, 8).fill('#f1f5f9');
+        doc.fillColor('#64748b').font('Helvetica').fontSize(11).text('Amount paid', left + 20, y + 14);
+        doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(24)
+            .text(`KES ${Number(r.amount).toLocaleString('en-KE')}`, left + 20, y + 28);
+
+        // Notes
+        y += 90;
+        doc.fillColor('#334155').font('Helvetica').fontSize(10).text(
+            'Thank you for booking with Tencent Innovations. An engineer will call you to agree a time for your visit. ' +
+            'Please keep this receipt as proof of payment. Prices can change according to location and urgency. ' +
+            'Our Terms and Conditions apply to all services.',
+            left, y, { width, lineGap: 3 }
+        );
+
+        // Footer
+        doc.fillColor('#94a3b8').fontSize(9).text(
+            'Tencent Innovations | Calls 0740 311 014 | WhatsApp 0769 306 917 | tencentbz@gmail.com',
+            left, doc.page.height - 70, { width, align: 'center' }
+        );
+        doc.end();
+    });
+}
+
+// Emails the receipt (PDF attached) to the address the customer registered with.
+// Needs SMTP, so like the other emails it will not work on Render's free tier.
+async function sendReceiptEmail(b) {
+    if (!b.email) return;
+    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+        console.log('Receipt email skipped: GMAIL_USER / GMAIL_APP_PASSWORD not set');
+        return;
+    }
+    const r = receiptFromBooking(b);
+    const pdf = await buildReceiptPdf(r);
+    await mailer.sendMail({
+        from: `"Tencent Innovations" <${process.env.GMAIL_USER}>`,
+        to: b.email,
+        subject: `Your receipt: ${b.service} (${b.accountRef})`,
+        html: `<h3>Thank you, ${esc(b.name)}!</h3>
+               <p>We have received your payment of <strong>KES ${esc(b.amount)}</strong> for <strong>${esc(b.service)}</strong>.</p>
+               <p>Your receipt is attached as a PDF. An engineer will call you to agree a time for the visit.</p>
+               ${b.link ? `<p>You can also view your booking online: <a href="${esc(b.link)}">${esc(b.link)}</a></p>` : ''}
+               <p style="color:#888">Tencent Innovations &middot; Rangwe, Homa Bay County &middot; 0740 311 014</p>`,
+        attachments: [{ filename: receiptFileName(r), content: pdf, contentType: 'application/pdf' }]
+    });
+}
+
+async function markPaid(booking, receipt, verified) {
+    if (booking.status === 'paid') return;   // idempotent: duplicate callbacks do nothing
+    booking.status = 'paid';
+    booking.receipt = receipt || '';
+    booking.paidAt = Date.now();
+    booking.link = makeBookingLink(booking);
+
+    // Send the customer their receipt without holding anything else up
+    sendReceiptEmail(booking)
+        .then(() => { if (booking.email) console.log('Receipt emailed to', booking.email); })
+        .catch(err => console.error('Receipt email failed:', err.message));
+
+    const extra = {
+        'M-Pesa receipt': receipt || '(see M-Pesa statement, match the Reference)',
+        Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only (status query was unavailable)'
+    };
+    if (booking.link) {
+        extra['Booking link'] = booking.link;
+        // One tap opens WhatsApp with the client's number and the message already typed
+        const msg = `Hello ${booking.name}, your Tencent Innovations booking is confirmed (${booking.service}, KES ${booking.amount} paid). Your booking details: ${booking.link}`;
+        extra['Send to client on WhatsApp'] = `https://wa.me/${booking.phone}?text=${encodeURIComponent(msg)}`;
+    }
+    await notify(`✅ PAID: ${booking.service} - ${booking.name}`, bookingFields(booking, extra));
+}
+
+function markFailed(booking, reason) {
+    if (booking.status !== 'pending') return;
+    booking.status = 'failed';
+    console.log('PAYMENT NOT COMPLETED:', JSON.stringify({ id: booking.id, reason }));
 }
 
 async function handleCallback(body) {
     const cb = body && body.Body && body.Body.stkCallback;
     if (!cb) return;
-    const checkoutId = cb.CheckoutRequestID;
-
-    const res = await pool.query('SELECT * FROM bookings WHERE checkout_request_id = $1', [checkoutId]);
-    if (res.rows.length === 0) return;
-    const booking = res.rows[0];
+    const booking = byCheckout.get(cb.CheckoutRequestID);
+    if (!booking) {
+        console.log('Callback for unknown CheckoutRequestID:', cb.CheckoutRequestID);
+        return;
+    }
 
     const succeeded = Number(cb.ResultCode) === 0;
     const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
@@ -483,28 +575,28 @@ async function handleCallback(body) {
     const receipt = String(meta('MpesaReceiptNumber') || '');
 
     if (booking.status === 'paid') {
-        if (succeeded && receipt && !booking.receipt) {
-            await pool.query('UPDATE bookings SET receipt = $1 WHERE id = $2', [receipt, booking.id]);
-        }
+        if (succeeded && receipt && !booking.receipt) booking.receipt = receipt;
         return;
     }
-    if (!succeeded) { await markFailed(booking.id, cb.ResultDesc); return; }
+    if (!succeeded) { markFailed(booking, cb.ResultDesc); return; }
 
+    // The amount paid must match the price we asked for
     if (Number(meta('Amount')) !== booking.amount) {
-        await pool.query('UPDATE bookings SET status = $1 WHERE id = $2', ['review', booking.id]);
+        booking.status = 'review';
         await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
-            'Amount reported': String(meta('Amount')),
+            'Amount reported by callback': String(meta('Amount')),
             'M-Pesa receipt': receipt
         }));
         return;
     }
 
+    // Do not trust the callback alone: ask Safaricom directly
     let verified = false;
     try {
-        const q = await stkQuery(booking.checkout_request_id);
+        const q = await stkQuery(booking.checkoutRequestId);
         verified = String(q.ResultCode) === '0';
         if (!verified) {
-            await pool.query('UPDATE bookings SET status = $1 WHERE id = $2', ['review', booking.id]);
+            booking.status = 'review';
             await notify(`⚠️ CHECK PAYMENT: callback and status query disagree for ${booking.name}`, bookingFields(booking, {
                 'M-Pesa receipt': receipt,
                 'Query result': `${q.ResultCode} ${q.ResultDesc || ''}`
@@ -512,240 +604,218 @@ async function handleCallback(body) {
             return;
         }
     } catch (err) {
-        console.error('STK status query failed:', err.message);
+        console.error('STK status query failed, accepting callback only:', err.message);
     }
-    await markPaid(booking.id, receipt, verified);
+    await markPaid(booking, receipt, verified);
 }
 
+// Safaricom calls this when the customer pays, cancels or times out.
+// The secret in the URL stops strangers from posting fake "payments".
 app.post('/payments/cb/:secret', (req, res) => {
     const given = Buffer.from(String(req.params.secret));
     const expected = Buffer.from(String(MPESA.callbackSecret || ''));
     const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
     if (!ok) return res.sendStatus(404);
 
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-    handleCallback(req.body).catch(err => console.error('Callback error:', err.message));
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
+    handleCallback(req.body).catch(err => console.error('Callback handling error:', err.message));
 });
 
+// The "Check your phone" page polls this. If the callback never arrives
+// (for example the server was asleep), it asks Safaricom directly.
 app.get('/payments/status/:id', async (req, res) => {
-    const r = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
-    if (r.rows.length === 0) return res.status(404).json({ status: 'unknown' });
-    let b = r.rows[0];
+    const b = bookings.get(String(req.params.id));
+    if (!b) return res.status(404).json({ status: 'unknown' });
 
-    if (b.status === 'pending' && b.checkout_request_id &&
-        Date.now() - Number(b.created_at) > 25000) {
+    if (b.status === 'pending' && b.checkoutRequestId &&
+        Date.now() - b.createdAt > 25000 && Date.now() - (b.lastQuery || 0) > 12000) {
+        b.lastQuery = Date.now();
         try {
-            const q = await stkQuery(b.checkout_request_id);
-            if (String(q.ResultCode) === '0') await markPaid(b.id, '', true);
-            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') await markFailed(b.id, q.ResultDesc);
-        } catch (_) {}
-        const updated = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
-        b = updated.rows[0];
+            const q = await stkQuery(b.checkoutRequestId);
+            if (String(q.ResultCode) === '0') await markPaid(b, '', true);
+            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') markFailed(b, q.ResultDesc);
+        } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
     }
-    const paidLink = b.status === 'paid' ? (makeBookingLink(b) || '') : '';
-    const pdfUrl = b.status === 'paid' ? `/payments/receipt/${b.id}/download.pdf` : '';
-    res.json({ status: b.status, link: paidLink, pdf: pdfUrl });
+    res.json({ status: b.status, link: b.status === 'paid' ? (b.link || '') : '' });
 });
 
-app.get('/payments/receipt/:id/download.pdf', async (req, res) => {
-    const r = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
-    if (r.rows.length === 0 || r.rows[0].status !== 'paid') {
-        return res.status(404).send('Receipt not available or payment pending.');
-    }
-    const b = r.rows[0];
-    if (!PDFDocument) return res.status(501).send('PDF generation disabled.');
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=Tencent-Receipt-${b.account_ref}.pdf`);
-
-    try {
-        const buf = await generatePdfBuffer({
-            accountRef: b.account_ref,
-            name: b.name,
-            phone: b.phone,
-            service: b.service,
-            location: b.location,
-            amount: b.amount,
-            receipt: b.receipt,
-            paidAt: b.paid_at
-        });
-        res.send(buf);
-    } catch (err) {
-        res.status(500).send('Error generating PDF receipt.');
-    }
-});
-
-// Authentication Middleware
-function requireAuth(req, res, next) {
-    if (!req.session.user) {
-        return res.redirect(`/login?redirect=${encodeURIComponent(req.originalUrl)}`);
-    }
-    next();
-}
-
-// ---------------------------------------------------------------
-// Layout Template Helper with Left Sidebar & Auth / Sign In / Login Buttons
-// ---------------------------------------------------------------
+// Shared Layout Template Helper (left sidebar layout)
 function renderPage({ title, activeNav, content }) {
+    const user = currentUser();
+    const navItem = (key, href, icon, label, gated) =>
+        `<a href="${href}" class="side-link ${activeNav === key ? 'active' : ''}">
+            <span class="ico">${icon}</span><span class="lbl">${label}</span>
+            ${gated && !user ? '<span class="lock" title="Login required">🔒</span>' : ''}
+        </a>`;
+
+    const accountBox = user
+        ? `<div class="user-card">
+                <div class="avatar">${esc((user.name || '?').trim().charAt(0).toUpperCase())}</div>
+                <div class="user-meta"><strong>${esc(user.name)}</strong><span>${esc(user.email)}</span></div>
+           </div>
+           <form action="/logout" method="POST"><button type="submit" class="side-btn ghost">Log out</button></form>`
+        : `<p class="side-note">Log in or create an account to book our services.</p>
+           <a href="/login" class="side-btn ghost">Log in</a>
+           <a href="/register" class="side-btn solid">Sign up</a>`;
+
     return `
         <!DOCTYPE html>
-        <html lang="en" data-theme="dark">
+        <html lang="en">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>${title} - Tencent Innovations</title>
-            <script>
-                (function() {
-                    const savedTheme = localStorage.getItem('theme') || 'dark';
-                    document.documentElement.setAttribute('data-theme', savedTheme);
-                })();
-            </script>
             <style>
-                :root {
-                    --bg: #0f172a;
-                    --surface: #1e293b;
-                    --sidebar-bg: #0b1120;
-                    --text: #f8fafc;
-                    --muted: #94a3b8;
-                    --border: #334155;
-                    --primary: #0284c7;
-                    --accent: #4ade80;
-                }
-                [data-theme="light"] {
-                    --bg: #f8fafc;
-                    --surface: #ffffff;
-                    --sidebar-bg: #ffffff;
-                    --text: #0f172a;
-                    --muted: #64748b;
-                    --border: #cbd5e1;
-                    --primary: #0284c7;
-                    --accent: #16a34a;
-                }
+                :root { --primary: #0284c7; --bg: #0b1120; --panel: #111a2e; --card: #16213a; --line: #26344f; --text: #f8fafc; --muted: #94a3b8; --accent: #4ade80; --sky: #38bdf8; --side-w: 264px; }
+                * { box-sizing: border-box; }
+                html { scroll-behavior: smooth; }
+                body { font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background: radial-gradient(1200px 600px at 80% -10%, rgba(56,189,248,0.10), transparent 60%), var(--bg); color: var(--text); line-height: 1.6; min-height: 100vh; }
+                a { color: var(--sky); }
 
-                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; min-height: 100vh; transition: background 0.3s, color 0.3s; }
-                
-                .sidebar { width: 260px; background: var(--sidebar-bg); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; z-index: 100; }
-                .sidebar-header { padding: 24px 20px; border-bottom: 1px solid var(--border); }
-                .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
-                .logo-img { height: 42px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
+                /* Left sidebar */
+                .sidebar { position: fixed; top: 0; left: 0; bottom: 0; width: var(--side-w); background: rgba(17,26,46,0.92); backdrop-filter: blur(14px); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 18px 14px; z-index: 200; transition: transform 0.25s ease; overflow-y: auto; }
+                .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; padding: 4px 6px 18px 6px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+                .logo-img { height: 44px; width: auto; border-radius: 10px; background: #ffffff; padding: 2px; }
                 .logo-text-group { display: flex; flex-direction: column; }
-                .logo-text { font-size: 1.15rem; font-weight: bold; color: #38bdf8; text-decoration: none; line-height: 1.1; }
-                .logo-tagline { font-size: 0.7rem; color: var(--muted); }
+                .logo-text { font-size: 1.1rem; font-weight: 700; color: var(--sky); line-height: 1.1; }
+                .logo-tagline { font-size: 0.72rem; color: var(--muted); }
+                .side-label { font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; color: #64748b; margin: 14px 10px 6px; }
+                .side-nav { display: flex; flex-direction: column; gap: 3px; }
+                .side-link { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; transition: background 0.18s, color 0.18s, transform 0.18s; }
+                .side-link .ico { width: 24px; text-align: center; font-size: 1.1rem; }
+                .side-link .lbl { flex: 1; }
+                .side-link .lock { font-size: 0.75rem; opacity: 0.7; }
+                .side-link:hover { background: rgba(56,189,248,0.08); color: #fff; transform: translateX(2px); }
+                .side-link.active { background: linear-gradient(90deg, rgba(56,189,248,0.22), rgba(56,189,248,0.05)); color: #fff; box-shadow: inset 3px 0 0 var(--sky); }
+                .side-bottom { margin-top: auto; padding-top: 16px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
+                .side-note { color: var(--muted); font-size: 0.82rem; margin: 0; }
+                .side-btn { display: block; width: 100%; text-align: center; padding: 10px 14px; border-radius: 10px; font-weight: 600; font-size: 0.92rem; text-decoration: none; cursor: pointer; border: 1px solid var(--line); transition: all 0.18s; font-family: inherit; }
+                .side-btn.ghost { background: transparent; color: var(--text); }
+                .side-btn.ghost:hover { background: #1e2d4a; }
+                .side-btn.solid { background: linear-gradient(135deg, #0ea5e9, #0284c7); border-color: transparent; color: #fff; box-shadow: 0 6px 18px rgba(2,132,199,0.35); }
+                .side-btn.solid:hover { filter: brightness(1.1); }
+                .user-card { display: flex; align-items: center; gap: 10px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+                .avatar { width: 38px; height: 38px; border-radius: 50%; background: linear-gradient(135deg, #38bdf8, #4ade80); color: #0b1120; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+                .user-meta { display: flex; flex-direction: column; min-width: 0; }
+                .user-meta strong { font-size: 0.92rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                .user-meta span { font-size: 0.74rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-                .sidebar-nav { flex: 1; padding: 20px 12px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; list-style: none; margin: 0; }
-                .sidebar-nav a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; padding: 10px 14px; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
-                .sidebar-nav a:hover, .sidebar-nav a.active { color: var(--text); background: var(--surface); }
+                /* Mobile top bar */
+                .topbar { display: none; position: sticky; top: 0; z-index: 150; background: rgba(11,17,32,0.92); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); padding: 10px 16px; align-items: center; gap: 12px; }
+                .topbar .brand { color: var(--sky); font-weight: 700; text-decoration: none; }
+                #menu-btn { background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font-size: 1.2rem; padding: 4px 11px; cursor: pointer; }
+                #overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 190; }
 
-                /* Prominent Authentication Sidebar Buttons */
-                .sidebar-auth-group { display: flex; flex-direction: column; gap: 8px; padding: 14px 12px; background: rgba(2, 132, 199, 0.08); border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
-                .sidebar-auth-btn { text-align: center; font-weight: bold; padding: 10px 14px; border-radius: 8px; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.95rem; transition: background 0.2s; }
-                .sidebar-login-btn { background: var(--primary); color: #ffffff; }
-                .sidebar-login-btn:hover { background: #0369a1; color: #ffffff; }
-                .sidebar-register-btn { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
-                .sidebar-register-btn:hover { background: var(--surface); color: var(--text); }
+                /* Main area */
+                .main { margin-left: var(--side-w); min-height: 100vh; display: flex; flex-direction: column; }
+                .container { width: 100%; max-width: 980px; margin: 0 auto; padding: 36px 28px; flex: 1; }
 
-                .sidebar-footer { padding: 15px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-                .theme-toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
-                .theme-toggle-btn:hover { background: var(--surface); }
+                /* Hero banner */
+                .hero-banner { background: linear-gradient(rgba(11,17,32,0.80), rgba(11,17,32,0.88)), url('/banner.png'); background-size: cover; background-position: center; padding: 56px 28px; text-align: center; border: 1px solid var(--line); border-radius: 20px; margin-bottom: 36px; }
+                .hero-banner h1 { font-size: 2.2rem; line-height: 1.2; margin: 0 0 12px 0; color: #ffffff; }
+                .hero-banner p { color: #e2e8f0; font-size: 1.1rem; margin: 0 auto 22px auto; max-width: 720px; }
+                .ussd-badge { display: inline-block; background: var(--sky); color: #0b1120; padding: 10px 22px; border-radius: 30px; font-weight: bold; font-size: 1.02rem; box-shadow: 0 6px 20px rgba(56,189,248,0.35); }
+                .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 18px; }
+                .hero-actions .cta-btn { width: auto; min-width: 150px; }
 
-                .main-content { margin-left: 260px; flex: 1; display: flex; flex-direction: column; min-height: 100vh; }
-                .container { max-width: 900px; margin: 40px auto; padding: 0 30px; flex: 1; width: 100%; box-sizing: border-box; }
+                h2 { color: var(--sky); font-size: 1.9rem; margin-top: 0; line-height: 1.25; }
+                h3 { color: var(--sky); margin-top: 30px; }
+                .sub-title { color: var(--muted); font-size: 1.1rem; margin-top: -8px; margin-bottom: 24px; }
+                .intro-text { font-size: 1.08rem; color: #e2e8f0; margin-bottom: 24px; }
 
-                h2 { color: var(--primary); font-size: 2rem; margin-top: 0; }
-                h3 { color: var(--primary); margin-top: 30px; }
-                .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
-                .intro-text { font-size: 1.1rem; color: var(--text); margin-bottom: 25px; }
-                
-                ul.feature-list { list-style: disc; padding-left: 20px; margin: 20px 0; }
-                ul.feature-list li { margin-bottom: 12px; font-size: 1.05rem; color: var(--text); }
+                ul.feature-list { list-style: none; padding: 0; margin: 18px 0; }
+                ul.feature-list li { margin-bottom: 10px; padding: 10px 14px 10px 40px; position: relative; font-size: 1rem; color: #f1f5f9; background: rgba(22,33,58,0.6); border: 1px solid var(--line); border-radius: 12px; }
+                ul.feature-list li::before { content: "✔"; position: absolute; left: 14px; color: var(--accent); font-weight: bold; }
 
-                .cta-box { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; }
-                .cta-box p { font-size: 1.1rem; margin-top: 0; color: var(--text); }
-                .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; border: none; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
-                .cta-btn:hover { background: #0369a1; }
+                .cta-box { background: linear-gradient(135deg, #16213a, #12304a); border: 1px solid var(--line); padding: 26px; border-radius: 16px; margin-top: 40px; text-align: center; }
+                .cta-box p { font-size: 1.08rem; margin-top: 0; color: #f8fafc; }
+                .cta-btn { display: inline-block; background: linear-gradient(135deg, #0ea5e9, #0284c7); color: white; padding: 12px 28px; border-radius: 12px; text-decoration: none; font-weight: bold; font-size: 1.02rem; transition: transform 0.15s, filter 0.15s; border: none; cursor: pointer; width: 100%; text-align: center; font-family: inherit; }
+                .cta-btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+                .cta-btn.outline { background: transparent; border: 1px solid var(--sky); color: var(--sky); }
 
-                .form-container { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 30px; text-align: left; }
-                .form-group { margin-bottom: 15px; }
-                .form-group label { display: block; margin-bottom: 5px; color: var(--primary); font-weight: 500; }
-                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; }
+                .form-container { background: var(--card); border: 1px solid var(--line); padding: 26px; border-radius: 16px; margin-top: 30px; text-align: left; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+                .form-group { margin-bottom: 16px; }
+                .form-group label { display: block; margin-bottom: 6px; color: var(--sky); font-weight: 500; }
+                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--line); background: #0b1120; color: #f8fafc; font-family: inherit; font-size: 0.97rem; transition: border-color 0.15s, box-shadow 0.15s; }
+                .form-group input:focus, .form-group select:focus, .form-group textarea:focus { outline: none; border-color: var(--sky); box-shadow: 0 0 0 3px rgba(56,189,248,0.2); }
 
-                .contact-bar { background: var(--sidebar-bg); border-top: 1px solid var(--border); padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
-                .contact-bar strong { color: var(--primary); }
+                /* Login / sign up */
+                .auth-wrap { min-height: 60vh; display: flex; align-items: center; justify-content: center; }
+                .auth-card { width: 100%; max-width: 460px; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 32px; box-shadow: 0 20px 50px rgba(0,0,0,0.35); }
+                .auth-card h2 { margin-bottom: 4px; }
+                .auth-card .sub-title { margin-bottom: 20px; font-size: 1rem; }
+                .alert { border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; font-size: 0.93rem; }
+                .alert.error { background: rgba(248,113,113,0.12); border: 1px solid rgba(248,113,113,0.5); color: #fecaca; }
+                .alert.info { background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.5); color: #bae6fd; }
+                .auth-switch { text-align: center; margin: 18px 0 0 0; color: var(--muted); font-size: 0.93rem; }
 
-                .site-footer { background: var(--sidebar-bg); border-top: 1px solid var(--border); color: var(--muted); padding: 40px 30px 20px 30px; }
-                .footer-grid { max-width: 900px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px; margin-bottom: 30px; }
-                .footer-col h4 { color: var(--primary); font-size: 1rem; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); padding-bottom: 6px; }
-                .footer-links { list-style: none; padding: 0; margin: 0; }
-                .footer-links li { margin-bottom: 8px; }
-                .footer-links a { color: var(--muted); text-decoration: none; font-size: 0.9rem; }
-                .footer-links a:hover { color: var(--primary); }
-                .footer-bottom { max-width: 900px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 15px; text-align: center; font-size: 0.85rem; color: var(--muted); }
+                .contact-bar { background: rgba(17,26,46,0.9); border-top: 1px solid var(--line); padding: 18px; text-align: center; color: var(--muted); margin-top: 40px; }
+                .contact-bar strong { color: var(--sky); }
+                footer { text-align: center; padding: 18px; color: var(--muted); font-size: 0.88rem; }
+                footer a { color: var(--sky); text-decoration: none; }
+                footer a:hover { text-decoration: underline; }
 
-                .hero-banner { 
-                    background: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.85)), url('/banner.png');
-                    background-size: cover;
-                    background-position: center;
-                    padding: 50px 20px; 
-                    text-align: center; 
-                    border-bottom: 1px solid var(--border); 
-                    margin: -40px -30px 30px -30px;
-                }
-                .hero-banner h1 { font-size: 2.2rem; margin: 0 0 10px 0; color: #ffffff; }
-                .hero-banner p { color: #e2e8f0; font-size: 1.1rem; margin-bottom: 20px; max-width: 750px; margin-left: auto; margin-right: auto; }
-                .ussd-badge { display: inline-block; background: #38bdf8; color: #0f172a; padding: 8px 18px; border-radius: 30px; font-weight: bold; font-size: 1rem; }
+                /* Terms & Conditions page */
+                .terms h3 { margin-top: 30px; }
+                .terms p.clause { margin: 8px 0; color: #e2e8f0; }
+                .terms p.clause strong { color: var(--accent); margin-right: 6px; }
+                .terms ul { padding-left: 22px; color: #f1f5f9; }
+                .terms ul li { margin-bottom: 8px; }
 
-                @media(max-width: 768px) {
-                    .sidebar { width: 100%; position: relative; height: auto; }
-                    .main-content { margin-left: 0; }
-                    body { flex-direction: column; }
+                @media (max-width: 900px) {
+                    .sidebar { transform: translateX(-100%); box-shadow: 10px 0 40px rgba(0,0,0,0.5); }
+                    body.menu-open .sidebar { transform: translateX(0); }
+                    body.menu-open #overlay { display: block; }
+                    .topbar { display: flex; }
+                    .main { margin-left: 0; }
+                    .container { padding: 24px 16px; }
+                    .hero-banner h1 { font-size: 1.7rem; }
                 }
             </style>
         </head>
         <body>
-            <aside class="sidebar">
-                <div class="sidebar-header">
-                    <a href="/" class="logo-container">
-                        <img src="/logo.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
-                        <div class="logo-text-group">
-                            <span class="logo-text">Tencent Innovations</span>
-                            <span class="logo-tagline">Connecting You, Faster.</span>
-                        </div>
-                    </a>
-                </div>
-                <ul class="sidebar-nav">
-                    <li><a href="/" class="${activeNav === 'home' ? 'active' : ''}">🏠 Home</a></li>
-                    <li><a href="/wifi" class="${activeNav === 'wifi' ? 'active' : ''}">📶 WiFi & Networking</a></li>
-                    <li><a href="/cctv" class="${activeNav === 'cctv' ? 'active' : ''}">📷 CCTV Systems</a></li>
-                    <li><a href="/smart-locks" class="${activeNav === 'smart-locks' ? 'active' : ''}">🔐 Smart Locks</a></li>
-                    <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
-                    <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
-                    <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
-                    ${res.locals.user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
-                    <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
-                    
-                    <hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;">
+            <div class="topbar">
+                <button id="menu-btn" aria-label="Open menu">☰</button>
+                <a href="/" class="brand">Tencent Innovations</a>
+            </div>
+            <div id="overlay"></div>
 
-                    <!-- Prominent Login / Register / Account Section -->
-                    <div class="sidebar-auth-group">
-                        ${res.locals.user ? `
-                            <div style="padding: 4px 6px; font-size: 0.9rem; color: var(--text); overflow: hidden; text-overflow: ellipsis;">
-                                👤 <strong>${esc(res.locals.user.name)}</strong>
-                            </div>
-                            <a href="/logout" class="sidebar-auth-btn sidebar-register-btn" style="border-color: #f87171; color: #f87171;">🚪 Logout</a>
-                        ` : `
-                            <a href="/login" class="sidebar-auth-btn sidebar-login-btn">🔑 Sign In / Login</a>
-                            <a href="/register" class="sidebar-auth-btn sidebar-register-btn">📝 Register Account</a>
-                        `}
+            <!-- Left sidebar navigation -->
+            <aside class="sidebar" id="sidebar">
+                <a href="/" class="logo-container">
+                    <img src="/logo.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
+                    <div class="logo-text-group">
+                        <span class="logo-text">Tencent Innovations</span>
+                        <span class="logo-tagline">Connecting You, Faster.</span>
                     </div>
-                </ul>
-                <div class="sidebar-footer">
-                    <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle Theme">
-                        <span id="theme-icon">☀️</span> <span id="theme-text">Light</span>
-                    </button>
+                </a>
+
+                <div class="side-label">Menu</div>
+                <nav class="side-nav">
+                    ${navItem('home', '/', '🏠', 'Home', false)}
+                </nav>
+
+                <div class="side-label">Services</div>
+                <nav class="side-nav">
+                    ${navItem('wifi', '/wifi', '📶', 'WiFi', true)}
+                    ${navItem('cctv', '/cctv', '📹', 'CCTV', true)}
+                    ${navItem('smart-locks', '/smart-locks', '🔐', 'Smart Locks', true)}
+                    ${navItem('electric-fence', '/electric-fence', '⚡', 'Electric Fence', true)}
+                    ${navItem('solar', '/solar', '☀️', 'Solar', true)}
+                    ${navItem('survey', '/survey', '📋', 'Surveys', true)}
+                </nav>
+
+                <div class="side-label">Information</div>
+                <nav class="side-nav">
+                    ${navItem('terms', '/terms', '📄', 'Terms &amp; Conditions', false)}
+                </nav>
+
+                <div class="side-bottom">
+                    ${accountBox}
                 </div>
             </aside>
 
-            <div class="main-content">
+            <div class="main">
                 <div class="container">
                     ${content}
                 </div>
@@ -754,61 +824,19 @@ function renderPage({ title, activeNav, content }) {
                     📍 <strong>Rangwe, Homa Bay County</strong> &nbsp;|&nbsp; 📞 <strong>0740 311 014</strong> &nbsp;|&nbsp; ✉️ <strong>tencentbz@gmail.com</strong>
                 </div>
 
-                <footer class="site-footer">
-                    <div class="footer-grid">
-                        <div class="footer-col">
-                            <h4>Find It Fast</h4>
-                            <ul class="footer-links">
-                                <li><a href="/smart-locks">Access Control</a></li>
-                                <li><a href="/cctv">Security Systems</a></li>
-                                <li><a href="/wifi">Telephony Systems</a></li>
-                                <li><a href="/survey">Site Surveys</a></li>
-                                <li><a href="/solar">Solar Systems</a></li>
-                            </ul>
-                        </div>
-                        <div class="footer-col">
-                            <h4>Customer Care</h4>
-                            <ul class="footer-links">
-                                <li><a href="/survey">My account</a></li>
-                                <li><a href="tel:0740311014">Contact Us</a></li>
-                                <li><a href="/terms">Terms & Conditions</a></li>
-                            </ul>
-                        </div>
-                        <div class="footer-col">
-                            <h4>Tencent Innovations</h4>
-                            <p style="font-size: 0.85rem; color: var(--muted); line-height: 1.5;">
-                                Empowering homes, schools, and businesses across Rangwe and Homa Bay County with integrated internet, reliable security, and clean solar backup power.
-                            </p>
-                        </div>
-                    </div>
-                    <div class="footer-bottom">
-                        <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform.</p>
-                    </div>
+                <footer>
+                    <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform.</p>
+                    <p><a href="/terms">Terms and Conditions</a></p>
                 </footer>
             </div>
 
             <script>
-                function updateThemeUI(theme) {
-                    const icon = document.getElementById('theme-icon');
-                    const text = document.getElementById('theme-text');
-                    if (theme === 'light') {
-                        if (icon) icon.textContent = '🌙';
-                        if (text) text.textContent = 'Dark';
-                    } else {
-                        if (icon) icon.textContent = '☀️';
-                        if (text) text.textContent = 'Light';
-                    }
-                }
-                const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-                updateThemeUI(currentTheme);
-
-                document.getElementById('theme-toggle').addEventListener('click', () => {
-                    const current = document.documentElement.getAttribute('data-theme') || 'dark';
-                    const next = current === 'dark' ? 'light' : 'dark';
-                    document.documentElement.setAttribute('data-theme', next);
-                    localStorage.setItem('theme', next);
-                    updateThemeUI(next);
-                });
+            (function () {
+                var btn = document.getElementById('menu-btn'), overlay = document.getElementById('overlay');
+                function toggle() { document.body.classList.toggle('menu-open'); }
+                btn.addEventListener('click', toggle);
+                overlay.addEventListener('click', toggle);
+            })();
             </script>
         </body>
         </html>
@@ -816,102 +844,153 @@ function renderPage({ title, activeNav, content }) {
 }
 
 // ---------------------------------------------------------------
-// Auth Routes (Register, Login, Logout)
+// Accounts: register, login, logout
 // ---------------------------------------------------------------
-app.get('/register', (req, res) => {
+function authPage(mode, { error = '', values = {}, next = '/', need = false } = {}) {
+    const isLogin = mode === 'login';
+    const nextField = `<input type="hidden" name="next" value="${esc(next)}">`;
     const content = `
-        <h2>Create an Account</h2>
-        <p class="sub-title">Register to book services, request surveys, and download receipts.</p>
-        <div class="form-container">
-            <form action="/register" method="POST">
-                <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="John Otieno"></div>
-                <div class="form-group"><label>Email Address (for receipt delivery)</label><input type="email" name="email" required placeholder="john@example.com"></div>
-                <div class="form-group"><label>Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
-                <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
-                <button type="submit" class="cta-btn">Register</button>
-            </form>
-            <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login" style="color:var(--primary);">Login here</a></p>
-        </div>
-    `;
-    res.send(renderPage({ title: 'Register', activeNav: 'register', content }));
+        <div class="auth-wrap">
+            <div class="auth-card">
+                <h2>${isLogin ? 'Welcome back' : 'Create your account'}</h2>
+                <p class="sub-title">${isLogin ? 'Log in to book our services and get your receipts.' : 'Sign up to book surveys and get receipts by email.'}</p>
+                ${need && isLogin ? '<div class="alert info">Please log in or sign up to access our services.</div>' : ''}
+                ${error ? `<div class="alert error">${esc(error)}</div>` : ''}
+                <form action="/${isLogin ? 'login' : 'register'}" method="POST" autocomplete="on">
+                    ${nextField}
+                    ${isLogin ? '' : `
+                    <div class="form-group">
+                        <label>Full Name</label>
+                        <input type="text" name="name" required maxlength="80" placeholder="e.g. Mary Akinyi" value="${esc(values.name || '')}" autocomplete="name">
+                    </div>`}
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" name="email" required maxlength="120" placeholder="you@example.com" value="${esc(values.email || '')}" autocomplete="email">
+                    </div>
+                    ${isLogin ? '' : `
+                    <div class="form-group">
+                        <label>M-Pesa Phone Number</label>
+                        <input type="tel" name="phone" required placeholder="0712345678" value="${esc(values.phone || '')}" autocomplete="tel">
+                    </div>`}
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" name="password" required ${isLogin ? '' : 'minlength="8"'} maxlength="72" placeholder="${isLogin ? 'Your password' : 'At least 8 characters'}" autocomplete="${isLogin ? 'current-password' : 'new-password'}">
+                    </div>
+                    ${isLogin ? '' : `
+                    <div class="form-group">
+                        <label>Confirm Password</label>
+                        <input type="password" name="confirm" required minlength="8" maxlength="72" placeholder="Repeat your password" autocomplete="new-password">
+                    </div>
+                    <p style="color:var(--muted); font-size:0.9rem; margin: 0 0 12px 0;">By signing up, you agree to our <a href="/terms" target="_blank">Terms and Conditions</a>.</p>`}
+                    <button type="submit" class="cta-btn">${isLogin ? 'Log in' : 'Create account'}</button>
+                </form>
+                <p class="auth-switch">${isLogin
+                    ? `New here? <a href="/register?next=${encodeURIComponent(next)}">Create an account</a>`
+                    : `Already registered? <a href="/login?next=${encodeURIComponent(next)}">Log in</a>`}</p>
+            </div>
+        </div>`;
+    return renderPage({ title: isLogin ? 'Log in' : 'Sign up', activeNav: isLogin ? 'login' : 'register', content });
+}
+
+// Starts a fresh session (prevents session fixation) and sends the person onwards
+function startSession(req, res, user, next) {
+    req.session.regenerate(err => {
+        if (err) { console.error('Session error:', err.message); return res.status(500).send(authPage('login', { error: 'Something went wrong. Please try again.', next })); }
+        req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone };
+        req.session.save(() => res.redirect(next));
+    });
+}
+
+const AUTH_DOWN = 'Accounts are not available right now. Please try again shortly or call us on 0740 311 014.';
+
+app.get('/register', (req, res) => {
+    if (req.session.user) return res.redirect('/');
+    res.send(authPage('register', { next: safeNext(req.query.next) }));
 });
 
-app.post('/register', async (req, res) => {
-    const { name, email, phone, password } = req.body;
-    if (!name || !email || !phone || !password) {
-        return res.status(400).send('All fields are required.');
-    }
+app.post('/register', authLimiter, async (req, res) => {
+    const str = v => (typeof v === 'string' ? v.trim() : '');
+    const name = str(req.body.name).slice(0, 80);
+    const email = str(req.body.email).toLowerCase().slice(0, 120);
+    const phone = normalizePhone(str(req.body.phone));
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const confirm = typeof req.body.confirm === 'string' ? req.body.confirm : '';
+    const next = safeNext(req.body.next);
+    const values = { name, email, phone: str(req.body.phone) };
+    const fail = (error, status = 400) => res.status(status).send(authPage('register', { error, values, next }));
+
+    if (!pool) return fail(AUTH_DOWN, 503);
+    if (!name) return fail('Please enter your name.');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return fail('Please enter a valid email address.');
+    if (!phone) return fail('Please enter a valid Safaricom number, for example 0712345678.');
+    if (password.length < 8) return fail('Your password must be at least 8 characters.');
+    if (password.length > 72) return fail('Your password must be 72 characters or fewer.');
+    if (password !== confirm) return fail('The two passwords do not match.');
+
     try {
-        const hash = await bcrypt.hash(password, 10);
-        const result = await pool.query(
+        const hash = await bcrypt.hash(password, 12);
+        const r = await pool.query(
             'INSERT INTO users (name, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, email, phone',
             [name, email, phone, hash]
         );
-        req.session.user = result.rows[0];
-        res.redirect('/survey');
+        console.log('NEW ACCOUNT:', JSON.stringify({ id: r.rows[0].id, email }));
+        startSession(req, res, r.rows[0], next);
     } catch (err) {
-        console.error('Registration error:', err.message);
-        res.status(400).send(renderPage({
-            title: 'Registration Error',
-            activeNav: 'register',
-            content: `<h2>Registration Failed</h2><p class="intro-text">Email may already be registered. Please try logging in.</p><a href="/login" class="cta-btn">Go to Login</a>`
-        }));
+        if (err.code === '23505') return fail('An account with this email already exists. Please log in instead.', 409);
+        console.error('Register failed:', err.message);
+        fail(AUTH_DOWN, 500);
     }
 });
+
+// Used so a login for an unknown email takes as long as one for a known email
+const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 12);
 
 app.get('/login', (req, res) => {
-    const redirectUrl = req.query.redirect || '/survey';
-    const content = `
-        <h2>Login to Your Account</h2>
-        <p class="sub-title">Access surveys, service bookings, and receipt downloads.</p>
-        <div class="form-container">
-            <form action="/login?redirect=${encodeURIComponent(redirectUrl)}" method="POST">
-                <div class="form-group"><label>Email Address</label><input type="email" name="email" required placeholder="john@example.com"></div>
-                <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
-                <button type="submit" class="cta-btn">Login</button>
-            </form>
-            <p style="margin-top: 15px; text-align:center;">Don't have an account? <a href="/register" style="color:var(--primary);">Register here</a></p>
-        </div>
-    `;
-    res.send(renderPage({ title: 'Login', activeNav: 'login', content }));
+    if (req.session.user) return res.redirect(safeNext(req.query.next));
+    res.send(authPage('login', { next: safeNext(req.query.next), need: req.query.need === '1' }));
 });
 
-app.post('/login', async (req, res) => {
-    const { email, password } = req.body;
-    const redirectUrl = req.query.redirect || '/survey';
+app.post('/login', authLimiter, async (req, res) => {
+    const email = (typeof req.body.email === 'string' ? req.body.email : '').trim().toLowerCase().slice(0, 120);
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const next = safeNext(req.body.next);
+    const fail = (error, status = 401) => res.status(status).send(authPage('login', { error, values: { email }, next }));
+
+    if (!pool) return fail(AUTH_DOWN, 503);
+    if (!email || !password) return fail('Please enter your email and password.', 400);
+
     try {
-        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (result.rows.length === 0) {
-            return res.status(400).send('Invalid email or password.');
-        }
-        const user = result.rows[0];
-        const match = await bcrypt.compare(password, user.password_hash);
-        if (!match) {
-            return res.status(400).send('Invalid email or password.');
-        }
-        req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone };
-        res.redirect(redirectUrl);
+        const r = await pool.query('SELECT id, name, email, phone, password_hash FROM users WHERE LOWER(email) = $1', [email]);
+        const row = r.rows[0];
+        const ok = await bcrypt.compare(password, row ? row.password_hash : DUMMY_HASH);
+        if (!row || !ok) return fail('Incorrect email or password.');
+        startSession(req, res, row, next);
     } catch (err) {
-        console.error('Login error:', err.message);
-        res.status(500).send('Server error during login.');
+        console.error('Login failed:', err.message);
+        fail(AUTH_DOWN, 500);
     }
 });
 
-app.get('/logout', (req, res) => {
+app.post('/logout', (req, res) => {
     req.session.destroy(() => {
+        res.clearCookie('tnc.sid');
         res.redirect('/');
     });
 });
 
-// ---------------------------------------------------------------
-// Public Pages
-// ---------------------------------------------------------------
+// 1. Home Page (Includes Form #2: Quick Callback / Inquiry Form)
 app.get('/', (req, res) => {
+    const user = currentUser();
     const content = `
         <div class="hero-banner">
             <h1>Internet, security and power for your home or business.</h1>
             <p>Tencent Innovations designs, installs and maintains WiFi, CCTV, smart locks, electric fences and solar systems. We start with a survey, so you only pay for what your site needs.</p>
             <div class="ussd-badge">📱 Dial *384*100# on your phone to book</div>
+            <div class="hero-actions">
+                ${user
+                    ? `<a href="/survey" class="cta-btn">Book a survey</a>`
+                    : `<a href="/register" class="cta-btn">Create account</a><a href="/login" class="cta-btn outline">Log in</a>`}
+            </div>
         </div>
         
         <p class="intro-text">Most problems with networks, cameras and power start with a poor plan, not poor equipment. We are engineers, so we plan first, install properly and stay around to support what we build.</p>
@@ -926,92 +1005,347 @@ app.get('/', (req, res) => {
             <li><strong>Surveys:</strong> A site visit and a written plan before any work begins.</li>
         </ul>
 
-        <div class="cta-box">
-            <p>Ready to get started? Register or login to book a professional site survey.</p>
-            <a href="/survey" class="cta-btn">Book a Survey Now</a>
+        <h3>Why choose us</h3>
+        <ul class="feature-list">
+            <li>Engineer-led design and installation, not guesswork.</li>
+            <li>A clear quote after the survey, with no surprise add-ons.</li>
+            <li>Local support after installation.</li>
+            <li>One team for all your systems, so your WiFi, cameras and power work together.</li>
+        </ul>
+
+        <div class="form-container" id="callback-form">
+            <h3 style="margin-top:0; color:#38bdf8;">Request a Free Callback</h3>
+            <p style="color:var(--muted); font-size:0.95rem;">Not sure where to start? Send us your details and an engineer will call you back shortly.</p>
+            <form action="/submit-callback" method="POST">
+                <div class="form-group">
+                    <label>Your Name</label>
+                    <input type="text" name="name" required placeholder="e.g. John Otieno">
+                </div>
+                <div class="form-group">
+                    <label>Phone Number</label>
+                    <input type="tel" name="phone" required placeholder="e.g. 0712345678">
+                </div>
+                <div class="form-group">
+                    <label>Project / Problem Description</label>
+                    <textarea name="message" rows="3" required placeholder="e.g. Need CCTV installed at my shop in Rangwe"></textarea>
+                </div>
+                <button type="submit" class="cta-btn">Request Callback</button>
+            </form>
         </div>
     `;
     res.send(renderPage({ title: 'Home', activeNav: 'home', content }));
 });
 
-app.get('/wifi', (req, res) => {
+// Handle Callback Submission (emails you instantly)
+app.post('/submit-callback', async (req, res) => {
+    const { name, phone, message } = req.body;
+
+    await notify(`📞 Callback request: ${name || 'Unknown'}`, {
+        Name: name,
+        Phone: phone,
+        Message: message
+    });
+
+    res.send(renderPage({
+        title: 'Callback Requested',
+        activeNav: 'home',
+        content: `<h2>Thank You, ${esc(name)}!</h2><p class="intro-text">We have received your request. An engineer will call you at <strong>${esc(phone)}</strong> shortly.</p><a href="/" class="cta-btn">Back to Home</a>`
+    }));
+});
+
+// 2. WiFi Page
+app.get('/wifi', requireAuth, (req, res) => {
     const content = `
         <h2>Reliable WiFi for homes, rentals and businesses.</h2>
         <p class="sub-title">Pay-as-you-go hotspot or a fixed monthly connection. We build the network, run the billing and keep it online.</p>
-        <p class="intro-text">A good connection depends on the whole chain: the link to the mast, the router, the access points and how many people share them.</p>
+        
+        <p class="intro-text">A good connection depends on the whole chain: the link to the mast, the router, the access points and how many people share them. We design all of it together, so the signal reaches every room and holds up when more people connect.</p>
+
+        <h3>Two ways to get connected</h3>
+        <ul class="feature-list">
+            <li><strong>Hotspot:</strong> Buy a time or data bundle with M-Pesa and connect from any phone or laptop. Good for rental plots, shops, cafes and public spaces.</li>
+            <li><strong>Monthly home or office plan:</strong> A dedicated connection with its own private WiFi name and password, billed monthly. Good for homes, schools and offices that need a steady line.</li>
+        </ul>
+
+        <h3>What is included</h3>
+        <ul class="feature-list">
+            <li>Site survey and signal test before we install</li>
+            <li>Outdoor and indoor access points, positioned for coverage</li>
+            <li>Router configuration with a captive login page, user limits and M-Pesa payments</li>
+            <li>Private WiFi and hotspot on the same equipment when you need both</li>
+            <li>Support when something drops</li>
+        </ul>
+
+        <h3>For business owners</h3>
+        <p>Running a hotspot business? We can set up the network, billing and login system for you, and show you how to manage customers yourself.</p>
+
         <div class="cta-box">
-            <p>Book a site visit to test signal strength at your location.</p>
-            <a href="/survey" class="cta-btn">Book WiFi Consultation</a>
+            <p>Tell us where you are and what you need. We will visit, test the signal and give you a clear quote.</p>
+            <a href="/survey" class="cta-btn">Book a WiFi consultation</a>
         </div>
     `;
     res.send(renderPage({ title: 'WiFi & Networking', activeNav: 'wifi', content }));
 });
 
-app.get('/cctv', (req, res) => {
+// 3. CCTV Page
+app.get('/cctv', requireAuth, (req, res) => {
     const content = `
         <h2>See your property from anywhere.</h2>
         <p class="sub-title">CCTV systems for homes, shops, schools and compounds, installed and set up to view live on your phone.</p>
+        
+        <p class="intro-text">A camera is only useful if it points at the right place, records clearly at night and keeps working when the power goes. We plan the camera positions on site, install the system neatly and show you how to use it.</p>
+
+        <h3>What you get</h3>
+        <ul class="feature-list">
+            <li>Cameras chosen for the spot: entrances, gates, parking, counters, perimeters</li>
+            <li>Clear day and night recording</li>
+            <li>Live viewing and playback on your phone</li>
+            <li>Recording to a hard drive, with enough storage for the number of days you need</li>
+            <li>Tidy, protected cabling and weatherproof fittings outdoors</li>
+            <li>Backup power so recording continues during outages</li>
+        </ul>
+
+        <h3>How it works</h3>
+        <ol style="color: #f1f5f9; padding-left: 20px; line-height: 1.8;">
+            <li>We visit and walk the site with you.</li>
+            <li>You receive a camera layout and a written quote.</li>
+            <li>We install, test every camera and set up your phone.</li>
+            <li>We show you how to find and save footage.</li>
+        </ol>
+
+        <h3>Good to know</h3>
+        <ul class="feature-list">
+            <li>Cameras work best when they are placed for a purpose. We will tell you if you need fewer than you expected, or more.</li>
+            <li>Already have cameras? We can inspect them, fix faults and add remote viewing.</li>
+        </ul>
+
         <div class="cta-box">
-            <p>Get professional camera positioning and a clear quote.</p>
-            <a href="/survey" class="cta-btn">Book CCTV Survey</a>
+            <p>Book a survey and we will tell you what your property needs and what it will cost.</p>
+            <a href="/survey" class="cta-btn">Book a CCTV survey</a>
         </div>
     `;
     res.send(renderPage({ title: 'CCTV Systems', activeNav: 'cctv', content }));
 });
 
-app.get('/smart-locks', (req, res) => {
+// 4. Smart Locks Page
+app.get('/smart-locks', requireAuth, (req, res) => {
     const content = `
         <h2>Open your door without a key.</h2>
         <p class="sub-title">Smart locks for homes, rental units, offices and stores. Use a code, a card, a fingerprint or your phone.</p>
+        
+        <p class="intro-text">Keys get lost, copied and passed to people who should not have them. A smart lock removes that problem. You decide who can enter, and you can take that access away in seconds.</p>
+
+        <h3>Ways to unlock</h3>
+        <ul class="feature-list">
+            <li>Fingerprint</li>
+            <li>PIN code</li>
+            <li>Card or key tag</li>
+            <li>Phone app (on supported models)</li>
+            <li>Mechanical key as a backup</li>
+        </ul>
+
+        <h3>Why people choose them</h3>
+        <ul class="feature-list">
+            <li><strong>Landlords and caretakers:</strong> Give each tenant their own code and change it when they move out. No more rekeying.</li>
+            <li><strong>Families:</strong> Children enter without carrying keys.</li>
+            <li><strong>Offices and stores:</strong> Give staff access and remove it when they leave.</li>
+            <li><strong>Short-stay hosts:</strong> Share a temporary code with guests.</li>
+        </ul>
+
+        <h3>What we do</h3>
+        <ul class="feature-list">
+            <li>Help you pick a model that fits your door and budget</li>
+            <li>Fit and align the lock so it closes smoothly</li>
+            <li>Add your users and show you how to manage them</li>
+            <li>Fit new batteries and show you how to know when they are low</li>
+        </ul>
+
+        <p><strong>Good to know:</strong> Smart locks fit most standard wooden and metal doors. We check your door during the survey and tell you if it needs changes before the lock goes on.</p>
+
         <div class="cta-box">
-            <p>Find the right smart lock model for your doors.</p>
-            <a href="/survey" class="cta-btn">Book Smart Lock Consultation</a>
+            <p>Tell us about your door and how many people need access. We will recommend a lock and quote you the installed price.</p>
+            <a href="/survey" class="cta-btn">Book a smart lock consultation</a>
         </div>
     `;
     res.send(renderPage({ title: 'Smart Locks', activeNav: 'smart-locks', content }));
 });
 
-app.get('/electric-fence', (req, res) => {
+// 5. Electric Fence Page
+app.get('/electric-fence', requireAuth, (req, res) => {
     const content = `
         <h2>Stop intruders at the boundary.</h2>
-        <p class="sub-title">Electric fence installation for homes, compounds, schools, farms and commercial plots.</p>
+        <p class="sub-title">Electric fence installation for homes, compounds, schools, farms and commercial plots, with an alarm that alerts you when the fence is touched or cut.</p>
+        
+        <p class="intro-text">A visible fence with a warning sign makes most intruders look for an easier target. Fitted correctly, it protects your boundary without turning your compound into a hazard. We install to a safe standard and explain every part of the system to you.</p>
+
+        <h3>What is included</h3>
+        <ul class="feature-list">
+            <li>Fence design for your wall, roof or open boundary</li>
+            <li>Energiser, wiring, insulators and earthing, installed correctly</li>
+            <li>Alarm siren and a control unit you can arm and disarm</li>
+            <li>Warning signs on every side of the fence</li>
+            <li>Backup battery so protection continues during power cuts</li>
+            <li>A walk-through showing how to arm, disarm and check the system</li>
+        </ul>
+
+        <h3>Safety comes first</h3>
+        <ul class="feature-list">
+            <li>We use proper insulators and a correct earthing system.</li>
+            <li>The fence delivers a short pulse designed to deter, not harm.</li>
+            <li>Warning signs go up before the fence is switched on.</li>
+            <li>We tell you how to keep vegetation and objects away from the live wires.</li>
+        </ul>
+
+        <p><strong>Often paired with:</strong> CCTV to see what set off the alarm, a solar backup so the fence runs through blackouts, and a smart lock on your gate or main door.</p>
+
         <div class="cta-box">
-            <p>Measure your boundary and get a professional installation quote.</p>
-            <a href="/survey" class="cta-btn">Book Electric Fence Survey</a>
+            <p>Book a survey. We measure your boundary, explain the options and give you a written quote.</p>
+            <a href="/survey" class="cta-btn">Book an electric fence survey</a>
         </div>
     `;
     res.send(renderPage({ title: 'Electric Fence', activeNav: 'electric-fence', content }));
 });
 
-app.get('/solar', (req, res) => {
+// 6. Solar Page (Includes Form #3: Solar Load & Battery Sizing Form)
+app.get('/solar', requireAuth, (req, res) => {
+    const user = currentUser();
     const content = `
         <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
-        <p class="sub-title">Solar and battery systems sized for your home, shop, school or network site.</p>
-        <div class="cta-box">
-            <p>Calculate your load requirements with our engineers.</p>
-            <a href="/survey" class="cta-btn">Book Solar Consultation</a>
+        <p class="sub-title">Solar and battery systems sized for your home, shop, school or network site, from a small backup to a full installation.</p>
+        
+        <p class="intro-text">Power cuts cost you sales, security and connection time. A solar system with battery storage keeps your essential equipment running, and cuts your dependence on the grid. We size every system to the equipment you need to power, so you do not overpay for capacity you will not use.</p>
+
+        <h3>What we offer</h3>
+        <ul class="feature-list">
+            <li><strong>Backup power:</strong> Keep lights, TV, router, phones and cameras running through outages.</li>
+            <li><strong>Hybrid systems:</strong> Use solar by day, batteries at night and the grid as a fallback.</li>
+            <li><strong>Off-grid systems:</strong> Power sites with no grid connection.</li>
+            <li><strong>Network and security backup:</strong> Keep WiFi access points, CCTV and electric fences online for hours after a cut.</li>
+        </ul>
+
+        <h3>What is included</h3>
+        <ul class="feature-list">
+            <li>A list of what you want to power, and how long it must run</li>
+            <li>System sizing: panels, battery capacity and inverter</li>
+            <li>Mounting, wiring, protection and earthing done to a safe standard</li>
+            <li>Testing and a walk-through of how the system behaves</li>
+            <li>Support and maintenance</li>
+        </ul>
+
+        <h3>How we size it</h3>
+        <p>We add up the power of each device, estimate the hours you use it, and size the batteries and panels to cover that load with room to grow. You see the numbers before you decide.</p>
+
+        <div class="form-container">
+            <h3 style="margin-top:0; color:#38bdf8;">Solar Load & Battery Sizing Request</h3>
+            <p style="color:var(--muted); font-size:0.95rem;">Select your required equipment to get a custom sizing estimate.</p>
+            <form action="/submit-solar" method="POST">
+                <div class="form-group">
+                    <label>Property Type</label>
+                    <select name="propertyType">
+                        <option value="Home">Home</option>
+                        <option value="Shop">Shop / Business</option>
+                        <option value="School">School / Institution</option>
+                        <option value="Rental Compound">Rental Compound</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Equipment to Power (Check all that apply):</label>
+                    <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 5px; color: #f1f5f9;">
+                        <label><input type="checkbox" name="equipment" value="Lights" style="width:auto;"> Lights & Phone Charging</label>
+                        <label><input type="checkbox" name="equipment" value="Router" style="width:auto;"> WiFi Router / Internet</label>
+                        <label><input type="checkbox" name="equipment" value="CCTV" style="width:auto;"> CCTV Cameras</label>
+                        <label><input type="checkbox" name="equipment" value="Fridge" style="width:auto;"> Refrigerator / Fridge</label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Required Backup Duration</label>
+                    <select name="duration">
+                        <option value="4 Hours">4 Hours (Basic Outage)</option>
+                        <option value="8 Hours">8 Hours (Extended)</option>
+                        <option value="24/7 Off-Grid">24/7 Full Off-Grid</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Phone Number (M-Pesa)</label>
+                    <input type="tel" name="phone" required placeholder="e.g. 0712345678" value="${esc(user ? user.phone : '')}">
+                </div>
+                <button type="submit" class="cta-btn">Calculate & Get Solar Quote</button>
+            </form>
         </div>
     `;
     res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
 });
 
-// ---------------------------------------------------------------
-// Protected Survey & Payment Page
-// ---------------------------------------------------------------
+// Handle Solar Request Submission (emails you instantly)
+app.post('/submit-solar', requireAuth, async (req, res) => {
+    const { propertyType, equipment, duration, phone } = req.body;
+    const user = currentUser();
+
+    await notify(`☀️ Solar request: ${propertyType || 'Unknown'} (${duration || 'n/a'})`, {
+        'Property type': propertyType,
+        Equipment: equipment,
+        'Backup duration': duration,
+        Phone: phone,
+        Account: user ? `${user.name} <${user.email}>` : ''
+    });
+
+    res.send(renderPage({
+        title: 'Solar Sizing Request Received',
+        activeNav: 'solar',
+        content: `<h2>Solar Analysis in Progress</h2><p class="intro-text">We received your requirements for your <strong>${esc(propertyType)}</strong> with <strong>${esc(duration)}</strong> backup. Our solar engineers will compute your panel sizing and call <strong>${esc(phone)}</strong> with a precise quotation.</p><a href="/solar" class="cta-btn">Back to Solar</a>`
+    }));
+});
+
+// 7. Surveys Page (Includes Form #1: Direct M-PESA STK Push Booking & Form #4: Site Inspection Booking)
 app.get('/survey', requireAuth, (req, res) => {
+    const user = currentUser();
     const content = `
         <h2>Know what your site needs before you spend.</h2>
-        <p class="sub-title">A site survey by an engineer, followed by a written plan and quote.</p>
+        <p class="sub-title">A site survey by an engineer, followed by a written plan and quote for WiFi, CCTV, smart locks, electric fence or solar.</p>
         
+        <p class="intro-text">The survey is where good installations start. We visit your property, measure, test and talk through what you want to achieve. You leave with a clear plan, so you can compare options and decide with confidence.</p>
+
+        <h3>What we check</h3>
+        <ul class="feature-list">
+            <li><strong>Network:</strong> Signal strength, line of sight to the mast, obstacles and the best place for access points</li>
+            <li><strong>CCTV:</strong> Camera positions, viewing angles, lighting and cable routes</li>
+            <li><strong>Smart locks:</strong> Door type, thickness and condition</li>
+            <li><strong>Electric fence:</strong> Boundary length, corners, gates and earthing points</li>
+            <li><strong>Solar:</strong> Roof space, shading, the equipment you need to power and where batteries should sit</li>
+        </ul>
+
+        <h3>What you receive</h3>
+        <ul class="feature-list">
+            <li>A written report of what we found</li>
+            <li>A recommended design, with options where they make sense</li>
+            <li>An itemised quote for equipment and installation</li>
+            <li>An estimated installation time</li>
+        </ul>
+
+        <h3>How it works</h3>
+        <ol style="color: #f1f5f9; padding-left: 20px; line-height: 1.8;">
+            <li>Book a survey on this website or by USSD, and pay the survey fee by M-Pesa.</li>
+            <li>We call you to agree a time.</li>
+            <li>An engineer visits and inspects your site.</li>
+            <li>You receive the report and quote.</li>
+            <li>If you go ahead, we schedule the installation.</li>
+        </ol>
+
         <div class="form-container" style="border-color: var(--accent);">
             <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-            <p style="color:var(--muted); font-size:0.95rem;">Logged in as: <strong>${esc(req.session.user.email)}</strong>. Receipts will be emailed here.</p>
-            <form action="/submit-survey-payment" method="POST" id="payment-form">
-                <div class="form-group"><label>Full Name</label><input type="text" name="name" value="${esc(req.session.user.name)}" required></div>
-                <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" value="${esc(req.session.user.phone)}" required placeholder="0712345678"></div>
+            <p style="color:var(--muted); font-size:0.95rem;">Fill in your site details. Submitting will send an M-Pesa prompt to your phone for the fee shown next to the service you choose. Your receipt will be emailed to <strong>${esc(user.email)}</strong> and can be downloaded as a PDF.</p>
+            <form action="/submit-survey-payment" method="POST">
+                <div class="form-group">
+                    <label>Full Name</label>
+                    <input type="text" name="name" required placeholder="e.g. Mary Akinyi" value="${esc(user.name)}">
+                </div>
+                <div class="form-group">
+                    <label>M-Pesa Phone Number</label>
+                    <input type="tel" name="phone" required placeholder="0712345678" value="${esc(user.phone)}">
+                </div>
                 <div class="form-group">
                     <label>Service Category</label>
-                    <select name="service" id="service-select">
+                    <select name="service">
                         <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
                         <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
                         <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
@@ -1019,8 +1353,13 @@ app.get('/survey', requireAuth, (req, res) => {
                         <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
                         <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
                     </select>
+                    <small style="display:block; margin-top:6px; color:var(--muted);">Prices can change according to the location and urgency. Thank you.</small>
                 </div>
-                <div class="form-group"><label>Physical Location / Address</label><input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay"></div>
+                <div class="form-group">
+                    <label>Physical Location / Address</label>
+                    <input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay">
+                </div>
+                <p style="color:var(--muted); font-size:0.9rem; margin: 0 0 12px 0;">By booking, you agree to our <a href="/terms" target="_blank" style="color:#38bdf8;">Terms and Conditions</a>.</p>
                 <button type="submit" class="cta-btn" style="background: var(--accent); color: #0f172a;">Trigger M-Pesa Payment & Book Survey</button>
             </form>
         </div>
@@ -1028,237 +1367,328 @@ app.get('/survey', requireAuth, (req, res) => {
     res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
+// Handle Survey Booking + M-Pesa STK Push
 app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => {
-    const { name, phone: rawPhone, service, location } = req.body;
-    const phone = normalizePhone(rawPhone);
+    const str = v => (typeof v === 'string' ? v.trim() : '');
+    const name = str(req.body.name).slice(0, 80);
+    const location = str(req.body.location).slice(0, 120);
+    const service = str(req.body.service);
+    const phone = normalizePhone(str(req.body.phone));
+    const user = currentUser();
 
-    if (!name || !phone || !service || !location) {
-        return res.status(400).send('Incomplete form details.');
-    }
+    const problem = (message, status = 400) => res.status(status).send(renderPage({
+        title: 'Booking Problem',
+        activeNav: 'survey',
+        content: `<h2>We could not start your payment</h2><p class="intro-text">${esc(message)}</p><a href="/survey" class="cta-btn">Back to Surveys</a>`
+    }));
 
-    if (!phoneAttemptAllowed(phone)) {
-        return res.status(429).send('Too many payment attempts. Please try again later.');
-    }
+    if (!name || !location) return problem('Please enter your name and location.');
+    if (!Object.hasOwn(SERVICE_PRICES, service)) return problem('Please choose a valid service.');
+    if (!phone) return problem('Please enter a valid Safaricom number, for example 0712345678.');
+    if (!phoneAttemptAllowed(phone)) return problem('Too many payment requests for this number. Please try again later.', 429);
 
-    const amount = SERVICE_PRICES[service] || 3000;
-    const bookingId = crypto.randomUUID();
-    const accountRef = `TI-${Math.floor(1000 + Math.random() * 9000)}`;
+    const id = crypto.randomBytes(8).toString('hex');
+    const booking = {
+        id, name, phone, service, location,
+        userId: user.id,
+        email: user.email,                           // the receipt is emailed here
+        amount: SERVICE_PRICES[service],            // price comes from the server, never from the form
+        status: 'pending',
+        createdAt: Date.now(),
+        accountRef: 'TNC' + id.slice(0, 8).toUpperCase()
+    };
+    bookings.set(id, booking);
 
-    try {
-        await pool.query(
-            'INSERT INTO bookings (id, user_id, name, phone, service, location, amount, account_ref, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
-            [bookingId, req.session.user.id, name, phone, service, location, amount, accountRef, 'pending', Date.now()]
-        );
-    } catch (err) {
-        console.error('Booking insertion error:', err.message);
-        return res.status(500).send('Database error processing booking.');
-    }
+    // Tell you about the lead right away, so it is never lost even if payment fails
+    notify(`📋 Survey booking (awaiting payment): ${name} - ${service}`, bookingFields(booking))
+        .catch(() => {});
 
     if (!mpesaConfigured()) {
-        await notify(`📝 PENDING (M-Pesa unconfigured): ${service} - ${name}`, { Name: name, Phone: phone, Service: service, Location: location, Amount: `KES ${amount}` }, req.session.user.email);
-        return res.send(renderPage({
-            title: 'Booking Received',
-            activeNav: 'survey',
-            content: `
-                <h2>Booking Received!</h2>
-                <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our M-Pesa gateway is currently in offline mode. An engineer has received your request and will call <strong>${esc(phone)}</strong> shortly.</p>
-                <p><a href="/requests" class="cta-btn" style="margin-top:10px;">View My Requests</a></p>
-            `
-        }));
+        booking.status = 'failed';
+        console.error('M-Pesa is not fully configured (check MPESA_* variables and PUBLIC_BASE_URL).');
+        return problem('Online payment is not available right now. We have saved your request and will call you.', 503);
     }
 
     try {
-        const bookingObj = { id: bookingId, name, phone, service, location, amount, accountRef };
-        const resStk = await stkPush(bookingObj);
-        await pool.query('UPDATE bookings SET checkout_request_id = $1 WHERE id = $2', [resStk.CheckoutRequestID, bookingId]);
+        const r = await stkPush(booking);
+        booking.checkoutRequestId = r.CheckoutRequestID;
+        booking.merchantRequestId = r.MerchantRequestID;
+        byCheckout.set(r.CheckoutRequestID, booking);
+        booking.requestLink = makeBookingLink(booking, false);   // shown to the client straight away
+    } catch (err) {
+        console.error('STK push failed:', err.message);
+        booking.status = 'failed';
+        return problem('We could not send the M-Pesa prompt. Please check your number and try again, or call us on 0740 311 014.', 502);
+    }
 
-        await notify(`📱 STK sent: ${service} - ${name} (KES ${amount})`, bookingFields(bookingObj), req.session.user.email);
-
-        res.send(renderPage({
-            title: 'Check Your Phone',
-            activeNav: 'survey',
-            content: `
-                <h2>Check Your Phone for M-Pesa</h2>
-                <p class="intro-text">An STK push for <strong>KES ${amount}</strong> has been sent to <strong>${esc(phone)}</strong>.</p>
-                <div id="status-box" style="background:var(--surface); border:1px solid var(--border); padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
-                    <p id="status-text" style="font-weight:bold; color:var(--primary);">Waiting for M-Pesa PIN confirmation...</p>
-                </div>
-                <div style="margin-top:20px; text-align:center;">
-                    <a href="/requests" class="cta-btn" style="background:var(--primary);">View All My Requests & Receipts</a>
-                </div>
-                <script>
-                    async function checkStatus() {
-                        try {
-                            const r = await fetch('/payments/status/${bookingId}');
-                            const d = await r.json();
-                            if (d.status === 'paid') {
-                                let html = '<h3 style="color:var(--accent); margin:0;">Payment Confirmed Successfully!</h3><p>An official receipt has been emailed to you.</p>';
-                                if (d.pdf) html += '<p><a href="' + d.pdf + '" class="cta-btn" style="margin-top:10px; display:inline-block; background:var(--accent); color:#0f172a;">Download Official PDF Receipt</a></p>';
-                                html += '<p style="margin-top:10px;"><a href="/requests" style="color:var(--primary);">Go to My Requests Dashboard</a></p>';
-                                document.getElementById('status-box').innerHTML = html;
-                                clearInterval(timer);
-                            } else if (d.status === 'failed') {
-                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">Payment Cancelled or Failed</h3><a href="/survey" class="cta-btn" style="margin-top:15px;">Try Again</a>';
-                                clearInterval(timer);
+    res.send(renderPage({
+        title: 'Check Your Phone',
+        activeNav: 'survey',
+        content: `
+            <h2>Check your phone</h2>
+            <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. An M-Pesa prompt for <strong>KES ${booking.amount}</strong> has been sent to <strong>${esc(phone)}</strong>. Enter your M-Pesa PIN to pay.</p>
+            <p id="pay-status" class="sub-title">Waiting for your payment...</p>
+            <p style="color:var(--muted);">Once you pay, your receipt will be emailed to <strong>${esc(user.email)}</strong> and you can download it here as a PDF.</p>
+            ${booking.requestLink ? `
+            <p style="color:var(--muted);">Save your booking link. It shows your payment status and becomes your receipt once you pay.</p>
+            <div id="pay-links">
+                <a id="pay-view" href="${esc(booking.requestLink)}" class="cta-btn" style="margin-bottom:12px;">Open your booking page</a>
+                <a id="pay-receipt" href="#" class="cta-btn" style="margin-bottom:12px; display:none; background: var(--accent); color:#0f172a;">Download receipt (PDF)</a>
+                <a id="pay-share" href="${esc('https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking: ' + booking.requestLink))}" target="_blank" rel="noopener" class="cta-btn" style="margin-bottom:12px;">Share on WhatsApp</a>
+            </div>` : ''}
+            <a href="/survey" class="cta-btn">Back to Surveys</a>
+            <script>
+            (function () {
+                var id = ${JSON.stringify(id)}, tries = 0, box = document.getElementById('pay-status');
+                function poll() {
+                    tries++;
+                    fetch('/payments/status/' + id).then(function (r) { return r.json(); }).then(function (d) {
+                        if (d.status === 'paid') {
+                            box.textContent = 'Payment received. Thank you! An engineer will call you to schedule the visit.';
+                            var viewBtn = document.getElementById('pay-view');
+                            var shareBtn = document.getElementById('pay-share');
+                            var receiptBtn = document.getElementById('pay-receipt');
+                            if (d.link && d.link.indexOf('https://') === 0 && viewBtn) {
+                                // swap to the permanent receipt link
+                                viewBtn.href = d.link;
+                                viewBtn.textContent = 'View your booking confirmation';
+                                if (receiptBtn) { receiptBtn.href = d.link + '/receipt.pdf'; receiptBtn.style.display = 'block'; }
+                                if (shareBtn) shareBtn.href = 'https://wa.me/?text=' + encodeURIComponent('My Tencent Innovations booking confirmation: ' + d.link);
                             }
-                        } catch(e) {}
-                    }
-                    const timer = setInterval(checkStatus, 4000);
-                </script>
-            `
-        }));
-    } catch (err) {
-        console.error('STK Push Error:', err.message);
-        res.status(500).send('Could not trigger M-Pesa payment prompt.');
-    }
-});
-
-// ---------------------------------------------------------------
-// My Requests & Tracking Dashboard
-// ---------------------------------------------------------------
-app.get('/requests', requireAuth, async (req, res) => {
-    try {
-        const result = await pool.query(
-            'SELECT * FROM bookings WHERE user_id = $1 ORDER BY created_at DESC',
-            [req.session.user.id]
-        );
-        const bookings = result.rows;
-
-        let rowsHtml = '';
-        if (bookings.length === 0) {
-            rowsHtml = `<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--muted);">You have not made any service requests or bookings yet. <br><a href="/survey" style="color:var(--primary); font-weight:bold;">Book a Site Survey Now</a></td></tr>`;
-        } else {
-            rowsHtml = bookings.map(b => {
-                const dateStr = new Date(Number(b.created_at)).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-                let statusBadge = '';
-                if (b.status === 'paid') {
-                    statusBadge = `<span style="background:rgba(74,222,128,0.15); color:var(--accent); padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">PAID & CONFIRMED</span>`;
-                } else if (b.status === 'pending') {
-                    statusBadge = `<span style="background:rgba(56,189,248,0.15); color:#38bdf8; padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">PENDING PAYMENT</span>`;
-                } else {
-                    statusBadge = `<span style="background:rgba(248,113,113,0.15); color:#f87171; padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">${b.status.toUpperCase()}</span>`;
+                        } else if (d.status === 'failed') {
+                            box.textContent = 'The payment was cancelled or did not go through. You can go back and try again.';
+                        } else if (d.status === 'review') {
+                            box.textContent = 'We are confirming your payment and will call you shortly.';
+                        } else if (tries < 40) {
+                            setTimeout(poll, 4000);
+                        } else {
+                            box.textContent = 'We have not seen the payment yet. If you paid, we will confirm and call you.';
+                        }
+                    }).catch(function () {
+                        if (tries < 40) setTimeout(poll, 4000);
+                    });
                 }
+                setTimeout(poll, 4000);
+            })();
+            </script>`
+    }));
+});
 
-                const actionBtn = b.status === 'paid' 
-                    ? `<a href="/payments/receipt/${b.id}/download.pdf" class="cta-btn" style="padding:6px 12px; font-size:0.85rem; background:var(--accent); color:#0f172a; text-decoration:none; display:inline-block;">📥 Download PDF</a>`
-                    : `<a href="/survey" style="color:var(--primary); font-size:0.85rem; font-weight:bold;">Retry Payment</a>`;
+// Private booking page. The link is signed, so it cannot be forged or edited.
+// Before payment it shows live status; after payment it is the receipt.
+app.get('/booking/:token', (req, res) => {
+    res.set('X-Robots-Tag', 'noindex, nofollow');
+    res.set('Cache-Control', 'private, no-store');
+    const d = readBookingLink(String(req.params.token));
+    if (!d) {
+        return res.status(404).send(renderPage({
+            title: 'Link Not Valid',
+            activeNav: 'survey',
+            content: `<h2>This link is not valid</h2><p class="intro-text">Please check the link you were sent, or call us on 0740 311 014.</p><a href="/" class="cta-btn">Back to Home</a>`
+        }));
+    }
 
-                return `
-                    <tr style="border-bottom: 1px solid var(--border);">
-                        <td style="padding:12px;">${dateStr}</td>
-                        <td style="padding:12px;"><strong>${esc(b.service)}</strong><br><small style="color:var(--muted);">${esc(b.location)}</small></td>
-                        <td style="padding:12px;">KES ${b.amount}</td>
-                        <td style="padding:12px;">${esc(b.account_ref)}</td>
-                        <td style="padding:12px;">${statusBadge}</td>
-                        <td style="padding:12px;">${esc(b.receipt || '-')}</td>
-                        <td style="padding:12px; text-align:center;">${actionBtn}</td>
-                    </tr>
-                `;
-            }).join('');
+    // k === 0: link given right after the request (before payment).
+    // k === 1: permanent receipt link. Older links have no k and were always receipts.
+    let state = 'paid';
+    let receipt = d.r;
+    let when = Number(d.t) || Date.now();
+    if (d.k === 0) {
+        const live = bookings.get(String(d.i || ''));
+        if (live && live.accountRef === d.f) {
+            if (live.status === 'paid' && live.link) return res.redirect(302, live.link);   // go to the permanent receipt
+            state = live.status;
+            if (state === 'paid') { receipt = live.receipt; when = live.paidAt || when; }
+        } else {
+            state = 'unknown';   // server restarted or booking older than 24 hours
         }
-
-        const content = `
-            <h2>My Service Requests & Tracking</h2>
-            <p class="sub-title">Monitor your submitted bookings, payment statuses, and download official PDF receipts.</p>
-            
-            <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-top: 20px;">
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem;">
-                    <thead>
-                        <tr style="background: var(--bg); border-bottom: 2px solid var(--border); color: var(--primary);">
-                            <th style="padding: 14px 12px;">Date</th>
-                            <th style="padding: 14px 12px;">Service & Location</th>
-                            <th style="padding: 14px 12px;">Amount</th>
-                            <th style="padding: 14px 12px;">Reference</th>
-                            <th style="padding: 14px 12px;">Status</th>
-                            <th style="padding: 14px 12px;">M-Pesa Receipt</th>
-                            <th style="padding: 14px 12px; text-align: center;">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${rowsHtml}
-                    </tbody>
-                </table>
-            </div>
-
-            <div style="margin-top: 30px; text-align: right;">
-                <a href="/survey" class="cta-btn" style="display:inline-block; width:auto; padding:10px 24px;">+ Book Another Service</a>
-            </div>
-        `;
-        res.send(renderPage({ title: 'My Requests', activeNav: 'requests', content }));
-    } catch (err) {
-        console.error('Error fetching requests:', err.message);
-        res.status(500).send('Error loading requests dashboard.');
     }
+
+    const views = {
+        paid:    { h: 'Booking confirmed', sub: 'Payment received. Keep this page as your receipt.', badge: '<strong style="color:var(--accent);">PAID</strong>' },
+        pending: { h: 'Booking received', sub: 'We are waiting for your M-Pesa payment. This page updates by itself.', badge: '<strong style="color:#fbbf24;">AWAITING PAYMENT</strong>' },
+        failed:  { h: 'Payment not completed', sub: 'The payment was cancelled or did not go through. You can book again.', badge: '<strong style="color:#f87171;">NOT PAID</strong>' },
+        review:  { h: 'Confirming your payment', sub: 'We are checking your payment and will call you shortly.', badge: '<strong style="color:#fbbf24;">CHECKING</strong>' },
+        unknown: { h: 'Booking details', sub: 'We cannot see the payment status right now. If you have paid, we will confirm and call you.', badge: '<strong style="color:#fbbf24;">STATUS UNKNOWN</strong>' }
+    };
+    const v = views[state] || views.unknown;
+    const isPaid = state === 'paid';
+
+    const row = (label, value) => `<tr><td style="padding:10px 8px; color:var(--muted); border-bottom:1px solid #334155;">${label}</td><td style="padding:10px 8px; text-align:right; border-bottom:1px solid #334155;">${value}</td></tr>`;
+    const phone = esc(d.p);
+    const whenText = new Date(when).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) + ' (EAT)';
+    const amount = esc(Number(d.a).toLocaleString('en-KE'));
+
+    const rows = [
+        row('Status', v.badge),
+        row('Name', esc(d.n)),
+        row('Phone', '<a href="tel:' + phone + '" style="color:#38bdf8;">' + phone + '</a>'),
+        row('Service', esc(d.s)),
+        row('Location', esc(d.l)),
+        row(isPaid ? 'Amount paid' : 'Amount due', 'KES ' + amount),
+        isPaid ? row('M-Pesa receipt', esc(receipt) || 'See your M-Pesa SMS') : '',
+        row('Reference', esc(d.f)),
+        row(isPaid ? 'Paid on' : 'Requested on', esc(whenText))
+    ].join('');
+
+    const poller = state === 'pending' ? `
+        <script>
+        (function () {
+            var id = ${JSON.stringify(String(d.i || '')).replace(/</g, '\\u003c')}, tries = 0;
+            function poll() {
+                tries++;
+                fetch('/payments/status/' + encodeURIComponent(id)).then(function (r) { return r.json(); }).then(function (x) {
+                    if (x.status && x.status !== 'pending') { location.reload(); }
+                    else if (tries < 60) { setTimeout(poll, 5000); }
+                }).catch(function () { if (tries < 60) setTimeout(poll, 5000); });
+            }
+            setTimeout(poll, 5000);
+        })();
+        </script>` : '';
+
+    res.send(renderPage({
+        title: v.h,
+        activeNav: 'survey',
+        content: `
+            <h2>${v.h}</h2>
+            <p class="sub-title">${v.sub}</p>
+            <div class="form-container" style="border-color: ${isPaid ? 'var(--accent)' : '#334155'};">
+                <table style="width:100%; border-collapse:collapse;">${rows}</table>
+            </div>
+            <p style="margin-top:20px;">${isPaid ? 'An engineer will call you to agree a time for the visit.' : 'Questions? Call or WhatsApp us below.'}</p>
+            ${isPaid ? `<a href="/booking/${esc(req.params.token)}/receipt.pdf" class="cta-btn" style="margin-top:10px; background: var(--accent); color:#0f172a;">⬇ Download receipt (PDF)</a>` : ''}
+            ${state === 'failed' ? '<a href="/survey" class="cta-btn" style="margin-top:10px;">Book again</a>' : ''}
+            <a href="tel:0740311014" class="cta-btn" style="margin-top:12px;">Call Tencent Innovations: 0740 311 014</a>
+            <a href="https://wa.me/254769306917" class="cta-btn" style="margin-top:12px;">WhatsApp us</a>
+            ${poller}`
+    }));
 });
 
-// Signed booking / receipt link view
-app.get('/booking/:token', async (req, res) => {
-    const data = readBookingLink(req.params.token);
-    if (!data) return res.status(404).send('Invalid or expired receipt link.');
-
-    const isPaid = data.k === 1;
-    const dateStr = new Date(data.t).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-    const content = `
-        <h2>${isPaid ? 'Payment Receipt & Booking' : 'Booking Status'}</h2>
-        <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County</p>
-        <div class="form-container">
-            <p><strong>Status:</strong> <span style="color: ${isPaid ? 'var(--accent)' : '#38bdf8'}; font-weight: bold;">${isPaid ? 'PAID & CONFIRMED' : 'PENDING'}</span></p>
-            <p><strong>Client Name:</strong> ${esc(data.n)}</p>
-            <p><strong>Phone Number:</strong> ${esc(data.p)}</p>
-            <p><strong>Service:</strong> ${esc(data.s)}</p>
-            <p><strong>Location:</strong> ${esc(data.l)}</p>
-            <p><strong>Amount:</strong> KES ${esc(data.a)}</p>
-            <p><strong>Reference:</strong> ${esc(data.f)}</p>
-            ${data.r ? `<p><strong>M-Pesa Receipt:</strong> ${esc(data.r)}</p>` : ''}
-            <p><strong>Timestamp:</strong> ${esc(dateStr)}</p>
-            ${isPaid && PDFDocument ? `<div style="margin-top: 25px;"><a href="/booking/${esc(req.params.token)}/receipt.pdf" class="cta-btn" style="background: var(--accent); color: #0f172a; text-align: center;">Download Official PDF Receipt</a></div>` : ''}
-        </div>
-    `;
-    res.send(renderPage({ title: 'Receipt', activeNav: 'home', content }));
-});
-
+// Downloadable PDF receipt. Uses the same signed link, so only someone holding
+// a genuine, paid booking link can get it.
 app.get('/booking/:token/receipt.pdf', async (req, res) => {
-    if (!PDFDocument) return res.status(501).send('PDF generation disabled.');
-    const data = readBookingLink(req.params.token);
-    if (!data || data.k !== 1) return res.status(404).send('Receipt not found.');
+    res.set('X-Robots-Tag', 'noindex, nofollow');
+    res.set('Cache-Control', 'private, no-store');
+    const token = String(req.params.token);
+    const d = readBookingLink(token);
+    if (!d) return res.status(404).type('text/plain').send('This link is not valid.');
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=Tencent-Receipt-${data.f}.pdf`);
+    let data;
+    if (d.k === 0) {
+        // Link given before payment: only valid once the booking is paid
+        const live = bookings.get(String(d.i || ''));
+        if (live && live.accountRef === d.f && live.status === 'paid') data = receiptFromBooking(live);
+        else return res.status(409).type('text/plain').send('This booking has not been paid yet, so there is no receipt.');
+    } else {
+        data = receiptFromLink(d);
+    }
+
     try {
-        const buf = await generatePdfBuffer({
-            accountRef: data.f,
-            name: data.n,
-            phone: data.p,
-            service: data.s,
-            location: data.l,
-            amount: data.a,
-            receipt: data.r,
-            paidAt: data.t
+        const pdf = await buildReceiptPdf(data);
+        res.set({
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `attachment; filename="${receiptFileName(data)}"`,
+            'Content-Length': pdf.length
         });
-        res.send(buf);
-    } catch (e) {
-        res.status(500).send('Error generating PDF.');
+        res.send(pdf);
+    } catch (err) {
+        console.error('Receipt PDF failed:', err.message);
+        res.status(500).type('text/plain').send('We could not generate the receipt. Please call 0740 311 014.');
     }
 });
 
-// Terms and Conditions Page
+// Terms and Conditions page
 app.get('/terms', (req, res) => {
     const content = `
+        <div class="terms">
         <h2>Terms and Conditions of Service</h2>
-        <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
-        <p class="intro-text">These Terms and Conditions govern the provision of internet services, security installations, and site surveys by Tencent Innovations.</p>
-        <h3>1. Services and Surveys</h3>
-        <p>Site surveys and consultations require an advance fee paid via M-Pesa. Fees cover engineer site visits and written quotations.</p>
-        <h3>2. Payments</h3>
-        <p>All payments are processed securely via M-Pesa STK Push. Receipts are delivered via email upon confirmation.</p>
+        <p class="sub-title">Tencent Innovations &middot; Rangwe, Homa Bay County, Kenya<br>Calls: 0740 311 014 &middot; WhatsApp: 0769 306 917</p>
+
+        <p class="intro-text">These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you"). By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms.</p>
+
+        <h3>1. Definitions</h3>
+        <p class="clause"><strong>1.1</strong> "Service" means any of the WiFi/internet access, CCTV installation, electric fence installation, solar standby system, or fingerprint door lock installation services offered by the Company.</p>
+        <p class="clause"><strong>1.2</strong> "Package" means a specific data, speed, or duration bundle purchased for internet access, as published by the Company from time to time.</p>
+        <p class="clause"><strong>1.3</strong> "Customer Premises Equipment" or "CPE" means routers, antennas, cameras, fence energisers, solar panels, batteries, fingerprint door locks, cabling, and any other hardware installed at the Customer's premises.</p>
+        <p class="clause"><strong>1.4</strong> "Hotspot" means the Company's WiFi network accessible via login portal and voucher, PIN, or M-Pesa payment.</p>
+
+        <h3>2. Account Registration</h3>
+        <p class="clause"><strong>2.1</strong> Customers must register using accurate name and phone number details. This information is used for billing, support, and network security, and will not be sold to third parties.</p>
+        <p class="clause"><strong>2.2</strong> A customer is responsible for keeping their account PIN, voucher codes, and WiFi password confidential. The Company is not liable for usage arising from a shared or leaked password.</p>
+        <p class="clause"><strong>2.3</strong> One account and connection are intended for a single household or business premises unless a business/enterprise package has been agreed in writing.</p>
+
+        <h3>3. WiFi and Internet Service</h3>
+        <p class="clause"><strong>3.1</strong> Internet access is sold in prepaid Packages (hourly, daily, weekly, or monthly) as displayed on the Hotspot login page or communicated by the Company. Prices may be revised from time to time; the price in effect at the moment of payment applies to that purchase.</p>
+        <p class="clause"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection.</p>
+        <p class="clause"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion.</p>
+        <p class="clause"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed.</p>
+        <p class="clause"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable.</p>
+        <p class="clause"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company.</p>
+        <p class="clause"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available.</p>
+
+        <h3>4. Acceptable Use</h3>
+        <p class="clause">The Service may not be used to:</p>
+        <ul>
+            <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred;</li>
+            <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system;</li>
+            <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users;</li>
+            <li>Impersonate another person or misrepresent your affiliation in connection with the Service.</li>
+        </ul>
+        <p class="clause">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities.</p>
+
+        <h3>5. Equipment (CPE)</h3>
+        <p class="clause"><strong>5.1</strong> Where the Company supplies and installs equipment (router, antenna, CCTV camera, fence energiser, solar panel, battery, or fingerprint door lock), ownership of that equipment remains with the Company until it has been fully paid for, unless otherwise agreed in writing.</p>
+        <p class="clause"><strong>5.2</strong> The Customer must provide a safe mounting location, stable power supply, and reasonable access for installation and future maintenance.</p>
+        <p class="clause"><strong>5.3</strong> The Customer is responsible for equipment once installed and accepted, and must promptly report any fault, damage, or tampering. Damage caused by the Customer, third parties, lightning, rodents, theft, or vandalism is not covered by any workmanship warranty and may attract a call-out and repair or replacement fee.</p>
+        <p class="clause"><strong>5.4</strong> Where a device remains the Company's property under an instalment or lease arrangement, the Customer may not relocate, resell, or allow a third party to tamper with it without the Company's written consent.</p>
+        <p class="clause"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service (for example, a Customer-owned router under a Commercial/Rental WiFi installation), that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company.</p>
+
+        <h3>6. Installation Services (CCTV, Electric Fence, Solar Standby, Fingerprint Door Locks)</h3>
+        <p class="clause"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding.</p>
+        <p class="clause"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms.</p>
+        <p class="clause"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss, and accepts no liability for such incidents.</p>
+        <p class="clause"><strong>6.4</strong> Solar standby systems are sized to the load and backup duration agreed with the Customer at the point of sale. Connecting additional appliances beyond the agreed load may reduce backup duration or damage the system, and is done at the Customer's own risk.</p>
+        <p class="clause"><strong>6.5</strong> CCTV, electric fence, solar standby, and fingerprint door lock installation services are offered nationwide across Kenya, subject to logistics and travel costs for sites outside the Company's normal service radius, communicated to the Customer at the point of quotation.</p>
+        <p class="clause"><strong>6.6</strong> Fingerprint door locks are powered by internal batteries. The Customer is responsible for replacing batteries as needed and for keeping any backup mechanical key or master code safe. Loss of access due to depleted batteries, lost backup keys or codes, or manufacturer firmware issues is not covered by the workmanship warranty.</p>
+
+        <h3>7. Service Availability</h3>
+        <p class="clause"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance.</p>
+        <p class="clause"><strong>7.2</strong> Where practical, the Company will give advance notice of planned maintenance that is expected to interrupt Service.</p>
+        <p class="clause"><strong>7.3</strong> The Company is not liable for losses arising from Service interruption, including business losses, except where caused by the Company's proven negligence.</p>
+
+        <h3>8. Suspension and Termination</h3>
+        <p class="clause"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or where continued connection poses a risk to the network or other customers.</p>
+        <p class="clause"><strong>8.2</strong> A Customer may discontinue Service at any time; Packages already paid for are consumed as described in Clause 3.3 and are not refunded on voluntary discontinuation.</p>
+        <p class="clause"><strong>8.3</strong> Where equipment remains the Company's property, the Company may retrieve it on termination of an instalment or lease arrangement, giving reasonable notice to the Customer.</p>
+        <p class="clause"><strong>8.4</strong> Upon termination of Service, any Customer-supplied equipment remains the property of the Customer, except the outdoor LiteBeam (LBE) CPE unit, which remains the property of the Company and will be retrieved regardless of who originally supplied or paid for it.</p>
+
+        <h3>9. Limitation of Liability</h3>
+        <p class="clause"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months.</p>
+        <p class="clause"><strong>9.2</strong> The Company is not liable for indirect, incidental, or consequential loss, including loss of income, data, or business opportunity.</p>
+
+        <h3>10. Privacy</h3>
+        <p class="clause"><strong>10.1</strong> Customer information collected at registration is used for billing, service delivery, and support, and is kept confidential save where disclosure is required by law or necessary to enforce these Terms.</p>
+
+        <h3>11. Amendments</h3>
+        <p class="clause"><strong>11.1</strong> The Company may update these Terms from time to time. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms.</p>
+
+        <h3>12. Governing Law</h3>
+        <p class="clause"><strong>12.1</strong> These Terms are governed by the laws of Kenya. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts.</p>
+
+        <h3>13. Contact</h3>
+        <p class="clause"><strong>13.1</strong> For billing, support, or installation enquiries, contact Tencent Innovations on Calls 0740 311 014, WhatsApp 0769 306 917, or visit the office in Rangwe, Homa Bay County.</p>
+
+        <a href="/" class="cta-btn" style="margin-top:30px;">Back to Home</a>
+        </div>
     `;
     res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
 });
 
-// USSD Endpoint
+// 8. USSD Endpoint
 app.post('/ussd', (req, res) => {
     const { text, phoneNumber } = req.body;
     let response = '';
+
     if (text === '') {
         response = `CON Welcome to Tencent Innovations
 1. WiFi & Hotspot Internet
@@ -1268,15 +1698,42 @@ app.post('/ussd', (req, res) => {
 5. Solar Backup Power
 6. Site Survey & Visit`;
     } else if (text === '1') {
-        response = `CON WiFi Consultation: KES 3,000\n1. Confirm & Pay via M-PESA`;
+        response = `CON WiFi Consultation: KES 3,000
+(Prices can change by location & urgency)
+1. Confirm & Pay via M-PESA`;
+    } else if (text === '2') {
+        response = `CON CCTV Survey: KES 3,000
+(Prices can change by location & urgency)
+1. Confirm & Pay via M-PESA`;
+    } else if (text === '3') {
+        response = `CON Smart Locks Consultation: KES 2,500
+(Prices can change by location & urgency)
+1. Confirm & Pay via M-PESA`;
+    } else if (text === '4') {
+        response = `CON Electric Fence Survey: KES 5,000
+(Prices can change by location & urgency)
+1. Confirm & Pay via M-PESA`;
+    } else if (text === '5') {
+        response = `CON Solar Consultation: KES 4,000
+(Prices can change by location & urgency)
+1. Confirm & Pay via M-PESA`;
+    } else if (text === '6') {
+        response = `CON Site Survey: KES 3,000
+(Prices can change by location & urgency)
+1. Confirm & Pay via M-PESA`;
     } else if (text.endsWith('*1')) {
-        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}.`;
+        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
     } else {
-        response = `END Invalid selection.`;
+        response = `END Invalid selection. Please dial again.`;
     }
+
     res.set('Content-Type', 'text/plain');
     res.send(response);
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
+initDb()
+    .catch(err => console.error('Database setup failed (accounts will not work until fixed):', err.message))
+    .finally(() => {
+        app.listen(PORT, () => console.log(`Tencent Innovations server with accounts and receipts running on port ${PORT}`));
+    });
