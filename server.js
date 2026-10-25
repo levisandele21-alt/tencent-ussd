@@ -13,10 +13,20 @@ const PDFDocument = require('pdfkit');
 
 const app = express();
 
-// 1. Static images (logo.png, banner.png) - only these two files are public.
-// (Serving the whole folder would also expose server.js and package.json.)
-app.get('/logo.png', (req, res) => res.sendFile(path.join(__dirname, 'logo.png')));
-app.get('/banner.png', (req, res) => res.sendFile(path.join(__dirname, 'banner.png')));
+// 1. Static images (logo.png, banner.png). Only image files are public, from the main
+// folder or from /public or /images. (Serving the whole folder would also expose
+// server.js and package.json.)
+const IMAGE_FILES = /\.(png|jpe?g|gif|svg|webp|ico)$/i;
+const staticOpts = { index: false, dotfiles: 'ignore', maxAge: '1d' };
+const imageServers = [__dirname, path.join(__dirname, 'public'), path.join(__dirname, 'images')]
+    .map(dir => express.static(dir, staticOpts));
+app.use((req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    if (!IMAGE_FILES.test(req.path)) return next();
+    let i = 0;
+    const tryNext = () => (i < imageServers.length ? imageServers[i++](req, res, tryNext) : next());
+    tryNext();
+});
 
 // 2. Security Headers via Helmet
 app.use(
