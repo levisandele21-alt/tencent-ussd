@@ -724,8 +724,8 @@ function renderPage({ title, activeNav, content }) {
                 .intro-text { font-size: 1.08rem; color: #e2e8f0; margin-bottom: 24px; }
 
                 ul.feature-list { list-style: none; padding: 0; margin: 18px 0; }
-                ul.feature-list li { margin-bottom: 10px; padding: 10px 14px 10px 40px; position: relative; font-size: 1rem; color: #f1f5f9; background: rgba(22,33,58,0.6); border: 1px solid var(--line); border-radius: 12px; }
-                ul.feature-list li::before { content: "✔"; position: absolute; left: 14px; color: var(--accent); font-weight: bold; }
+                ul.feature-list li { margin-bottom: 12px; padding: 0 0 0 28px; position: relative; font-size: 1.05rem; color: #f1f5f9; }
+                ul.feature-list li::before { content: "✔"; position: absolute; left: 0; color: var(--accent); font-weight: bold; }
 
                 .cta-box { background: linear-gradient(135deg, #16213a, #12304a); border: 1px solid var(--line); padding: 26px; border-radius: 16px; margin-top: 40px; text-align: center; }
                 .cta-box p { font-size: 1.08rem; margin-top: 0; color: #f8fafc; }
