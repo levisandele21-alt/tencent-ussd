@@ -426,7 +426,6 @@ async function markPaid(bookingId, receipt, verified) {
     b.paidAt = paidAt;
     b.link = makeBookingLink(b);
 
-    // Get user email if available
     let userEmail = null;
     if (b.user_id) {
         const uRes = await pool.query('SELECT email FROM users WHERE id = $1', [b.user_id]);
@@ -436,7 +435,16 @@ async function markPaid(bookingId, receipt, verified) {
     let pdfBuffer = null;
     if (PDFDocument) {
         try {
-            pdfBuffer = await generatePdfBuffer(b);
+            pdfBuffer = await generatePdfBuffer({
+                accountRef: b.account_ref,
+                name: b.name,
+                phone: b.phone,
+                service: b.service,
+                location: b.location,
+                amount: b.amount,
+                receipt: b.receipt,
+                paidAt: b.paid_at
+            });
         } catch (e) {
             console.error('PDF generation error:', e.message);
         }
@@ -574,7 +582,7 @@ function requireAuth(req, res, next) {
 }
 
 // ---------------------------------------------------------------
-// Layout Template Helper with Left Sidebar
+// Layout Template Helper with Left Sidebar & Auth / Sign In / Login Buttons
 // ---------------------------------------------------------------
 function renderPage({ title, activeNav, content }) {
     return `
@@ -625,6 +633,14 @@ function renderPage({ title, activeNav, content }) {
                 .sidebar-nav { flex: 1; padding: 20px 12px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; list-style: none; margin: 0; }
                 .sidebar-nav a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; padding: 10px 14px; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
                 .sidebar-nav a:hover, .sidebar-nav a.active { color: var(--text); background: var(--surface); }
+
+                /* Prominent Authentication Sidebar Buttons */
+                .sidebar-auth-group { display: flex; flex-direction: column; gap: 8px; padding: 14px 12px; background: rgba(2, 132, 199, 0.08); border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
+                .sidebar-auth-btn { text-align: center; font-weight: bold; padding: 10px 14px; border-radius: 8px; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.95rem; transition: background 0.2s; }
+                .sidebar-login-btn { background: var(--primary); color: #ffffff; }
+                .sidebar-login-btn:hover { background: #0369a1; color: #ffffff; }
+                .sidebar-register-btn { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+                .sidebar-register-btn:hover { background: var(--surface); color: var(--text); }
 
                 .sidebar-footer { padding: 15px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
                 .theme-toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
@@ -701,16 +717,24 @@ function renderPage({ title, activeNav, content }) {
                     <li><a href="/smart-locks" class="${activeNav === 'smart-locks' ? 'active' : ''}">🔐 Smart Locks</a></li>
                     <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
                     <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
-                    <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Site Surveys</a></li>
+                    <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
+                    ${res.locals.user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
                     <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
-                    <hr style="border:0; border-top:1px solid var(--border); margin: 10px 0;">
-                    ${res.locals.user ? `
-                        <li><span style="color:var(--primary); font-size:0.9rem; padding: 6px 14px;">👤 ${esc(res.locals.user.name)}</span></li>
-                        <li><a href="/logout">🚪 Logout</a></li>
-                    ` : `
-                        <li><a href="/login" class="${activeNav === 'login' ? 'active' : ''}">🔑 Login</a></li>
-                        <li><a href="/register" class="${activeNav === 'register' ? 'active' : ''}">📝 Register</a></li>
-                    `}
+                    
+                    <hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;">
+
+                    <!-- Prominent Login / Register / Account Section -->
+                    <div class="sidebar-auth-group">
+                        ${res.locals.user ? `
+                            <div style="padding: 4px 6px; font-size: 0.9rem; color: var(--text); overflow: hidden; text-overflow: ellipsis;">
+                                👤 <strong>${esc(res.locals.user.name)}</strong>
+                            </div>
+                            <a href="/logout" class="sidebar-auth-btn sidebar-register-btn" style="border-color: #f87171; color: #f87171;">🚪 Logout</a>
+                        ` : `
+                            <a href="/login" class="sidebar-auth-btn sidebar-login-btn">🔑 Sign In / Login</a>
+                            <a href="/register" class="sidebar-auth-btn sidebar-register-btn">📝 Register Account</a>
+                        `}
+                    </div>
                 </ul>
                 <div class="sidebar-footer">
                     <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle Theme">
@@ -1036,7 +1060,7 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
             content: `
                 <h2>Booking Received!</h2>
                 <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our M-Pesa gateway is currently in offline mode. An engineer has received your request and will call <strong>${esc(phone)}</strong> shortly.</p>
-                <a href="/" class="cta-btn">Back to Home</a>
+                <p><a href="/requests" class="cta-btn" style="margin-top:10px;">View My Requests</a></p>
             `
         }));
     }
@@ -1057,6 +1081,9 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
                 <div id="status-box" style="background:var(--surface); border:1px solid var(--border); padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
                     <p id="status-text" style="font-weight:bold; color:var(--primary);">Waiting for M-Pesa PIN confirmation...</p>
                 </div>
+                <div style="margin-top:20px; text-align:center;">
+                    <a href="/requests" class="cta-btn" style="background:var(--primary);">View All My Requests & Receipts</a>
+                </div>
                 <script>
                     async function checkStatus() {
                         try {
@@ -1065,6 +1092,7 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
                             if (d.status === 'paid') {
                                 let html = '<h3 style="color:var(--accent); margin:0;">Payment Confirmed Successfully!</h3><p>An official receipt has been emailed to you.</p>';
                                 if (d.pdf) html += '<p><a href="' + d.pdf + '" class="cta-btn" style="margin-top:10px; display:inline-block; background:var(--accent); color:#0f172a;">Download Official PDF Receipt</a></p>';
+                                html += '<p style="margin-top:10px;"><a href="/requests" style="color:var(--primary);">Go to My Requests Dashboard</a></p>';
                                 document.getElementById('status-box').innerHTML = html;
                                 clearInterval(timer);
                             } else if (d.status === 'failed') {
@@ -1080,6 +1108,84 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
     } catch (err) {
         console.error('STK Push Error:', err.message);
         res.status(500).send('Could not trigger M-Pesa payment prompt.');
+    }
+});
+
+// ---------------------------------------------------------------
+// My Requests & Tracking Dashboard
+// ---------------------------------------------------------------
+app.get('/requests', requireAuth, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM bookings WHERE user_id = $1 ORDER BY created_at DESC',
+            [req.session.user.id]
+        );
+        const bookings = result.rows;
+
+        let rowsHtml = '';
+        if (bookings.length === 0) {
+            rowsHtml = `<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--muted);">You have not made any service requests or bookings yet. <br><a href="/survey" style="color:var(--primary); font-weight:bold;">Book a Site Survey Now</a></td></tr>`;
+        } else {
+            rowsHtml = bookings.map(b => {
+                const dateStr = new Date(Number(b.created_at)).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
+                let statusBadge = '';
+                if (b.status === 'paid') {
+                    statusBadge = `<span style="background:rgba(74,222,128,0.15); color:var(--accent); padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">PAID & CONFIRMED</span>`;
+                } else if (b.status === 'pending') {
+                    statusBadge = `<span style="background:rgba(56,189,248,0.15); color:#38bdf8; padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">PENDING PAYMENT</span>`;
+                } else {
+                    statusBadge = `<span style="background:rgba(248,113,113,0.15); color:#f87171; padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">${b.status.toUpperCase()}</span>`;
+                }
+
+                const actionBtn = b.status === 'paid' 
+                    ? `<a href="/payments/receipt/${b.id}/download.pdf" class="cta-btn" style="padding:6px 12px; font-size:0.85rem; background:var(--accent); color:#0f172a; text-decoration:none; display:inline-block;">📥 Download PDF</a>`
+                    : `<a href="/survey" style="color:var(--primary); font-size:0.85rem; font-weight:bold;">Retry Payment</a>`;
+
+                return `
+                    <tr style="border-bottom: 1px solid var(--border);">
+                        <td style="padding:12px;">${dateStr}</td>
+                        <td style="padding:12px;"><strong>${esc(b.service)}</strong><br><small style="color:var(--muted);">${esc(b.location)}</small></td>
+                        <td style="padding:12px;">KES ${b.amount}</td>
+                        <td style="padding:12px;">${esc(b.account_ref)}</td>
+                        <td style="padding:12px;">${statusBadge}</td>
+                        <td style="padding:12px;">${esc(b.receipt || '-')}</td>
+                        <td style="padding:12px; text-align:center;">${actionBtn}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        const content = `
+            <h2>My Service Requests & Tracking</h2>
+            <p class="sub-title">Monitor your submitted bookings, payment statuses, and download official PDF receipts.</p>
+            
+            <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-top: 20px;">
+                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem;">
+                    <thead>
+                        <tr style="background: var(--bg); border-bottom: 2px solid var(--border); color: var(--primary);">
+                            <th style="padding: 14px 12px;">Date</th>
+                            <th style="padding: 14px 12px;">Service & Location</th>
+                            <th style="padding: 14px 12px;">Amount</th>
+                            <th style="padding: 14px 12px;">Reference</th>
+                            <th style="padding: 14px 12px;">Status</th>
+                            <th style="padding: 14px 12px;">M-Pesa Receipt</th>
+                            <th style="padding: 14px 12px; text-align: center;">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${rowsHtml}
+                    </tbody>
+                </table>
+            </div>
+
+            <div style="margin-top: 30px; text-align: right;">
+                <a href="/survey" class="cta-btn" style="display:inline-block; width:auto; padding:10px 24px;">+ Book Another Service</a>
+            </div>
+        `;
+        res.send(renderPage({ title: 'My Requests', activeNav: 'requests', content }));
+    } catch (err) {
+        console.error('Error fetching requests:', err.message);
+        res.status(500).send('Error loading requests dashboard.');
     }
 });
 
