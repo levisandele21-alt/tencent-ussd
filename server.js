@@ -49,6 +49,8 @@ async function initDb() {
                 password_hash VARCHAR(255) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        `);
+        await pool.query(`
             CREATE TABLE IF NOT EXISTS bookings (
                 id VARCHAR(64) PRIMARY KEY,
                 user_id INT REFERENCES users(id),
