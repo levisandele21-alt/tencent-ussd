@@ -19,7 +19,7 @@ try {
 
 const app = express();
 
-// 1. Static file serving for images (logo.png, banner.png)
+// 1. Static file serving for images & assets
 app.use(express.static(__dirname));
 
 // 2. Security Headers via Helmet
@@ -532,14 +532,12 @@ app.get('/payments/status/:id', async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ status: 'unknown' });
     let b = r.rows[0];
 
-    // Query Daraja status after 30 seconds if still pending
     if (b.status === 'pending' && b.checkout_request_id && Date.now() - Number(b.created_at) > 30000) {
         try {
             const q = await stkQuery(b.checkout_request_id);
             if (String(q.ResultCode) === '0') {
                 await markPaid(b.id, '', true);
             } else if (q.ResultCode !== undefined && String(q.ResultCode) !== '' && String(q.ResultCode) !== '500.001.1001') {
-                // 500.001.1001 means transaction is still being processed by Safaricom
                 await markFailed(b.id, q.ResultDesc || 'Payment cancelled');
             }
         } catch (_) {}
@@ -589,7 +587,7 @@ function requireAuth(req, res, next) {
 }
 
 // ---------------------------------------------------------------
-// Layout Template Helper with Left Sidebar & Auth / Sign In / Login Buttons
+// Layout Template Helper with Left Sidebar & Modern Styling
 // ---------------------------------------------------------------
 function renderPage(req, { title, activeNav, content }) {
     const user = req.session && req.session.user ? req.session.user : null;
@@ -608,14 +606,14 @@ function renderPage(req, { title, activeNav, content }) {
             </script>
             <style>
                 :root {
-                    --bg: #0f172a;
-                    --surface: #1e293b;
-                    --sidebar-bg: #0b1120;
-                    --text: #f8fafc;
+                    --bg: #0b132b;
+                    --surface: #1c2541;
+                    --sidebar-bg: #060a17;
+                    --text: #ffffff;
                     --muted: #94a3b8;
                     --border: #334155;
                     --primary: #0284c7;
-                    --accent: #4ade80;
+                    --accent: #10b981;
                 }
                 [data-theme="light"] {
                     --bg: #f8fafc;
@@ -631,12 +629,12 @@ function renderPage(req, { title, activeNav, content }) {
                 body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; min-height: 100vh; transition: background 0.3s, color 0.3s; }
                 
                 .sidebar { width: 260px; background: var(--sidebar-bg); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; z-index: 100; }
-                .sidebar-header { padding: 24px 20px; border-bottom: 1px solid var(--border); }
+                .sidebar-header { padding: 24px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; background: rgba(0,0,0,0.2); }
                 .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
-                .logo-img { height: 42px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
+                .logo-img { height: 40px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
                 .logo-text-group { display: flex; flex-direction: column; }
-                .logo-text { font-size: 1.15rem; font-weight: bold; color: #38bdf8; text-decoration: none; line-height: 1.1; }
-                .logo-tagline { font-size: 0.7rem; color: var(--muted); }
+                .logo-text { font-size: 1.1rem; font-weight: bold; color: #38bdf8; text-decoration: none; line-height: 1.1; }
+                .logo-tagline { font-size: 0.65rem; color: var(--muted); }
 
                 .sidebar-nav { flex: 1; padding: 20px 12px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; list-style: none; margin: 0; }
                 .sidebar-nav a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; padding: 10px 14px; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
@@ -654,50 +652,53 @@ function renderPage(req, { title, activeNav, content }) {
                 .theme-toggle-btn:hover { background: var(--surface); }
 
                 .main-content { margin-left: 260px; flex: 1; display: flex; flex-direction: column; min-height: 100vh; }
-                .container { max-width: 900px; margin: 40px auto; padding: 0 30px; flex: 1; width: 100%; box-sizing: border-box; }
+                .container { max-width: 1100px; margin: 0 auto; padding: 0; flex: 1; width: 100%; box-sizing: border-box; }
 
-                h2 { color: var(--primary); font-size: 2rem; margin-top: 0; }
-                h3 { color: var(--primary); margin-top: 30px; }
-                .sub-title { color: var(--muted); font-size: 1.15rem; margin-top: -10px; margin-bottom: 25px; }
-                .intro-text { font-size: 1.1rem; color: var(--text); margin-bottom: 25px; }
+                /* Modern Grid Homepage Styling modeled after reference */
+                .hero-video-container { position: relative; width: 100%; height: 420px; overflow: hidden; display: flex; align-items: center; justify-content: center; text-align: center; border-bottom: 3px solid var(--border); }
+                .hero-video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; filter: brightness(0.45); }
+                .hero-overlay-content { position: relative; z-index: 2; padding: 20px; max-width: 800px; }
+                .hero-logo-badge { height: 75px; width: auto; background: #fff; padding: 6px; border-radius: 10px; margin-bottom: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+                .hero-overlay-content h1 { font-size: 2.3rem; color: #ffffff; margin: 0 0 10px 0; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
+                .hero-overlay-content p { color: #e2e8f0; font-size: 1.15rem; margin: 0 0 20px 0; text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
+
+                .services-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0; width: 100%; }
+                .service-card { padding: 40px 30px; text-align: center; display: flex; flex-direction: column; justify-content: space-between; min-height: 280px; box-sizing: border-box; transition: transform 0.2s; position: relative; }
+                .service-card:hover { transform: translateY(-4px); z-index: 10; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
+                .service-card h3 { font-size: 1.4rem; font-weight: 800; letter-spacing: 0.05em; margin: 15px 0 10px 0; text-transform: uppercase; }
+                .service-card p { font-size: 0.95rem; line-height: 1.5; margin-bottom: 25px; opacity: 0.9; }
+                .service-icon { font-size: 2.5rem; margin-bottom: 10px; }
                 
-                ul.feature-list { list-style: disc; padding-left: 20px; margin: 20px 0; }
-                ul.feature-list li { margin-bottom: 12px; font-size: 1.05rem; color: var(--text); }
+                .card-black { background: #000000; color: #ffffff; border-right: 1px solid #1e293b; }
+                .card-gray { background: #334155; color: #ffffff; border-right: 1px solid #475569; }
+                .card-light { background: #f1f5f9; color: #0f172a; border-right: 1px solid #cbd5e1; }
+                .card-teal { background: #14b8a6; color: #000000; }
 
-                .cta-box { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 40px; text-align: center; }
-                .cta-box p { font-size: 1.1rem; margin-top: 0; color: var(--text); }
-                .cta-btn { display: inline-block; background: var(--primary); color: white; padding: 12px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.05rem; border: none; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
-                .cta-btn:hover { background: #0369a1; }
+                .enquire-btn { display: inline-block; background: #ffffff; color: #0f172a; padding: 10px 24px; border-radius: 4px; font-weight: bold; text-decoration: none; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; transition: background 0.2s; }
+                .card-black .enquire-btn { background: #0284c7; color: #fff; }
+                .card-black .enquire-btn:hover { background: #0369a1; }
+                .card-gray .enquire-btn { background: #0f172a; color: #fff; }
+                .card-light .enquire-btn { background: #0f172a; color: #fff; }
+                .card-teal .enquire-btn { background: #0f172a; color: #fff; }
+                .enquire-btn:hover { opacity: 0.85; }
 
-                .form-container { background: var(--surface); border: 1px solid var(--border); padding: 25px; border-radius: 10px; margin-top: 30px; text-align: left; }
-                .form-group { margin-bottom: 15px; }
-                .form-group label { display: block; margin-bottom: 5px; color: var(--primary); font-weight: 500; }
-                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; }
+                .general-container { padding: 40px 30px; }
+                .form-container { background: var(--surface); border: 1px solid var(--border); padding: 30px; border-radius: 12px; margin-top: 20px; text-align: left; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+                .form-group { margin-bottom: 20px; }
+                .form-group label { display: block; margin-bottom: 8px; color: var(--primary); font-weight: 600; }
+                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; font-size: 1rem; }
 
-                .contact-bar { background: var(--sidebar-bg); border-top: 1px solid var(--border); padding: 20px; text-align: center; color: var(--muted); margin-top: 50px; }
+                .contact-bar { background: var(--sidebar-bg); border-top: 1px solid var(--border); padding: 25px 30px; text-align: center; color: var(--muted); margin-top: auto; }
                 .contact-bar strong { color: var(--primary); }
 
                 .site-footer { background: var(--sidebar-bg); border-top: 1px solid var(--border); color: var(--muted); padding: 40px 30px 20px 30px; }
-                .footer-grid { max-width: 900px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px; margin-bottom: 30px; }
+                .footer-grid { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px; margin-bottom: 30px; }
                 .footer-col h4 { color: var(--primary); font-size: 1rem; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); padding-bottom: 6px; }
                 .footer-links { list-style: none; padding: 0; margin: 0; }
                 .footer-links li { margin-bottom: 8px; }
                 .footer-links a { color: var(--muted); text-decoration: none; font-size: 0.9rem; }
                 .footer-links a:hover { color: var(--primary); }
-                .footer-bottom { max-width: 900px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 15px; text-align: center; font-size: 0.85rem; color: var(--muted); }
-
-                .hero-banner { 
-                    background: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.85)), url('/banner.png');
-                    background-size: cover;
-                    background-position: center;
-                    padding: 50px 20px; 
-                    text-align: center; 
-                    border-bottom: 1px solid var(--border); 
-                    margin: -40px -30px 30px -30px;
-                }
-                .hero-banner h1 { font-size: 2.2rem; margin: 0 0 10px 0; color: #ffffff; }
-                .hero-banner p { color: #e2e8f0; font-size: 1.1rem; margin-bottom: 20px; max-width: 750px; margin-left: auto; margin-right: auto; }
-                .ussd-badge { display: inline-block; background: #38bdf8; color: #0f172a; padding: 8px 18px; border-radius: 30px; font-weight: bold; font-size: 1rem; }
+                .footer-bottom { max-width: 1100px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 15px; text-align: center; font-size: 0.85rem; color: var(--muted); }
 
                 @media(max-width: 768px) {
                     .sidebar { width: 100%; position: relative; height: auto; }
@@ -710,7 +711,7 @@ function renderPage(req, { title, activeNav, content }) {
             <aside class="sidebar">
                 <div class="sidebar-header">
                     <a href="/" class="logo-container">
-                        <img src="/logo.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
+                        <img src="/TENCENT_INNOVATIONS_logo.png.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
                         <div class="logo-text-group">
                             <span class="logo-text">Tencent Innovations</span>
                             <span class="logo-tagline">Connecting You, Faster.</span>
@@ -773,7 +774,7 @@ function renderPage(req, { title, activeNav, content }) {
                         <div class="footer-col">
                             <h4>Customer Care</h4>
                             <ul class="footer-links">
-                                <li><a href="/survey">My account</a></li>
+                                <li><a href="/survey">My Account</a></li>
                                 <li><a href="tel:0740311014">Contact Us</a></li>
                                 <li><a href="/terms">Terms & Conditions</a></li>
                             </ul>
@@ -824,17 +825,19 @@ function renderPage(req, { title, activeNav, content }) {
 // ---------------------------------------------------------------
 app.get('/register', (req, res) => {
     const content = `
-        <h2>Create an Account</h2>
-        <p class="sub-title">Register to book services, request surveys, and download receipts.</p>
-        <div class="form-container">
-            <form action="/register" method="POST">
-                <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="John Otieno"></div>
-                <div class="form-group"><label>Email Address (for receipt delivery)</label><input type="email" name="email" required placeholder="john@example.com"></div>
-                <div class="form-group"><label>Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
-                <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
-                <button type="submit" class="cta-btn">Register</button>
-            </form>
-            <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login" style="color:var(--primary);">Login here</a></p>
+        <div class="general-container">
+            <h2>Create an Account</h2>
+            <p class="sub-title">Register to book services, request surveys, and download receipts.</p>
+            <div class="form-container">
+                <form action="/register" method="POST">
+                    <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="John Otieno"></div>
+                    <div class="form-group"><label>Email Address (for receipt delivery)</label><input type="email" name="email" required placeholder="john@example.com"></div>
+                    <div class="form-group"><label>Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
+                    <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
+                    <button type="submit" class="cta-btn" style="width:100%; padding:12px; background:var(--primary); color:#fff; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Register</button>
+                </form>
+                <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login" style="color:var(--primary);">Login here</a></p>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Register', activeNav: 'register', content }));
@@ -858,7 +861,7 @@ app.post('/register', async (req, res) => {
         res.status(400).send(renderPage(req, {
             title: 'Registration Error',
             activeNav: 'register',
-            content: `<h2>Registration Failed</h2><p class="intro-text">Email may already be registered. Please try logging in.</p><a href="/login" class="cta-btn">Go to Login</a>`
+            content: `<div class="general-container"><h2>Registration Failed</h2><p class="intro-text">Email may already be registered. Please try logging in.</p><a href="/login" style="color:var(--primary);">Go to Login</a></div>`
         }));
     }
 });
@@ -866,15 +869,17 @@ app.post('/register', async (req, res) => {
 app.get('/login', (req, res) => {
     const redirectUrl = req.query.redirect || '/survey';
     const content = `
-        <h2>Login to Your Account</h2>
-        <p class="sub-title">Access surveys, service bookings, and receipt downloads.</p>
-        <div class="form-container">
-            <form action="/login?redirect=${encodeURIComponent(redirectUrl)}" method="POST">
-                <div class="form-group"><label>Email Address</label><input type="email" name="email" required placeholder="john@example.com"></div>
-                <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
-                <button type="submit" class="cta-btn">Login</button>
-            </form>
-            <p style="margin-top: 15px; text-align:center;">Don't have an account? <a href="/register" style="color:var(--primary);">Register here</a></p>
+        <div class="general-container">
+            <h2>Login to Your Account</h2>
+            <p class="sub-title">Access surveys, service bookings, and receipt downloads.</p>
+            <div class="form-container">
+                <form action="/login?redirect=${encodeURIComponent(redirectUrl)}" method="POST">
+                    <div class="form-group"><label>Email Address</label><input type="email" name="email" required placeholder="john@example.com"></div>
+                    <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
+                    <button type="submit" style="width:100%; padding:12px; background:var(--primary); color:#fff; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Login</button>
+                </form>
+                <p style="margin-top: 15px; text-align:center;">Don't have an account? <a href="/register" style="color:var(--primary);">Register here</a></p>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Login', activeNav: 'login', content }));
@@ -908,31 +913,58 @@ app.get('/logout', (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// Public Pages
+// Public Pages with Custom Background Video & Modern Grid Homepage
 // ---------------------------------------------------------------
 app.get('/', (req, res) => {
     const content = `
-        <div class="hero-banner">
-            <h1>Internet, security and power for your home or business.</h1>
-            <p>Tencent Innovations designs, installs and maintains WiFi, CCTV, smart locks, electric fences and solar systems. We start with a survey, so you only pay for what your site needs.</p>
-            <div class="ussd-badge">📱 Dial *384*100# on your phone to book</div>
+        <div class="hero-video-container">
+            <video autoplay muted loop playsinline class="hero-video">
+                <source src="https://assets.mixkit.co/videos/preview/mixkit-digital-animation-of-screens-and-connections-31917-large.mp4" type="video/mp4">
+            </video>
+            <div class="hero-overlay-content">
+                <img src="/TENCENT_INNOVATIONS_logo.png.png" alt="Tencent Innovations Logo" class="hero-logo-badge" onerror="this.style.display='none'">
+                <h1>INTEGRATED TECHNOLOGY & SECURITY LEADERS</h1>
+                <p>Providing high-performance WiFi, Solar Backup, CCTV, Smart Locks, and Electric Fences across East Africa.</p>
+                <div style="margin-top:15px;"><a href="/survey" style="background:#38bdf8; color:#0f172a; padding:12px 28px; border-radius:30px; font-weight:bold; text-decoration:none;">Book Site Survey (*384*100#)</a></div>
+            </div>
         </div>
-        
-        <p class="intro-text">Most problems with networks, cameras and power start with a poor plan, not poor equipment. We are engineers, so we plan first, install properly and stay around to support what we build.</p>
-        
-        <h3>What we do</h3>
-        <ul class="feature-list">
-            <li><strong>WiFi:</strong> Hotspot and home internet that stays up and stays fast.</li>
-            <li><strong>CCTV:</strong> Cameras you can watch from your phone.</li>
-            <li><strong>Smart locks:</strong> Entry without keys to copy, lose or hand over.</li>
-            <li><strong>Electric fence:</strong> A boundary that deters intruders before they reach your door.</li>
-            <li><strong>Solar:</strong> Power that keeps your lights, router and cameras on when the grid is off.</li>
-            <li><strong>Surveys:</strong> A site visit and a written plan before any work begins.</li>
-        </ul>
 
-        <div class="cta-box">
-            <p>Ready to get started? Register or login to book a professional site survey.</p>
-            <a href="/survey" class="cta-btn">Book a Survey Now</a>
+        <div class="services-grid">
+            <div class="service-card card-black">
+                <div>
+                    <div class="service-icon">📶</div>
+                    <h3>WIFI NETWORKS</h3>
+                    <p>High-speed hotspot and dedicated home/office fiber internet installations designed for maximum uptime and stability.</p>
+                </div>
+                <div><a href="/wifi" class="enquire-btn">Enquire Now</a></div>
+            </div>
+
+            <div class="service-card card-gray">
+                <div>
+                    <div class="service-icon">☀️</div>
+                    <h3>SOLAR SOLUTIONS</h3>
+                    <p>Contact us now for your solar system quote for both Home & Commercial off-grid and hybrid kits.</p>
+                </div>
+                <div><a href="/solar" class="enquire-btn">Enquire Now</a></div>
+            </div>
+
+            <div class="service-card card-light">
+                <div>
+                    <div class="service-icon">📷</div>
+                    <h3>CCTV SYSTEMS</h3>
+                    <p>Advanced security surveillance cameras with remote smartphone viewing and crystal-clear night vision.</p>
+                </div>
+                <div><a href="/cctv" class="enquire-btn">Enquire Now</a></div>
+            </div>
+
+            <div class="service-card card-teal">
+                <div>
+                    <div class="service-icon">🔐 & ⚡</div>
+                    <h3>LOCKS & FENCES</h3>
+                    <p>Secure biometric smart locks and high-voltage perimeter electric fences engineered to protect your premises.</p>
+                </div>
+                <div><a href="/smart-locks" class="enquire-btn">Enquire Now</a></div>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Home', activeNav: 'home', content }));
@@ -940,12 +972,13 @@ app.get('/', (req, res) => {
 
 app.get('/wifi', (req, res) => {
     const content = `
-        <h2>Reliable WiFi for homes, rentals and businesses.</h2>
-        <p class="sub-title">Pay-as-you-go hotspot or a fixed monthly connection. We build the network, run the billing and keep it online.</p>
-        <p class="intro-text">A good connection depends on the whole chain: the link to the mast, the router, the access points and how many people share them.</p>
-        <div class="cta-box">
-            <p>Book a site visit to test signal strength at your location.</p>
-            <a href="/survey" class="cta-btn">Book WiFi Consultation</a>
+        <div class="general-container">
+            <h2>Reliable WiFi for homes, rentals and businesses.</h2>
+            <p class="sub-title">Pay-as-you-go hotspot or a fixed monthly connection. We build the network, run the billing and keep it online.</p>
+            <div class="form-container">
+                <p>Book a site visit to test signal strength at your location.</p>
+                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book WiFi Consultation</a>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'WiFi & Networking', activeNav: 'wifi', content }));
@@ -953,11 +986,13 @@ app.get('/wifi', (req, res) => {
 
 app.get('/cctv', (req, res) => {
     const content = `
-        <h2>See your property from anywhere.</h2>
-        <p class="sub-title">CCTV systems for homes, shops, schools and compounds, installed and set up to view live on your phone.</p>
-        <div class="cta-box">
-            <p>Get professional camera positioning and a clear quote.</p>
-            <a href="/survey" class="cta-btn">Book CCTV Survey</a>
+        <div class="general-container">
+            <h2>See your property from anywhere.</h2>
+            <p class="sub-title">CCTV systems for homes, shops, schools and compounds, installed and set up to view live on your phone.</p>
+            <div class="form-container">
+                <p>Get professional camera positioning and a clear quote.</p>
+                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book CCTV Survey</a>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'CCTV Systems', activeNav: 'cctv', content }));
@@ -965,11 +1000,13 @@ app.get('/cctv', (req, res) => {
 
 app.get('/smart-locks', (req, res) => {
     const content = `
-        <h2>Open your door without a key.</h2>
-        <p class="sub-title">Smart locks for homes, rental units, offices and stores. Use a code, a card, a fingerprint or your phone.</p>
-        <div class="cta-box">
-            <p>Find the right smart lock model for your doors.</p>
-            <a href="/survey" class="cta-btn">Book Smart Lock Consultation</a>
+        <div class="general-container">
+            <h2>Open your door without a key.</h2>
+            <p class="sub-title">Smart locks for homes, rental units, offices and stores. Use a code, a card, a fingerprint or your phone.</p>
+            <div class="form-container">
+                <p>Find the right smart lock model for your doors.</p>
+                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book Smart Lock Consultation</a>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Smart Locks', activeNav: 'smart-locks', content }));
@@ -977,11 +1014,13 @@ app.get('/smart-locks', (req, res) => {
 
 app.get('/electric-fence', (req, res) => {
     const content = `
-        <h2>Stop intruders at the boundary.</h2>
-        <p class="sub-title">Electric fence installation for homes, compounds, schools, farms and commercial plots.</p>
-        <div class="cta-box">
-            <p>Measure your boundary and get a professional installation quote.</p>
-            <a href="/survey" class="cta-btn">Book Electric Fence Survey</a>
+        <div class="general-container">
+            <h2>Stop intruders at the boundary.</h2>
+            <p class="sub-title">Electric fence installation for homes, compounds, schools, farms and commercial plots.</p>
+            <div class="form-container">
+                <p>Measure your boundary and get a professional installation quote.</p>
+                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book Electric Fence Survey</a>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Electric Fence', activeNav: 'electric-fence', content }));
@@ -989,11 +1028,13 @@ app.get('/electric-fence', (req, res) => {
 
 app.get('/solar', (req, res) => {
     const content = `
-        <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
-        <p class="sub-title">Solar and battery systems sized for your home, shop, school or network site.</p>
-        <div class="cta-box">
-            <p>Calculate your load requirements with our engineers.</p>
-            <a href="/survey" class="cta-btn">Book Solar Consultation</a>
+        <div class="general-container">
+            <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
+            <p class="sub-title">Solar and battery systems sized for your home, shop, school or network site.</p>
+            <div class="form-container">
+                <p>Calculate your load requirements with our engineers.</p>
+                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book Solar Consultation</a>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Solar Solutions', activeNav: 'solar', content }));
@@ -1004,29 +1045,31 @@ app.get('/solar', (req, res) => {
 // ---------------------------------------------------------------
 app.get('/survey', requireAuth, (req, res) => {
     const content = `
-        <h2>Know what your site needs before you spend.</h2>
-        <p class="sub-title">A site survey by an engineer, followed by a written plan and quote.</p>
-        
-        <div class="form-container" style="border-color: var(--accent);">
-            <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-            <p style="color:var(--muted); font-size:0.95rem;">Logged in as: <strong>${esc(req.session.user.email)}</strong>. Receipts will be emailed here.</p>
-            <form action="/submit-survey-payment" method="POST" id="payment-form">
-                <div class="form-group"><label>Full Name</label><input type="text" name="name" value="${esc(req.session.user.name)}" required></div>
-                <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" value="${esc(req.session.user.phone)}" required placeholder="0712345678"></div>
-                <div class="form-group">
-                    <label>Service Category</label>
-                    <select name="service" id="service-select">
-                        <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
-                        <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
-                        <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
-                        <option value="Smart Locks">Smart Locks Consultation (KES 2,500)</option>
-                        <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
-                        <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
-                    </select>
-                </div>
-                <div class="form-group"><label>Physical Location / Address</label><input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay"></div>
-                <button type="submit" class="cta-btn" style="background: var(--accent); color: #0f172a;">Trigger M-Pesa Payment & Book Survey</button>
-            </form>
+        <div class="general-container">
+            <h2>Know what your site needs before you spend.</h2>
+            <p class="sub-title">A site survey by an engineer, followed by a written plan and quote.</p>
+            
+            <div class="form-container" style="border-color: var(--accent);">
+                <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
+                <p style="color:var(--muted); font-size:0.95rem;">Logged in as: <strong>${esc(req.session.user.email)}</strong>. Receipts will be emailed here.</p>
+                <form action="/submit-survey-payment" method="POST" id="payment-form">
+                    <div class="form-group"><label>Full Name</label><input type="text" name="name" value="${esc(req.session.user.name)}" required></div>
+                    <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" value="${esc(req.session.user.phone)}" required placeholder="0712345678"></div>
+                    <div class="form-group">
+                        <label>Service Category</label>
+                        <select name="service" id="service-select">
+                            <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
+                            <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
+                            <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
+                            <option value="Smart Locks">Smart Locks Consultation (KES 2,500)</option>
+                            <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
+                            <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
+                        </select>
+                    </div>
+                    <div class="form-group"><label>Physical Location / Address</label><input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay"></div>
+                    <button type="submit" style="width:100%; padding:14px; background:var(--accent); color:#0f172a; border:none; border-radius:8px; font-weight:bold; font-size:1.05rem; cursor:pointer;">Trigger M-Pesa Payment & Book Survey</button>
+                </form>
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Surveys & Quotations', activeNav: 'survey', content }));
@@ -1064,9 +1107,11 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
             title: 'Booking Received',
             activeNav: 'survey',
             content: `
-                <h2>Booking Received!</h2>
-                <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our M-Pesa gateway is currently in offline mode. An engineer has received your request and will call <strong>${esc(phone)}</strong> shortly.</p>
-                <p><a href="/requests" class="cta-btn" style="margin-top:10px;">View My Requests</a></p>
+                <div class="general-container">
+                    <h2>Booking Received!</h2>
+                    <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our M-Pesa gateway is currently in offline mode. An engineer has received your request and will call <strong>${esc(phone)}</strong> shortly.</p>
+                    <p><a href="/requests" style="color:var(--primary); font-weight:bold;">View My Requests</a></p>
+                </div>
             `
         }));
     }
@@ -1082,22 +1127,24 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
             title: 'Check Your Phone',
             activeNav: 'survey',
             content: `
-                <h2>📱 Check Your Phone</h2>
-                <div style="background:var(--surface); border:1px solid var(--primary); padding:25px; border-radius:12px; margin-top:20px; text-align:center;">
-                    <h3 style="color:#38bdf8; margin-top:0;">M-Pesa Prompt Sent to ${esc(phone)}</h3>
-                    <p style="font-size:1.1rem; color:var(--text);">An STK prompt for <strong>KES ${amount}</strong> has been pushed to your handset.</p>
-                    
-                    <div id="status-box" style="margin:25px 0; padding:15px; border-radius:8px; background:var(--bg); border:1px solid var(--border);">
-                        <p id="status-text" style="font-weight:bold; color:var(--primary); font-size:1.05rem; margin:0;">
-                            ⏳ Waiting for you to enter your M-Pesa PIN on your phone...
+                <div class="general-container">
+                    <h2>📱 M-Pesa Prompt Sent Successfully</h2>
+                    <div style="background:var(--surface); border:2px solid var(--accent); padding:25px; border-radius:12px; margin-top:20px; text-align:center;">
+                        <h3 style="color:var(--accent); margin-top:0; font-size:1.4rem;">⚠️ ATTENTION REQUIRED:</h3>
+                        <p style="font-size:1.2rem; color:var(--text); font-weight:bold; margin: 15px 0;">
+                            Please check your phone (${esc(phone)}) immediately and put your M-Pesa PIN to authorize KES ${amount}!
                         </p>
+                        
+                        <div id="status-box" style="margin:25px 0; padding:15px; border-radius:8px; background:var(--bg); border:1px solid var(--border);">
+                            <p id="status-text" style="font-weight:bold; color:#38bdf8; font-size:1.05rem; margin:0;">
+                                ⏳ Waiting for your M-Pesa PIN entry...
+                            </p>
+                        </div>
                     </div>
 
-                    <p style="font-size:0.9rem; color:var(--muted);">Please enter your PIN when prompted. Once complete, this page will automatically confirm your transaction and generate your receipt.</p>
-                </div>
-
-                <div style="margin-top:25px; text-align:center;">
-                    <a href="/requests" class="cta-btn" style="background:var(--primary);">View All My Requests & Statuses</a>
+                    <div style="margin-top:25px; text-align:center;">
+                        <a href="/requests" style="background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">View All My Requests & Receipts</a>
+                    </div>
                 </div>
 
                 <script>
@@ -1107,12 +1154,12 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
                             const d = await r.json();
                             if (d.status === 'paid') {
                                 let html = '<h3 style="color:var(--accent); margin:0;">✅ Payment Confirmed Successfully!</h3><p style="margin-top:8px;">An official PDF receipt has been sent to your email.</p>';
-                                if (d.pdf) html += '<p><a href="' + d.pdf + '" class="cta-btn" style="margin-top:12px; display:inline-block; background:var(--accent); color:#0f172a;">📥 Download Official PDF Receipt</a></p>';
+                                if (d.pdf) html += '<p><a href="' + d.pdf + '" style="margin-top:12px; display:inline-block; background:var(--accent); color:#0f172a; padding:10px 20px; border-radius:6px; font-weight:bold; text-decoration:none;">📥 Download Official PDF Receipt</a></p>';
                                 html += '<p style="margin-top:12px;"><a href="/requests" style="color:var(--primary); text-decoration:underline;">Go to My Requests Dashboard</a></p>';
                                 document.getElementById('status-box').innerHTML = html;
                                 clearInterval(timer);
                             } else if (d.status === 'failed') {
-                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">❌ Payment Cancelled or Timed Out</h3><p style="margin-top:8px; color:var(--muted);">The payment request was not completed.</p><a href="/survey" class="cta-btn" style="margin-top:15px; display:inline-block;">Try Again</a>';
+                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">❌ Payment Cancelled or Timed Out</h3><p style="margin-top:8px; color:var(--muted);">The payment request was not completed.</p><a href="/survey" style="margin-top:15px; display:inline-block; background:var(--primary); color:#fff; padding:10px 20px; border-radius:6px; text-decoration:none;">Try Again</a>';
                                 clearInterval(timer);
                             }
                         } catch(e) {}
@@ -1155,7 +1202,7 @@ app.get('/requests', requireAuth, async (req, res) => {
                 }
 
                 const actionBtn = b.status === 'paid' 
-                    ? `<a href="/payments/receipt/${b.id}/download.pdf" class="cta-btn" style="padding:6px 12px; font-size:0.85rem; background:var(--accent); color:#0f172a; text-decoration:none; display:inline-block;">📥 Download PDF</a>`
+                    ? `<a href="/payments/receipt/${b.id}/download.pdf" style="padding:6px 12px; font-size:0.85rem; background:var(--accent); color:#0f172a; text-decoration:none; border-radius:4px; font-weight:bold; display:inline-block;">📥 Download PDF</a>`
                     : `<a href="/survey" style="color:var(--primary); font-size:0.85rem; font-weight:bold;">Retry Payment</a>`;
 
                 return `
@@ -1173,30 +1220,32 @@ app.get('/requests', requireAuth, async (req, res) => {
         }
 
         const content = `
-            <h2>My Service Requests & Tracking</h2>
-            <p class="sub-title">Monitor your submitted bookings, payment statuses, and download official PDF receipts.</p>
-            
-            <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-top: 20px;">
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem;">
-                    <thead>
-                        <tr style="background: var(--bg); border-bottom: 2px solid var(--border); color: var(--primary);">
-                            <th style="padding: 14px 12px;">Date</th>
-                            <th style="padding: 14px 12px;">Service & Location</th>
-                            <th style="padding: 14px 12px;">Amount</th>
-                            <th style="padding: 14px 12px;">Reference</th>
-                            <th style="padding: 14px 12px;">Status</th>
-                            <th style="padding: 14px 12px;">M-Pesa Receipt</th>
-                            <th style="padding: 14px 12px; text-align: center;">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${rowsHtml}
-                    </tbody>
-                </table>
-            </div>
+            <div class="general-container">
+                <h2>My Service Requests & Tracking</h2>
+                <p class="sub-title">Monitor your submitted bookings, payment statuses, and download official PDF receipts.</p>
+                
+                <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-top: 20px;">
+                    <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem;">
+                        <thead>
+                            <tr style="background: var(--bg); border-bottom: 2px solid var(--border); color: var(--primary);">
+                                <th style="padding: 14px 12px;">Date</th>
+                                <th style="padding: 14px 12px;">Service & Location</th>
+                                <th style="padding: 14px 12px;">Amount</th>
+                                <th style="padding: 14px 12px;">Reference</th>
+                                <th style="padding: 14px 12px;">Status</th>
+                                <th style="padding: 14px 12px;">M-Pesa Receipt</th>
+                                <th style="padding: 14px 12px; text-align: center;">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rowsHtml}
+                        </tbody>
+                    </table>
+                </div>
 
-            <div style="margin-top: 30px; text-align: right;">
-                <a href="/survey" class="cta-btn" style="display:inline-block; width:auto; padding:10px 24px;">+ Book Another Service</a>
+                <div style="margin-top: 30px; text-align: right;">
+                    <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:10px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">+ Book Another Service</a>
+                </div>
             </div>
         `;
         res.send(renderPage(req, { title: 'My Requests', activeNav: 'requests', content }));
@@ -1214,19 +1263,21 @@ app.get('/booking/:token', async (req, res) => {
     const isPaid = data.k === 1;
     const dateStr = new Date(data.t).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
     const content = `
-        <h2>${isPaid ? 'Payment Receipt & Booking' : 'Booking Status'}</h2>
-        <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County</p>
-        <div class="form-container">
-            <p><strong>Status:</strong> <span style="color: ${isPaid ? 'var(--accent)' : '#38bdf8'}; font-weight: bold;">${isPaid ? 'PAID & CONFIRMED' : 'PENDING'}</span></p>
-            <p><strong>Client Name:</strong> ${esc(data.n)}</p>
-            <p><strong>Phone Number:</strong> ${esc(data.p)}</p>
-            <p><strong>Service:</strong> ${esc(data.s)}</p>
-            <p><strong>Location:</strong> ${esc(data.l)}</p>
-            <p><strong>Amount:</strong> KES ${esc(data.a)}</p>
-            <p><strong>Reference:</strong> ${esc(data.f)}</p>
-            ${data.r ? `<p><strong>M-Pesa Receipt:</strong> ${esc(data.r)}</p>` : ''}
-            <p><strong>Timestamp:</strong> ${esc(dateStr)}</p>
-            ${isPaid && PDFDocument ? `<div style="margin-top: 25px;"><a href="/booking/${esc(req.params.token)}/receipt.pdf" class="cta-btn" style="background: var(--accent); color: #0f172a; text-align: center;">Download Official PDF Receipt</a></div>` : ''}
+        <div class="general-container">
+            <h2>${isPaid ? 'Payment Receipt & Booking' : 'Booking Status'}</h2>
+            <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County</p>
+            <div class="form-container">
+                <p><strong>Status:</strong> <span style="color: ${isPaid ? 'var(--accent)' : '#38bdf8'}; font-weight: bold;">${isPaid ? 'PAID & CONFIRMED' : 'PENDING'}</span></p>
+                <p><strong>Client Name:</strong> ${esc(data.n)}</p>
+                <p><strong>Phone Number:</strong> ${esc(data.p)}</p>
+                <p><strong>Service:</strong> ${esc(data.s)}</p>
+                <p><strong>Location:</strong> ${esc(data.l)}</p>
+                <p><strong>Amount:</strong> KES ${esc(data.a)}</p>
+                <p><strong>Reference:</strong> ${esc(data.f)}</p>
+                ${data.r ? `<p><strong>M-Pesa Receipt:</strong> ${esc(data.r)}</p>` : ''}
+                <p><strong>Timestamp:</strong> ${esc(dateStr)}</p>
+                ${isPaid && PDFDocument ? `<div style="margin-top: 25px;"><a href="/booking/${esc(req.params.token)}/receipt.pdf" style="background: var(--accent); color: #0f172a; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block;">Download Official PDF Receipt</a></div>` : ''}
+            </div>
         </div>
     `;
     res.send(renderPage(req, { title: 'Receipt', activeNav: 'home', content }));
@@ -1259,13 +1310,15 @@ app.get('/booking/:token/receipt.pdf', async (req, res) => {
 // Terms and Conditions Page
 app.get('/terms', (req, res) => {
     const content = `
-        <h2>Terms and Conditions of Service</h2>
-        <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
-        <p class="intro-text">These Terms and Conditions govern the provision of internet services, security installations, and site surveys by Tencent Innovations.</p>
-        <h3>1. Services and Surveys</h3>
-        <p>Site surveys and consultations require an advance fee paid via M-Pesa. Fees cover engineer site visits and written quotations.</p>
-        <h3>2. Payments</h3>
-        <p>All payments are processed securely via M-Pesa STK Push. Receipts are delivered via email upon confirmation.</p>
+        <div class="general-container">
+            <h2>Terms and Conditions of Service</h2>
+            <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
+            <p class="intro-text">These Terms and Conditions govern the provision of internet services, security installations, and site surveys by Tencent Innovations.</p>
+            <h3>1. Services and Surveys</h3>
+            <p>Site surveys and consultations require an advance fee paid via M-Pesa. Fees cover engineer site visits and written quotations.</p>
+            <h3>2. Payments</h3>
+            <p>All payments are processed securely via M-Pesa STK Push. Receipts are delivered via email upon confirmation.</p>
+        </div>
     `;
     res.send(renderPage(req, { title: 'Terms and Conditions', activeNav: 'terms', content }));
 });
@@ -1285,7 +1338,7 @@ app.post('/ussd', (req, res) => {
     } else if (text === '1') {
         response = `CON WiFi Consultation: KES 3,000\n1. Confirm & Pay via M-PESA`;
     } else if (text.endsWith('*1')) {
-        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}.`;
+        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. Please enter your PIN.`;
     } else {
         response = `END Invalid selection.`;
     }
