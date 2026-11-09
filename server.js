@@ -586,7 +586,8 @@ function requireAuth(req, res, next) {
 // ---------------------------------------------------------------
 // Layout Template Helper with Left Sidebar & Auth / Sign In / Login Buttons
 // ---------------------------------------------------------------
-function renderPage({ title, activeNav, content }) {
+function renderPage(req, { title, activeNav, content }) {
+    const user = req.session && req.session.user ? req.session.user : null;
     return `
         <!DOCTYPE html>
         <html lang="en" data-theme="dark">
@@ -720,16 +721,16 @@ function renderPage({ title, activeNav, content }) {
                     <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
                     <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
                     <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
-                    ${res.locals.user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
+                    ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
                     <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
                     
                     <hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;">
 
-                    <!-- Prominent Login / Register / Account Section -->
+                    <!-- Prominent Authentication Sidebar Buttons -->
                     <div class="sidebar-auth-group">
-                        ${res.locals.user ? `
+                        ${user ? `
                             <div style="padding: 4px 6px; font-size: 0.9rem; color: var(--text); overflow: hidden; text-overflow: ellipsis;">
-                                👤 <strong>${esc(res.locals.user.name)}</strong>
+                                👤 <strong>${esc(user.name)}</strong>
                             </div>
                             <a href="/logout" class="sidebar-auth-btn sidebar-register-btn" style="border-color: #f87171; color: #f87171;">🚪 Logout</a>
                         ` : `
@@ -833,7 +834,7 @@ app.get('/register', (req, res) => {
             <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login" style="color:var(--primary);">Login here</a></p>
         </div>
     `;
-    res.send(renderPage({ title: 'Register', activeNav: 'register', content }));
+    res.send(renderPage(req, { title: 'Register', activeNav: 'register', content }));
 });
 
 app.post('/register', async (req, res) => {
@@ -851,7 +852,7 @@ app.post('/register', async (req, res) => {
         res.redirect('/survey');
     } catch (err) {
         console.error('Registration error:', err.message);
-        res.status(400).send(renderPage({
+        res.status(400).send(renderPage(req, {
             title: 'Registration Error',
             activeNav: 'register',
             content: `<h2>Registration Failed</h2><p class="intro-text">Email may already be registered. Please try logging in.</p><a href="/login" class="cta-btn">Go to Login</a>`
@@ -873,7 +874,7 @@ app.get('/login', (req, res) => {
             <p style="margin-top: 15px; text-align:center;">Don't have an account? <a href="/register" style="color:var(--primary);">Register here</a></p>
         </div>
     `;
-    res.send(renderPage({ title: 'Login', activeNav: 'login', content }));
+    res.send(renderPage(req, { title: 'Login', activeNav: 'login', content }));
 });
 
 app.post('/login', async (req, res) => {
@@ -931,7 +932,7 @@ app.get('/', (req, res) => {
             <a href="/survey" class="cta-btn">Book a Survey Now</a>
         </div>
     `;
-    res.send(renderPage({ title: 'Home', activeNav: 'home', content }));
+    res.send(renderPage(req, { title: 'Home', activeNav: 'home', content }));
 });
 
 app.get('/wifi', (req, res) => {
@@ -944,7 +945,7 @@ app.get('/wifi', (req, res) => {
             <a href="/survey" class="cta-btn">Book WiFi Consultation</a>
         </div>
     `;
-    res.send(renderPage({ title: 'WiFi & Networking', activeNav: 'wifi', content }));
+    res.send(renderPage(req, { title: 'WiFi & Networking', activeNav: 'wifi', content }));
 });
 
 app.get('/cctv', (req, res) => {
@@ -956,7 +957,7 @@ app.get('/cctv', (req, res) => {
             <a href="/survey" class="cta-btn">Book CCTV Survey</a>
         </div>
     `;
-    res.send(renderPage({ title: 'CCTV Systems', activeNav: 'cctv', content }));
+    res.send(renderPage(req, { title: 'CCTV Systems', activeNav: 'cctv', content }));
 });
 
 app.get('/smart-locks', (req, res) => {
@@ -968,7 +969,7 @@ app.get('/smart-locks', (req, res) => {
             <a href="/survey" class="cta-btn">Book Smart Lock Consultation</a>
         </div>
     `;
-    res.send(renderPage({ title: 'Smart Locks', activeNav: 'smart-locks', content }));
+    res.send(renderPage(req, { title: 'Smart Locks', activeNav: 'smart-locks', content }));
 });
 
 app.get('/electric-fence', (req, res) => {
@@ -980,7 +981,7 @@ app.get('/electric-fence', (req, res) => {
             <a href="/survey" class="cta-btn">Book Electric Fence Survey</a>
         </div>
     `;
-    res.send(renderPage({ title: 'Electric Fence', activeNav: 'electric-fence', content }));
+    res.send(renderPage(req, { title: 'Electric Fence', activeNav: 'electric-fence', content }));
 });
 
 app.get('/solar', (req, res) => {
@@ -992,7 +993,7 @@ app.get('/solar', (req, res) => {
             <a href="/survey" class="cta-btn">Book Solar Consultation</a>
         </div>
     `;
-    res.send(renderPage({ title: 'Solar Solutions', activeNav: 'solar', content }));
+    res.send(renderPage(req, { title: 'Solar Solutions', activeNav: 'solar', content }));
 });
 
 // ---------------------------------------------------------------
@@ -1025,7 +1026,7 @@ app.get('/survey', requireAuth, (req, res) => {
             </form>
         </div>
     `;
-    res.send(renderPage({ title: 'Surveys & Quotations', activeNav: 'survey', content }));
+    res.send(renderPage(req, { title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
 app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => {
@@ -1056,7 +1057,7 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
 
     if (!mpesaConfigured()) {
         await notify(`📝 PENDING (M-Pesa unconfigured): ${service} - ${name}`, { Name: name, Phone: phone, Service: service, Location: location, Amount: `KES ${amount}` }, req.session.user.email);
-        return res.send(renderPage({
+        return res.send(renderPage(req, {
             title: 'Booking Received',
             activeNav: 'survey',
             content: `
@@ -1074,7 +1075,7 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
 
         await notify(`📱 STK sent: ${service} - ${name} (KES ${amount})`, bookingFields(bookingObj), req.session.user.email);
 
-        res.send(renderPage({
+        res.send(renderPage(req, {
             title: 'Check Your Phone',
             activeNav: 'survey',
             content: `
@@ -1184,7 +1185,7 @@ app.get('/requests', requireAuth, async (req, res) => {
                 <a href="/survey" class="cta-btn" style="display:inline-block; width:auto; padding:10px 24px;">+ Book Another Service</a>
             </div>
         `;
-        res.send(renderPage({ title: 'My Requests', activeNav: 'requests', content }));
+        res.send(renderPage(req, { title: 'My Requests', activeNav: 'requests', content }));
     } catch (err) {
         console.error('Error fetching requests:', err.message);
         res.status(500).send('Error loading requests dashboard.');
@@ -1214,7 +1215,7 @@ app.get('/booking/:token', async (req, res) => {
             ${isPaid && PDFDocument ? `<div style="margin-top: 25px;"><a href="/booking/${esc(req.params.token)}/receipt.pdf" class="cta-btn" style="background: var(--accent); color: #0f172a; text-align: center;">Download Official PDF Receipt</a></div>` : ''}
         </div>
     `;
-    res.send(renderPage({ title: 'Receipt', activeNav: 'home', content }));
+    res.send(renderPage(req, { title: 'Receipt', activeNav: 'home', content }));
 });
 
 app.get('/booking/:token/receipt.pdf', async (req, res) => {
@@ -1252,7 +1253,7 @@ app.get('/terms', (req, res) => {
         <h3>2. Payments</h3>
         <p>All payments are processed securely via M-Pesa STK Push. Receipts are delivered via email upon confirmation.</p>
     `;
-    res.send(renderPage({ title: 'Terms and Conditions', activeNav: 'terms', content }));
+    res.send(renderPage(req, { title: 'Terms and Conditions', activeNav: 'terms', content }));
 });
 
 // USSD Endpoint
