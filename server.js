@@ -652,9 +652,9 @@ function renderPage(req, { title, activeNav, content }) {
                 .theme-toggle-btn:hover { background: var(--surface); }
 
                 .main-content { margin-left: 260px; flex: 1; display: flex; flex-direction: column; min-height: 100vh; }
-                .container { max-width: 1100px; margin: 0 auto; padding: 0; flex: 1; width: 100%; box-sizing: border-box; }
+                .container { max-width: 100%; margin: 0 auto; padding: 0; flex: 1; width: 100%; box-sizing: border-box; }
 
-                /* Modern Grid Homepage Styling modeled after reference */
+                /* Modern 4-Column Grid Homepage Styling modeled after reference */
                 .hero-video-container { position: relative; width: 100%; height: 420px; overflow: hidden; display: flex; align-items: center; justify-content: center; text-align: center; border-bottom: 3px solid var(--border); }
                 .hero-video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; filter: brightness(0.45); }
                 .hero-overlay-content { position: relative; z-index: 2; padding: 20px; max-width: 800px; }
@@ -662,19 +662,20 @@ function renderPage(req, { title, activeNav, content }) {
                 .hero-overlay-content h1 { font-size: 2.3rem; color: #ffffff; margin: 0 0 10px 0; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
                 .hero-overlay-content p { color: #e2e8f0; font-size: 1.15rem; margin: 0 0 20px 0; text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
 
-                .services-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0; width: 100%; }
-                .service-card { padding: 40px 30px; text-align: center; display: flex; flex-direction: column; justify-content: space-between; min-height: 280px; box-sizing: border-box; transition: transform 0.2s; position: relative; }
+                /* 4 items in the exact same line */
+                .services-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; width: 100%; }
+                .service-card { padding: 40px 20px; text-align: center; display: flex; flex-direction: column; justify-content: space-between; min-height: 320px; box-sizing: border-box; transition: transform 0.2s; position: relative; }
                 .service-card:hover { transform: translateY(-4px); z-index: 10; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
-                .service-card h3 { font-size: 1.4rem; font-weight: 800; letter-spacing: 0.05em; margin: 15px 0 10px 0; text-transform: uppercase; }
-                .service-card p { font-size: 0.95rem; line-height: 1.5; margin-bottom: 25px; opacity: 0.9; }
-                .service-icon { font-size: 2.5rem; margin-bottom: 10px; }
+                .service-card h3 { font-size: 1.25rem; font-weight: 800; letter-spacing: 0.05em; margin: 15px 0 10px 0; text-transform: uppercase; }
+                .service-card p { font-size: 0.9rem; line-height: 1.5; margin-bottom: 25px; opacity: 0.9; }
+                .service-icon { font-size: 2.3rem; margin-bottom: 10px; }
                 
                 .card-black { background: #000000; color: #ffffff; border-right: 1px solid #1e293b; }
                 .card-gray { background: #334155; color: #ffffff; border-right: 1px solid #475569; }
                 .card-light { background: #f1f5f9; color: #0f172a; border-right: 1px solid #cbd5e1; }
                 .card-teal { background: #14b8a6; color: #000000; }
 
-                .enquire-btn { display: inline-block; background: #ffffff; color: #0f172a; padding: 10px 24px; border-radius: 4px; font-weight: bold; text-decoration: none; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; transition: background 0.2s; }
+                .enquire-btn { display: inline-block; background: #ffffff; color: #0f172a; padding: 10px 20px; border-radius: 4px; font-weight: bold; text-decoration: none; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; transition: background 0.2s; }
                 .card-black .enquire-btn { background: #0284c7; color: #fff; }
                 .card-black .enquire-btn:hover { background: #0369a1; }
                 .card-gray .enquire-btn { background: #0f172a; color: #fff; }
@@ -682,7 +683,7 @@ function renderPage(req, { title, activeNav, content }) {
                 .card-teal .enquire-btn { background: #0f172a; color: #fff; }
                 .enquire-btn:hover { opacity: 0.85; }
 
-                .general-container { padding: 40px 30px; }
+                .general-container { padding: 40px 30px; max-width: 900px; margin: 0 auto; }
                 .form-container { background: var(--surface); border: 1px solid var(--border); padding: 30px; border-radius: 12px; margin-top: 20px; text-align: left; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
                 .form-group { margin-bottom: 20px; }
                 .form-group label { display: block; margin-bottom: 8px; color: var(--primary); font-weight: 600; }
@@ -700,10 +701,14 @@ function renderPage(req, { title, activeNav, content }) {
                 .footer-links a:hover { color: var(--primary); }
                 .footer-bottom { max-width: 1100px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 15px; text-align: center; font-size: 0.85rem; color: var(--muted); }
 
+                @media(max-width: 992px) {
+                    .services-grid { grid-template-columns: repeat(2, 1fr); }
+                }
                 @media(max-width: 768px) {
                     .sidebar { width: 100%; position: relative; height: auto; }
                     .main-content { margin-left: 0; }
                     body { flex-direction: column; }
+                    .services-grid { grid-template-columns: 1fr; }
                 }
             </style>
         </head>
@@ -913,7 +918,7 @@ app.get('/logout', (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// Public Pages with Custom Background Video & Modern Grid Homepage
+// Public Pages with Custom Background Video & 4-Column Homepage Grid
 // ---------------------------------------------------------------
 app.get('/', (req, res) => {
     const content = `
