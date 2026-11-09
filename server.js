@@ -5,11 +5,12 @@ const nodemailer = require('nodemailer');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
-const { Pool } = require('pg');
 const session = require('express-session');
-const pgSession = require('connect-pg-simple')(session);
+const PgSession = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 
+// PDF receipts need the "pdfkit" package.
 let PDFDocument = null;
 try {
     PDFDocument = require('pdfkit');
@@ -19,83 +20,25 @@ try {
 
 const app = express();
 
-// 1. Static file serving for images & assets
-app.use(express.static(__dirname));
+// Security headers must be applied before routes and static responses.
+app.use(helmet({ contentSecurityPolicy: false }));
 
-// 2. Security Headers via Helmet
-app.use(
-    helmet({
-        contentSecurityPolicy: false,
-    })
-);
-
-// 3. Trust Render's Proxy
-app.set('trust proxy', 1);
-
-// 4. Database Setup (PostgreSQL)
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
-
-async function initDb() {
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS bookings (
-                id VARCHAR(64) PRIMARY KEY,
-                user_id INT REFERENCES users(id),
-                name VARCHAR(255) NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                service VARCHAR(255) NOT NULL,
-                location VARCHAR(255) NOT NULL,
-                amount INT NOT NULL,
-                account_ref VARCHAR(50) NOT NULL,
-                status VARCHAR(50) NOT NULL,
-                receipt VARCHAR(100),
-                checkout_request_id VARCHAR(100),
-                created_at BIGINT NOT NULL,
-                paid_at BIGINT
-            );
-        `);
-        console.log('PostgreSQL tables initialized successfully.');
-    } catch (err) {
-        console.error('Database initialization error:', err.message);
-    }
-}
-initDb();
-
-// 5. Session Middleware with PostgreSQL Store
-app.use(session({
-    store: new pgSession({
-        pool: pool,
-        tableName: 'session',
-        createTableIfMissing: true
-    }),
-    secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        secure: process.env.NODE_ENV === 'production',
-        maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
-    }
+// Serve only intentional public assets.
+app.use('/public', express.static(path.join(__dirname, 'public'), {
+    index: false,
+    dotfiles: 'deny',
+    fallthrough: true
 }));
 
-// 6. Rate Limiting
+app.set('trust proxy', 1);
+
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: 'Too many requests from this IP, please try again later.',
-    skip: (req) => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
+    skip: (req) =>
+        req.path.startsWith('/payments/cb/') ||
+        req.path.startsWith('/payments/status/')
 });
 
 const payLimiter = rateLimit({
@@ -103,20 +46,194 @@ const payLimiter = rateLimit({
     max: 10,
     message: 'Too many payment attempts from this network. Please try again later.'
 });
+
 app.use(limiter);
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-// Make user session data available in all templates
-app.use((req, res, next) => {
-    res.locals.user = req.session.user || null;
-    next();
+if (!process.env.DATABASE_URL) {
+    console.warn('DATABASE_URL is not set. PostgreSQL is required for startup.');
+}
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL
+        ? { rejectUnauthorized: false }
+        : false
 });
 
+app.use(session({
+    store: new PgSession({
+        pool,
+        tableName: 'user_sessions',
+        createTableIfMissing: true
+    }),
+    secret: process.env.SESSION_SECRET ||
+        (process.env.NODE_ENV === 'production'
+            ? (() => {
+                throw new Error('SESSION_SECRET is required in production.');
+            })()
+            : crypto.randomBytes(32).toString('hex')),
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+    }
+}));
+
+function requireLogin(req, res, next) {
+    if (req.session && req.session.user) return next();
+
+    const nextPath = encodeURIComponent(req.originalUrl || '/dashboard');
+    return res.redirect(`/login?next=${nextPath}`);
+}
+
+function safeNext(value) {
+    if (
+        typeof value !== 'string' ||
+        !value.startsWith('/') ||
+        value.startsWith('//') ||
+        value.includes('\\')
+    ) {
+        return '/dashboard';
+    }
+
+    return value;
+}
+
+async function persistBooking(b) {
+    if (!b || !b.id) return;
+
+    await pool.query(
+        `INSERT INTO customer_bookings
+        (booking_id, customer_id, email, name, phone, service, location,
+         amount, account_ref, status, created_at, paid_at, receipt,
+         checkout_request_id, last_query, receipt_email_sent)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        ON CONFLICT (booking_id) DO UPDATE SET
+        customer_id=EXCLUDED.customer_id,
+        email=EXCLUDED.email,
+        name=EXCLUDED.name,
+        phone=EXCLUDED.phone,
+        service=EXCLUDED.service,
+        location=EXCLUDED.location,
+        amount=EXCLUDED.amount,
+        account_ref=EXCLUDED.account_ref,
+        status=EXCLUDED.status,
+        paid_at=EXCLUDED.paid_at,
+        receipt=EXCLUDED.receipt,
+        checkout_request_id=EXCLUDED.checkout_request_id,
+        last_query=EXCLUDED.last_query,
+        receipt_email_sent=EXCLUDED.receipt_email_sent`,
+        [
+            b.id,
+            b.customerId || null,
+            b.email || '',
+            b.name,
+            b.phone,
+            b.service,
+            b.location,
+            b.amount,
+            b.accountRef,
+            b.status,
+            b.createdAt,
+            b.paidAt || null,
+            b.receipt || '',
+            b.checkoutRequestId || null,
+            b.lastQuery || null,
+            Boolean(b.receiptEmailSent)
+        ]
+    );
+}
+
+async function initDatabase() {
+    if (!process.env.DATABASE_URL) {
+        throw new Error(
+            'DATABASE_URL is required. Add a PostgreSQL database on Render.'
+        );
+    }
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS customers (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS customer_bookings (
+            booking_id TEXT PRIMARY KEY,
+            customer_id BIGINT REFERENCES customers(id) ON DELETE SET NULL,
+            email TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            service TEXT NOT NULL,
+            location TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            account_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at BIGINT NOT NULL,
+            paid_at BIGINT,
+            receipt TEXT NOT NULL DEFAULT '',
+            checkout_request_id TEXT UNIQUE,
+            last_query BIGINT,
+            receipt_email_sent BOOLEAN NOT NULL DEFAULT FALSE
+        );
+
+        CREATE INDEX IF NOT EXISTS customer_bookings_customer_idx
+        ON customer_bookings(customer_id);
+    `);
+
+    const result = await pool.query('SELECT * FROM customer_bookings');
+
+    for (const row of result.rows) {
+        const b = {
+            id: row.booking_id,
+            customerId: row.customer_id == null
+                ? null
+                : String(row.customer_id),
+            email: row.email,
+            name: row.name,
+            phone: row.phone,
+            service: row.service,
+            location: row.location,
+            amount: Number(row.amount),
+            accountRef: row.account_ref,
+            status: row.status,
+            createdAt: Number(row.created_at),
+            paidAt: row.paid_at == null
+                ? null
+                : Number(row.paid_at),
+            receipt: row.receipt || '',
+            checkoutRequestId: row.checkout_request_id || undefined,
+            lastQuery: row.last_query == null
+                ? 0
+                : Number(row.last_query),
+            receiptEmailSent: Boolean(row.receipt_email_sent)
+        };
+
+        if (
+            b.status === 'paid' ||
+            Date.now() - b.createdAt < 24 * 60 * 60 * 1000
+        ) {
+            bookings.set(b.id, b);
+
+            if (b.checkoutRequestId) {
+                byCheckout.set(b.checkoutRequestId, b);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------
-// Email notifications & PDF generation
+// Email notifications (Gmail via Nodemailer)
 // ---------------------------------------------------------------
+
 const mailer = nodemailer.createTransport({
     service: 'gmail',
     connectionTimeout: 8000,
@@ -138,122 +255,103 @@ function esc(value = '') {
 }
 
 function flat(value) {
-    return Array.isArray(value) ? value.join(', ') : (value || '');
+    return Array.isArray(value)
+        ? value.join(', ')
+        : (value || '');
 }
 
-function generatePdfBuffer(bookingData) {
-    return new Promise((resolve, reject) => {
-        if (!PDFDocument) return reject(new Error('PDFKit not available'));
-        const doc = new PDFDocument({ size: 'A4', margin: 50 });
-        let buffers = [];
-        doc.on('data', chunk => buffers.push(chunk));
-        doc.on('end', () => resolve(Buffer.concat(buffers)));
+async function notify(subject, fields) {
+    const cleanSubject = String(subject)
+        .replace(/[\r\n]+/g, ' ')
+        .slice(0, 150);
 
-        doc.fillColor('#0284c7').fontSize(22).text('TENCENT INNOVATIONS', { align: 'center' });
-        doc.fillColor('#64748b').fontSize(10).text('Rangwe, Homa Bay County | Tel: 0740 311 014 | tencentbz@gmail.com', { align: 'center' });
-        doc.moveDown(2);
-
-        doc.fillColor('#0f172a').fontSize(16).text('OFFICIAL PAYMENT RECEIPT', { align: 'center' });
-        doc.moveDown(1.5);
-
-        doc.fontSize(12);
-        const dateStr = new Date(bookingData.paidAt || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-
-        const rows = [
-            ['Reference / Account:', bookingData.accountRef],
-            ['Client Name:', bookingData.name],
-            ['Phone Number:', bookingData.phone],
-            ['Service Rendered:', bookingData.service],
-            ['Location:', bookingData.location],
-            ['Amount Paid:', `KES ${bookingData.amount}`],
-            ['M-Pesa Receipt:', bookingData.receipt || 'Confirmed via Daraja'],
-            ['Date & Time:', dateStr],
-            ['Payment Status:', 'PAID & CONFIRMED']
-        ];
-
-        let y = doc.y;
-        rows.forEach(([label, val]) => {
-            doc.font('Helvetica-Bold').text(label, 50, y, { width: 160 });
-            doc.font('Helvetica').text(val, 220, y, { width: 320 });
-            y += 24;
-        });
-
-        doc.moveDown(4);
-        doc.fontSize(10).fillColor('#64748b').text('Thank you for choosing Tencent Innovations. This is an electronically generated receipt.', 50, y + 40, { align: 'center', width: 500 });
-
-        doc.end();
-    });
-}
-
-async function notify(subject, fields, userEmail = null, pdfBuffer = null) {
-    const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
     const rows = Object.entries(fields)
         .map(([label, val]) => {
             const safe = esc(flat(val));
+
             const display = /^https:\/\//.test(safe)
                 ? `<a href="${safe}">Tap to open</a>`
                 : /phone/i.test(label)
                     ? `<a href="tel:${safe}">${safe}</a>`
                     : safe;
+
             return `<p><strong>${esc(label)}:</strong> ${display}</p>`;
         })
         .join('');
-    const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
-    console.log('LEAD:', JSON.stringify({ subject: cleanSubject, fields, time }));
+    const time = new Date().toLocaleString('en-KE', {
+        timeZone: 'Africa/Nairobi'
+    });
+
+    console.log('LEAD:', JSON.stringify({
+        subject: cleanSubject,
+        fields,
+        time
+    }));
 
     const sendTelegram = async () => {
-        if (!process.env.TELEGRAM_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
-        const lines = Object.entries(fields).map(([label, val]) => `${label}: ${flat(val)}`);
-        const text = `${cleanSubject}\n\n${lines.join('\n')}\n\n${time} (EAT)`.slice(0, 4000);
-        const resp = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text }),
-            signal: AbortSignal.timeout(8000)
-        });
-        if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
+        if (!process.env.TELEGRAM_TOKEN ||
+            !process.env.TELEGRAM_CHAT_ID) return;
+
+        const lines = Object.entries(fields)
+            .map(([label, val]) => `${label}: ${flat(val)}`);
+
+        const text = `${cleanSubject}\n\n${lines.join('\n')}\n\n${time} (EAT)`
+            .slice(0, 4000);
+
+        const resp = await fetch(
+            `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: process.env.TELEGRAM_CHAT_ID,
+                    text
+                }),
+                signal: AbortSignal.timeout(8000)
+            }
+        );
+
+        if (!resp.ok) {
+            throw new Error(`Telegram HTTP ${resp.status}`);
+        }
     };
 
-    const sendAdminEmail = async () => {
-        if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
-        let attachments = [];
-        if (pdfBuffer) {
-            attachments.push({ filename: 'Tencent-Receipt.pdf', content: pdfBuffer });
-        }
+    const sendEmail = async () => {
+        if (!process.env.GMAIL_USER ||
+            !process.env.GMAIL_APP_PASSWORD) return;
+
         await mailer.sendMail({
             from: `"Tencent Website" <${process.env.GMAIL_USER}>`,
             to: process.env.NOTIFY_TO || process.env.GMAIL_USER,
             subject: cleanSubject,
-            html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`,
-            attachments
+            html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`
         });
     };
+	    const results = await Promise.allSettled([
+        sendTelegram(),
+        sendEmail()
+    ]);
 
-    const sendUserEmail = async () => {
-        if (!userEmail || !process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) return;
-        let attachments = [];
-        if (pdfBuffer) {
-            attachments.push({ filename: 'Tencent-Receipt.pdf', content: pdfBuffer });
-        }
-        await mailer.sendMail({
-            from: `"Tencent Innovations" <${process.env.GMAIL_USER}>`,
-            to: userEmail,
-            subject: `Receipt & Booking Confirmation: ${cleanSubject}`,
-            html: `<h3>Hello, your booking is confirmed!</h3>${rows}<p>Please find attached your official payment receipt PDF.</p><p style="color:#888">Tencent Innovations | Rangwe, Homa Bay County</p>`,
-            attachments
-        });
-    };
+    if (results[0].status === 'rejected') {
+        console.error(
+            'Telegram notification failed:',
+            results[0].reason?.message
+        );
+    }
 
-    const results = await Promise.allSettled([sendTelegram(), sendAdminEmail(), sendUserEmail()]);
-    if (results[0].status === 'rejected') console.error('Telegram failed:', results[0].reason?.message);
-    if (results[1].status === 'rejected') console.error('Admin email failed:', results[1].reason?.message);
-    if (results[2].status === 'rejected') console.error('User email failed:', results[2].reason?.message);
+    if (results[1].status === 'rejected') {
+        console.error(
+            'Notification email failed:',
+            results[1].reason?.message
+        );
+    }
 }
 
 // ---------------------------------------------------------------
-// M-Pesa (Daraja) Configuration & Helpers
+// M-Pesa (Daraja) STK Push
 // ---------------------------------------------------------------
+
 const MPESA = {
     production: process.env.MPESA_ENV === 'production',
     key: process.env.MPESA_CONSUMER_KEY,
@@ -263,13 +361,20 @@ const MPESA = {
     callbackSecret: process.env.MPESA_CALLBACK_SECRET,
     publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '')
 };
+
 MPESA.baseUrl = process.env.MPESA_BASE_URL ||
-    (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
+    (MPESA.production
+        ? 'https://api.safaricom.co.ke'
+        : 'https://sandbox.safaricom.co.ke');
 
 function mpesaConfigured() {
     return Boolean(
-        MPESA.key && MPESA.secret && MPESA.shortcode && MPESA.passkey &&
-        MPESA.callbackSecret && MPESA.callbackSecret.length >= 16 &&
+        MPESA.key &&
+        MPESA.secret &&
+        MPESA.shortcode &&
+        MPESA.passkey &&
+        MPESA.callbackSecret &&
+        MPESA.callbackSecret.length >= 16 &&
         MPESA.publicBaseUrl.startsWith('https://')
     );
 }
@@ -284,1102 +389,2349 @@ const SERVICE_PRICES = {
 };
 
 function normalizePhone(raw) {
-    let p = String(raw || '').replace(/[\s\-()]/g, '');
-    if (p.startsWith('+')) p = p.slice(1);
-    if (/^0[17]\d{8}$/.test(p)) p = '254' + p.slice(1);
-    else if (/^[17]\d{8}$/.test(p)) p = '254' + p;
-    return /^254[17]\d{8}$/.test(p) ? p : null;
+    let phone = String(raw || '').replace(/[\s\-()]/g, '');
+
+    if (phone.startsWith('+')) {
+        phone = phone.slice(1);
+    }
+
+    if (/^0[17]\d{8}$/.test(phone)) {
+        phone = '254' + phone.slice(1);
+    } else if (/^[17]\d{8}$/.test(phone)) {
+        phone = '254' + phone;
+    }
+
+    return /^254[17]\d{8}$/.test(phone) ? phone : null;
 }
 
+const bookings = new Map();
+const byCheckout = new Map();
 const phoneAttempts = new Map();
 
 function phoneAttemptAllowed(phone) {
     const now = Date.now();
-    const recent = (phoneAttempts.get(phone) || []).filter(t => now - t < 60 * 60 * 1000);
-    if (recent.length >= 3) { phoneAttempts.set(phone, recent); return false; }
+
+    const recent = (phoneAttempts.get(phone) || [])
+        .filter(time => now - time < 60 * 60 * 1000);
+
+    if (recent.length >= 3) {
+        phoneAttempts.set(phone, recent);
+        return false;
+    }
+
     recent.push(now);
     phoneAttempts.set(phone, recent);
     return true;
 }
 
-let tokenCache = { value: null, expiresAt: 0 };
+setInterval(() => {
+    const now = Date.now();
+
+    for (const [id, booking] of bookings) {
+        if (
+            booking.status !== 'paid' &&
+            now - booking.createdAt > 24 * 60 * 60 * 1000
+        ) {
+            bookings.delete(id);
+
+            if (booking.checkoutRequestId) {
+                byCheckout.delete(booking.checkoutRequestId);
+            }
+        }
+    }
+
+    for (const [phone, attempts] of phoneAttempts) {
+        const recent = attempts.filter(
+            time => now - time < 60 * 60 * 1000
+        );
+
+        if (recent.length) {
+            phoneAttempts.set(phone, recent);
+        } else {
+            phoneAttempts.delete(phone);
+        }
+    }
+}, 30 * 60 * 1000).unref();
+
+let tokenCache = {
+    value: null,
+    expiresAt: 0
+};
+
 async function getAccessToken() {
-    if (tokenCache.value && Date.now() < tokenCache.expiresAt) return tokenCache.value;
-    const auth = Buffer.from(`${MPESA.key}:${MPESA.secret}`).toString('base64');
-    const resp = await fetch(`${MPESA.baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
-        headers: { Authorization: `Basic ${auth}` },
-        signal: AbortSignal.timeout(15000)
-    });
-    if (!resp.ok) throw new Error(`Daraja authentication failed (HTTP ${resp.status})`);
-    const data = await resp.json();
+    if (
+        tokenCache.value &&
+        Date.now() < tokenCache.expiresAt
+    ) {
+        return tokenCache.value;
+    }
+
+    const auth = Buffer.from(
+        `${MPESA.key}:${MPESA.secret}`
+    ).toString('base64');
+
+    const response = await fetch(
+        `${MPESA.baseUrl}/oauth/v1/generate?grant_type=client_credentials`,
+        {
+            headers: {
+                Authorization: `Basic ${auth}`
+            },
+            signal: AbortSignal.timeout(15000)
+        }
+    );
+
+    if (!response.ok) {
+        throw new Error(
+            `Daraja authentication failed (HTTP ${response.status})`
+        );
+    }
+
+    const data = await response.json();
+
     tokenCache = {
         value: data.access_token,
-        expiresAt: Date.now() + (Number(data.expires_in || 3599) - 60) * 1000
+        expiresAt: Date.now() +
+            (Number(data.expires_in || 3599) - 60) * 1000
     };
+
     return tokenCache.value;
 }
 
 function darajaTimestamp() {
-    return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
-}
-function darajaPassword(timestamp) {
-    return Buffer.from(`${MPESA.shortcode}${MPESA.passkey}${timestamp}`).toString('base64');
+    return new Date(Date.now() + 3 * 60 * 60 * 1000)
+        .toISOString()
+        .replace(/\D/g, '')
+        .slice(0, 14);
 }
 
-async function darajaPost(path, payload) {
+function darajaPassword(timestamp) {
+    return Buffer.from(
+        `${MPESA.shortcode}${MPESA.passkey}${timestamp}`
+    ).toString('base64');
+}
+
+async function darajaPost(endpoint, payload) {
     const token = await getAccessToken();
-    const resp = await fetch(`${MPESA.baseUrl}${path}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(20000)
-    });
+
+    const response = await fetch(
+        `${MPESA.baseUrl}${endpoint}`,
+        {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(20000)
+        }
+    );
+
     let data = {};
-    try { data = await resp.json(); } catch (_) {}
-    if (!resp.ok) {
-        const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
-        err.status = resp.status;
-        throw err;
+
+    try {
+        data = await response.json();
+    } catch (_) {
+        // The response was not valid JSON.
     }
+
+    if (!response.ok) {
+        const error = new Error(
+            data.errorMessage ||
+            data.ResultDesc ||
+            `Daraja HTTP ${response.status}`
+        );
+
+        error.status = response.status;
+        throw error;
+    }
+
     return data;
 }
 
 async function stkPush(booking) {
     const timestamp = darajaTimestamp();
-    const data = await darajaPost('/mpesa/stkpush/v1/processrequest', {
-        BusinessShortCode: MPESA.shortcode,
-        Password: darajaPassword(timestamp),
-        Timestamp: timestamp,
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: booking.amount,
-        PartyA: booking.phone,
-        PartyB: MPESA.shortcode,
-        PhoneNumber: booking.phone,
-        CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: booking.accountRef,
-        TransactionDesc: 'Survey fee'
-    });
-    if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
+
+    const data = await darajaPost(
+        '/mpesa/stkpush/v1/processrequest',
+        {
+            BusinessShortCode: MPESA.shortcode,
+            Password: darajaPassword(timestamp),
+            Timestamp: timestamp,
+            TransactionType: 'CustomerPayBillOnline',
+            Amount: booking.amount,
+            PartyA: booking.phone,
+            PartyB: MPESA.shortcode,
+            PhoneNumber: booking.phone,
+            CallBackURL:
+                `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
+            AccountReference: booking.accountRef,
+            TransactionDesc: 'Tencent Innovations service payment'
+        }
+    );
+
+    if (String(data.ResponseCode) !== '0') {
+        throw new Error(
+            data.ResponseDescription || 'STK push was rejected'
+        );
+    }
+
     return data;
 }
 
 async function stkQuery(checkoutRequestId) {
     const timestamp = darajaTimestamp();
-    return darajaPost('/mpesa/stkpushquery/v1/query', {
-        BusinessShortCode: MPESA.shortcode,
-        Password: darajaPassword(timestamp),
-        Timestamp: timestamp,
-        CheckoutRequestID: checkoutRequestId
-    });
+
+    return darajaPost(
+        '/mpesa/stkpushquery/v1/query',
+        {
+            BusinessShortCode: MPESA.shortcode,
+            Password: darajaPassword(timestamp),
+            Timestamp: timestamp,
+            CheckoutRequestID: checkoutRequestId
+        }
+    );
 }
 
-function bookingFields(b, extra = {}) {
+function bookingFields(booking, extra = {}) {
     return {
-        Name: b.name,
-        Phone: b.phone,
-        Service: b.service,
-        Location: b.location,
-        Amount: `KES ${b.amount}`,
-        Reference: b.accountRef,
+        Name: booking.name,
+        Phone: booking.phone,
+        Service: booking.service,
+        Location: booking.location,
+        Amount: `KES ${booking.amount}`,
+        Reference: booking.accountRef,
         ...extra
     };
 }
 
-// Signed booking links
-const LINK_SECRET = process.env.LINK_SECRET || MPESA.callbackSecret || '';
+// ---------------------------------------------------------------
+// Signed booking confirmation links
+// ---------------------------------------------------------------
+
+const LINK_SECRET =
+    process.env.LINK_SECRET ||
+    MPESA.callbackSecret ||
+    '';
+
 function linksEnabled() {
-    return LINK_SECRET.length >= 16 && MPESA.publicBaseUrl.startsWith('https://');
+    return (
+        LINK_SECRET.length >= 16 &&
+        MPESA.publicBaseUrl.startsWith('https://')
+    );
 }
+
 function signLinkPart(part) {
-    return crypto.createHmac('sha256', LINK_SECRET).update(part).digest('base64url');
+    return crypto
+        .createHmac('sha256', LINK_SECRET)
+        .update(part)
+        .digest('base64url');
 }
-function makeBookingLink(b, paid = true) {
+
+function makeBookingLink(booking, paid = true) {
     if (!linksEnabled()) return '';
-    const part = Buffer.from(JSON.stringify({
-        n: b.name, p: b.phone, s: b.service, a: b.amount,
-        r: paid ? (b.receipt || '') : '', f: b.accountRef, l: b.location,
-        t: paid ? (b.paidAt || Date.now()) : b.createdAt,
-        i: b.id, k: paid ? 1 : 0
-    })).toString('base64url');
+
+    const part = Buffer.from(
+        JSON.stringify({
+            n: booking.name,
+            p: booking.phone,
+            s: booking.service,
+            a: booking.amount,
+            r: paid ? (booking.receipt || '') : '',
+            f: booking.accountRef,
+            l: booking.location,
+            t: paid
+                ? (booking.paidAt || Date.now())
+                : booking.createdAt,
+            i: booking.id,
+            k: paid ? 1 : 0
+        })
+    ).toString('base64url');
+
     return `${MPESA.publicBaseUrl}/booking/${part}.${signLinkPart(part)}`;
 }
+
 function readBookingLink(token) {
     if (LINK_SECRET.length < 16) return null;
+
     const dot = token.lastIndexOf('.');
+
     if (dot < 1) return null;
+
     const part = token.slice(0, dot);
     const given = Buffer.from(token.slice(dot + 1));
     const expected = Buffer.from(signLinkPart(part));
-    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
-    try { return JSON.parse(Buffer.from(part, 'base64url').toString('utf8')); } catch (_) { return null; }
-}
 
-async function markPaid(bookingId, receipt, verified) {
-    const res = await pool.query('SELECT * FROM bookings WHERE id = $1', [bookingId]);
-    if (res.rows.length === 0) return;
-    let b = res.rows[0];
-    if (b.status === 'paid') return;
-
-    const paidAt = Date.now();
-    await pool.query('UPDATE bookings SET status = $1, receipt = $2, paid_at = $3 WHERE id = $4', ['paid', receipt || '', paidAt, bookingId]);
-
-    b.status = 'paid';
-    b.receipt = receipt || '';
-    b.paidAt = paidAt;
-    b.link = makeBookingLink(b);
-
-    let userEmail = null;
-    if (b.user_id) {
-        const uRes = await pool.query('SELECT email FROM users WHERE id = $1', [b.user_id]);
-        if (uRes.rows.length > 0) userEmail = uRes.rows[0].email;
+    if (
+        given.length !== expected.length ||
+        !crypto.timingSafeEqual(given, expected)
+    ) {
+        return null;
     }
 
-    let pdfBuffer = null;
-    if (PDFDocument) {
-        try {
-            pdfBuffer = await generatePdfBuffer({
-                accountRef: b.account_ref,
-                name: b.name,
-                phone: b.phone,
-                service: b.service,
-                location: b.location,
-                amount: b.amount,
-                receipt: b.receipt,
-                paidAt: b.paid_at
-            });
-        } catch (e) {
-            console.error('PDF generation error:', e.message);
+    try {
+        return JSON.parse(
+            Buffer.from(part, 'base64url').toString('utf8')
+        );
+    } catch (_) {
+        return null;
+    }
+}
+
+app.get('/booking/:token', (req, res) => {
+    const data = readBookingLink(req.params.token);
+
+    if (!data || data.k !== 1 || !data.i) {
+        return res.status(404).send(
+            'This booking link is invalid or has expired.'
+        );
+    }
+
+    const content = `
+        <h2>Booking confirmed</h2>
+        <div class="form-container">
+            <p><strong>Customer:</strong> ${esc(data.n)}</p>
+            <p><strong>Service:</strong> ${esc(data.s)}</p>
+            <p><strong>Reference:</strong> ${esc(data.f)}</p>
+            <p><strong>Amount:</strong> KES ${Number(data.a).toLocaleString('en-KE')}</p>
+            <p><strong>M-Pesa receipt:</strong> ${esc(data.r || 'Confirmed')}</p>
+            <p><strong>Status:</strong> PAID</p>
+            <p>Sign in to download your PDF receipt.</p>
+            <a class="cta-btn" href="/login">Sign in</a>
+        </div>
+    `;
+
+    res.send(
+        renderPage({
+            title: 'Booking Confirmation',
+            activeNav: '',
+            content
+        })
+    );
+});
+// ---------------------------------------------------------------
+// PDF receipt generation
+// ---------------------------------------------------------------
+
+function generateReceiptPDF(booking) {
+    return new Promise((resolve, reject) => {
+        if (!PDFDocument) {
+            return reject(
+                new Error('PDFKit is not installed.')
+            );
         }
-    }
 
-    const pdfDownloadUrl = `${MPESA.publicBaseUrl}/payments/receipt/${b.id}/download.pdf`;
-    const extra = {
-        'M-Pesa receipt': receipt || '(see M-Pesa statement)',
-        Verified: verified ? 'Yes, confirmed with Safaricom' : 'Callback only'
-    };
-    if (pdfBuffer) extra['Download Receipt PDF'] = pdfDownloadUrl;
-    if (b.link) extra['Booking link'] = b.link;
+        try {
+            const doc = new PDFDocument({
+                size: 'A4',
+                margin: 55,
+                info: {
+                    Title: 'Tencent Innovations Payment Receipt',
+                    Author: 'Tencent Innovations'
+                }
+            });
 
-    await notify(`✅ PAID: ${b.service} - ${b.name}`, bookingFields(b, extra), userEmail, pdfBuffer);
+            const chunks = [];
+
+            doc.on('data', chunk => chunks.push(chunk));
+            doc.on('end', () => resolve(Buffer.concat(chunks)));
+            doc.on('error', reject);
+
+            doc
+                .fontSize(22)
+                .fillColor('#123b68')
+                .text('TENCENT INNOVATIONS', { align: 'center' });
+
+            doc
+                .moveDown(0.5)
+                .fontSize(12)
+                .fillColor('#555555')
+                .text('OFFICIAL PAYMENT RECEIPT', { align: 'center' });
+
+            doc.moveDown(2);
+
+            doc
+                .fontSize(11)
+                .fillColor('#222222')
+                .text(`Receipt reference: ${booking.accountRef}`)
+                .text(`Booking ID: ${booking.id}`)
+                .text(`Date paid: ${new Date(
+                    booking.paidAt || Date.now()
+                ).toLocaleString('en-KE', {
+                    timeZone: 'Africa/Nairobi'
+                })}`);
+
+            doc.moveDown();
+
+            doc
+                .fontSize(13)
+                .fillColor('#123b68')
+                .text('CUSTOMER DETAILS');
+
+            doc
+                .moveDown(0.5)
+                .fontSize(11)
+                .fillColor('#222222')
+                .text(`Customer name: ${booking.name}`)
+                .text(`Email: ${booking.email}`)
+                .text(`Phone: ${booking.phone}`);
+
+            doc.moveDown();
+
+            doc
+                .fontSize(13)
+                .fillColor('#123b68')
+                .text('PAYMENT DETAILS');
+
+            doc
+                .moveDown(0.5)
+                .fontSize(11)
+                .fillColor('#222222')
+                .text(`Service: ${booking.service}`)
+                .text(`Location: ${booking.location}`)
+                .text(`Amount paid: KES ${Number(
+                    booking.amount
+                ).toLocaleString('en-KE')}`)
+                .text(`M-Pesa receipt: ${booking.receipt || 'Confirmed'}`)
+                .text('Payment status: PAID');
+
+            doc.moveDown(3);
+
+            doc
+                .fontSize(10)
+                .fillColor('#555555')
+                .text(
+                    'Thank you for choosing Tencent Innovations. ' +
+                    'Keep this receipt for your records.',
+                    { align: 'center' }
+                );
+
+            doc.moveDown(2);
+
+            doc
+                .fontSize(9)
+                .fillColor('#777777')
+                .text(
+                    'This receipt was generated electronically following payment verification.',
+                    { align: 'center' }
+                );
+
+            doc.end();
+        } catch (error) {
+            reject(error);
+        }
+    });
 }
 
-async function markFailed(bookingId, reason) {
-    await pool.query('UPDATE bookings SET status = $1 WHERE id = $2 AND status = $3', ['failed', bookingId, 'pending']);
-    console.log('PAYMENT NOT COMPLETED:', JSON.stringify({ id: bookingId, reason }));
+// ---------------------------------------------------------------
+// Customer payment receipt email
+// ---------------------------------------------------------------
+
+async function sendCustomerReceipt(booking) {
+    if (booking.receiptEmailSent) return;
+
+    if (!process.env.GMAIL_USER ||
+        !process.env.GMAIL_APP_PASSWORD) {
+        throw new Error('Email credentials are not configured.');
+    }
+
+    if (!booking.email) {
+        throw new Error('Customer email address is missing.');
+    }
+
+    const pdf = await generateReceiptPDF(booking);
+
+    await mailer.sendMail({
+        from: `"Tencent Innovations" <${process.env.GMAIL_USER}>`,
+        to: booking.email,
+        subject: 'Your Tencent Innovations payment receipt',
+        text:
+            `Hello ${booking.name},\n\n` +
+            `Your payment has been verified successfully.\n\n` +
+            `Service: ${booking.service}\n` +
+            `Amount: KES ${booking.amount}\n` +
+            `M-Pesa receipt: ${booking.receipt || 'Confirmed'}\n\n` +
+            'Your PDF receipt is attached.\n\n' +
+            'Thank you for choosing Tencent Innovations.',
+        attachments: [
+            {
+                filename: `Tencent-Receipt-${booking.id}.pdf`,
+                content: pdf,
+                contentType: 'application/pdf'
+            }
+        ]
+    });
+
+    booking.receiptEmailSent = true;
+    await persistBooking(booking);
+}
+
+// ---------------------------------------------------------------
+// Mark a booking as paid only after verification
+// ---------------------------------------------------------------
+
+async function markPaid(booking, receipt, verified) {
+    if (!verified) {
+        throw new Error('Payment has not been verified.');
+    }
+
+    const alreadyPaid = booking.status === 'paid';
+
+    if (alreadyPaid && booking.receiptEmailSent) {
+        return;
+    }
+
+    const previous = {
+        status: booking.status,
+        receipt: booking.receipt,
+        paidAt: booking.paidAt,
+        link: booking.link
+    };
+
+    booking.status = 'paid';
+    booking.receipt = receipt || booking.receipt || '';
+    booking.paidAt = booking.paidAt || Date.now();
+    booking.link = makeBookingLink(booking, true);
+
+    // Save the verified payment before sending a receipt.
+    try {
+        await persistBooking(booking);
+    } catch (error) {
+        Object.assign(booking, previous);
+        throw error;
+    }
+
+    try {
+        await sendCustomerReceipt(booking);
+    } catch (error) {
+        console.error(
+            'Customer receipt email failed; retry is required:',
+            error.message
+        );
+    }
+
+    await notify(
+        'M-Pesa payment confirmed',
+        bookingFields(booking, {
+            'M-Pesa receipt': booking.receipt,
+            'Booking confirmation': booking.link || 'Not configured'
+        })
+    );
+}
+
+// ---------------------------------------------------------------
+// Mark failed payments
+// ---------------------------------------------------------------
+
+async function markFailed(booking, description) {
+    if (!booking || booking.status === 'paid') return;
+
+    booking.status = 'failed';
+    booking.failureReason = String(
+        description || 'Payment was not completed.'
+    ).slice(0, 300);
+
+    await persistBooking(booking);
+
+    await notify(
+        'M-Pesa payment failed',
+        bookingFields(booking, {
+            Reason: booking.failureReason
+        })
+    );
+}
+
+// ---------------------------------------------------------------
+// M-Pesa callback processing
+// ---------------------------------------------------------------
+
+function safeSecretEqual(received, expected) {
+    const a = Buffer.from(String(received || ''));
+    const b = Buffer.from(String(expected || ''));
+
+    return (
+        a.length === b.length &&
+        a.length > 0 &&
+        crypto.timingSafeEqual(a, b)
+    );
 }
 
 async function handleCallback(body) {
-    const cb = body && body.Body && body.Body.stkCallback;
-    if (!cb) return;
-    const checkoutId = cb.CheckoutRequestID;
+    const callback = body?.Body?.stkCallback;
 
-    const res = await pool.query('SELECT * FROM bookings WHERE checkout_request_id = $1', [checkoutId]);
-    if (res.rows.length === 0) return;
-    const booking = res.rows[0];
+    if (!callback) {
+        throw new Error('Invalid M-Pesa callback structure.');
+    }
 
-    const succeeded = Number(cb.ResultCode) === 0;
-    const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
-    const meta = name => { const it = items.find(i => i.Name === name); return it ? it.Value : undefined; };
-    const receipt = String(meta('MpesaReceiptNumber') || '');
+    const checkoutId = callback.CheckoutRequestID;
+    const booking = byCheckout.get(checkoutId);
+
+    if (!booking) {
+        console.error(
+            'Callback received for unknown CheckoutRequestID:',
+            checkoutId
+        );
+        return;
+    }
+
+    // Never trust the callback alone. Query Daraja for the final status.
+    let query;
+
+    try {
+        query = await stkQuery(checkoutId);
+    } catch (error) {
+        booking.status = 'review';
+        await persistBooking(booking);
+        throw error;
+    }
+
+    if (String(query.ResultCode) === '0') {
+        const callbackItems =
+            callback.CallbackMetadata?.Item || [];
+
+        const callbackAmount = callbackItems.find(
+            item => item.Name === 'Amount'
+        )?.Value;
+
+        const callbackReceipt = callbackItems.find(
+            item => item.Name === 'MpesaReceiptNumber'
+        )?.Value;
+
+        if (
+            callbackAmount !== undefined &&
+            Number(callbackAmount) !== Number(booking.amount)
+        ) {
+            booking.status = 'review';
+            await persistBooking(booking);
+            throw new Error('M-Pesa amount does not match booking amount.');
+        }
+
+        await markPaid(
+            booking,
+            callbackReceipt || '',
+            true
+        );
+    } else {
+        const resultCode = String(callback.ResultCode);
+
+        if (resultCode === '1032') {
+            await markFailed(booking, 'Payment cancelled by customer.');
+        } else if (resultCode === '1037') {
+            await markFailed(booking, 'M-Pesa request timed out.');
+        } else {
+            await markFailed(
+                booking,
+                callback.ResultDesc || 'M-Pesa payment was not completed.'
+            );
+        }
+    }
+}
+
+// Callback URL is protected by a secret path segment.
+app.post('/payments/cb/:secret', async (req, res) => {
+    if (!safeSecretEqual(
+        req.params.secret,
+        MPESA.callbackSecret
+    )) {
+        return res.sendStatus(404);
+    }
+
+    // Acknowledge quickly to avoid repeated Daraja delivery.
+    res.json({
+        ResultCode: 0,
+        ResultDesc: 'Accepted'
+    });
+
+    try {
+        await handleCallback(req.body);
+    } catch (error) {
+        console.error(
+            'M-Pesa callback processing error:',
+            error.message
+        );
+    }
+});
+
+// ---------------------------------------------------------------
+// Payment status verification
+// ---------------------------------------------------------------
+
+async function verifyBookingPayment(booking) {
+    if (!booking || !booking.checkoutRequestId) {
+        return booking;
+    }
 
     if (booking.status === 'paid') {
-        if (succeeded && receipt && !booking.receipt) {
-            await pool.query('UPDATE bookings SET receipt = $1 WHERE id = $2', [receipt, booking.id]);
-        }
-        return;
-    }
-    if (!succeeded) { await markFailed(booking.id, cb.ResultDesc); return; }
-
-    if (Number(meta('Amount')) !== booking.amount) {
-        await pool.query('UPDATE bookings SET status = $1 WHERE id = $2', ['review', booking.id]);
-        await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
-            'Amount reported': String(meta('Amount')),
-            'M-Pesa receipt': receipt
-        }));
-        return;
+        return booking;
     }
 
-    let verified = false;
-    try {
-        const q = await stkQuery(booking.checkout_request_id);
-        verified = String(q.ResultCode) === '0';
-        if (!verified) {
-            await pool.query('UPDATE bookings SET status = $1 WHERE id = $2', ['review', booking.id]);
-            await notify(`⚠️ CHECK PAYMENT: callback and status query disagree for ${booking.name}`, bookingFields(booking, {
-                'M-Pesa receipt': receipt,
-                'Query result': `${q.ResultCode} ${q.ResultDesc || ''}`
-            }));
-            return;
-        }
-    } catch (err) {
-        console.error('STK status query failed:', err.message);
+    const now = Date.now();
+
+    if (
+        booking.lastQuery &&
+        now - booking.lastQuery < 15000
+    ) {
+        return booking;
     }
-    await markPaid(booking.id, receipt, verified);
+
+    booking.lastQuery = now;
+    await persistBooking(booking);
+
+    const result = await stkQuery(
+        booking.checkoutRequestId
+    );
+
+    if (String(result.ResultCode) === '0') {
+        await markPaid(
+            booking,
+            result.MpesaReceiptNumber || booking.receipt || '',
+            true
+        );
+    } else if (
+        ['1032', '1037'].includes(String(result.ResultCode))
+    ) {
+        await markFailed(
+            booking,
+            result.ResultDesc || 'Payment was not completed.'
+        );
+    }
+
+    return booking;
 }
+// ---------------------------------------------------------------
+// Payment status endpoint
+// ---------------------------------------------------------------
 
-app.post('/payments/cb/:secret', (req, res) => {
-    const given = Buffer.from(String(req.params.secret));
-    const expected = Buffer.from(String(MPESA.callbackSecret || ''));
-    const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
-    if (!ok) return res.sendStatus(404);
+app.get('/payments/status/:id', requireLogin, async (req, res) => {
+    try {
+        let booking = bookings.get(String(req.params.id));
 
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-    handleCallback(req.body).catch(err => console.error('Callback error:', err.message));
-});
+        // Recover older bookings from PostgreSQL if not in memory.
+        if (!booking) {
+            const result = await pool.query(
+                `SELECT * FROM customer_bookings
+                 WHERE booking_id = $1 AND customer_id = $2`,
+                [String(req.params.id), req.session.user.id]
+            );
 
-app.get('/payments/status/:id', async (req, res) => {
-    const r = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
-    if (r.rows.length === 0) return res.status(404).json({ status: 'unknown' });
-    let b = r.rows[0];
+            if (result.rowCount) {
+                const row = result.rows[0];
 
-    if (b.status === 'pending' && b.checkout_request_id && Date.now() - Number(b.created_at) > 30000) {
-        try {
-            const q = await stkQuery(b.checkout_request_id);
-            if (String(q.ResultCode) === '0') {
-                await markPaid(b.id, '', true);
-            } else if (q.ResultCode !== undefined && String(q.ResultCode) !== '' && String(q.ResultCode) !== '500.001.1001') {
-                await markFailed(b.id, q.ResultDesc || 'Payment cancelled');
+                booking = {
+                    id: row.booking_id,
+                    customerId: String(row.customer_id),
+                    email: row.email,
+                    name: row.name,
+                    phone: row.phone,
+                    service: row.service,
+                    location: row.location,
+                    amount: Number(row.amount),
+                    accountRef: row.account_ref,
+                    status: row.status,
+                    createdAt: Number(row.created_at),
+                    paidAt: row.paid_at
+                        ? Number(row.paid_at)
+                        : null,
+                    receipt: row.receipt || '',
+                    checkoutRequestId:
+                        row.checkout_request_id || undefined,
+                    lastQuery: row.last_query
+                        ? Number(row.last_query)
+                        : 0,
+                    receiptEmailSent:
+                        Boolean(row.receipt_email_sent)
+                };
+
+                bookings.set(booking.id, booking);
+
+                if (booking.checkoutRequestId) {
+                    byCheckout.set(
+                        booking.checkoutRequestId,
+                        booking
+                    );
+                }
             }
-        } catch (_) {}
-        const updated = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
-        b = updated.rows[0];
-    }
+        }
 
-    const paidLink = b.status === 'paid' ? (makeBookingLink(b) || '') : '';
-    const pdfUrl = b.status === 'paid' ? `/payments/receipt/${b.id}/download.pdf` : '';
-    res.json({ status: b.status, link: paidLink, pdf: pdfUrl });
-});
+        if (
+            !booking ||
+            String(booking.customerId) !==
+                String(req.session.user.id)
+        ) {
+            return res.status(404).json({
+                status: 'unknown'
+            });
+        }
 
-app.get('/payments/receipt/:id/download.pdf', async (req, res) => {
-    const r = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
-    if (r.rows.length === 0 || r.rows[0].status !== 'paid') {
-        return res.status(404).send('Receipt not available or payment pending.');
-    }
-    const b = r.rows[0];
-    if (!PDFDocument) return res.status(501).send('PDF generation disabled.');
+        if (booking.status === 'pending') {
+            try {
+                await verifyBookingPayment(booking);
+            } catch (error) {
+                console.error(
+                    'Payment status verification failed:',
+                    error.message
+                );
+            }
+        }
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=Tencent-Receipt-${b.account_ref}.pdf`);
-
-    try {
-        const buf = await generatePdfBuffer({
-            accountRef: b.account_ref,
-            name: b.name,
-            phone: b.phone,
-            service: b.service,
-            location: b.location,
-            amount: b.amount,
-            receipt: b.receipt,
-            paidAt: b.paid_at
+        return res.json({
+            id: booking.id,
+            status: booking.status,
+            service: booking.service,
+            amount: booking.amount,
+            receipt: booking.receipt || '',
+            receiptEmailSent: Boolean(
+                booking.receiptEmailSent
+            )
         });
-        res.send(buf);
-    } catch (err) {
-        res.status(500).send('Error generating PDF receipt.');
+    } catch (error) {
+        console.error('Payment status error:', error.message);
+
+        return res.status(500).json({
+            error: 'Unable to check payment status.'
+        });
     }
 });
 
-// Authentication Middleware
-function requireAuth(req, res, next) {
-    if (!req.session.user) {
-        return res.redirect(`/login?redirect=${encodeURIComponent(req.originalUrl)}`);
+// ---------------------------------------------------------------
+// PDF receipt download
+// ---------------------------------------------------------------
+
+app.get(
+    '/payments/receipt/:id/download.pdf',
+    requireLogin,
+    async (req, res) => {
+        try {
+            let booking = bookings.get(String(req.params.id));
+
+            if (
+                !booking ||
+                String(booking.customerId) !==
+                    String(req.session.user.id)
+            ) {
+                const result = await pool.query(
+                    `SELECT * FROM customer_bookings
+                     WHERE booking_id = $1
+                     AND customer_id = $2
+                     AND status = 'paid'`,
+                    [
+                        String(req.params.id),
+                        req.session.user.id
+                    ]
+                );
+
+                if (result.rowCount) {
+                    const row = result.rows[0];
+
+                    booking = {
+                        id: row.booking_id,
+                        customerId: String(row.customer_id),
+                        email: row.email,
+                        name: row.name,
+                        phone: row.phone,
+                        service: row.service,
+                        location: row.location,
+                        amount: Number(row.amount),
+                        accountRef: row.account_ref,
+                        status: row.status,
+                        createdAt: Number(row.created_at),
+                        paidAt: row.paid_at
+                            ? Number(row.paid_at)
+                            : null,
+                        receipt: row.receipt || ''
+                    };
+                }
+            }
+
+            if (
+                !booking ||
+                booking.status !== 'paid' ||
+                String(booking.customerId) !==
+                    String(req.session.user.id)
+            ) {
+                return res.status(404).send(
+                    'Receipt not available or payment pending.'
+                );
+            }
+
+            if (!PDFDocument) {
+                return res.status(503).send(
+                    'PDF receipt service is unavailable.'
+                );
+            }
+
+            const pdf = await generateReceiptPDF(booking);
+
+            res.setHeader(
+                'Content-Type',
+                'application/pdf'
+            );
+
+            res.setHeader(
+                'Content-Disposition',
+                `attachment; filename="Tencent-Receipt-${booking.id}.pdf"`
+            );
+
+            return res.send(pdf);
+        } catch (error) {
+            console.error(
+                'Receipt download failed:',
+                error.message
+            );
+
+            return res.status(500).send(
+                'Unable to generate your receipt.'
+            );
+        }
     }
-    next();
-}
+);
 
 // ---------------------------------------------------------------
-// Layout Template Helper with Left Sidebar, Global Modal & Styling
+// Customer registration
 // ---------------------------------------------------------------
-function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) {
-    const user = req.session && req.session.user ? req.session.user : null;
-    return `
-        <!DOCTYPE html>
-        <html lang="en" data-theme="dark">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>${title} - Tencent Innovations</title>
-            <script>
-                (function() {
-                    const savedTheme = localStorage.getItem('theme') || 'dark';
-                    document.documentElement.setAttribute('data-theme', savedTheme);
-                })();
-            </script>
-            <style>
-                :root {
-                    --bg: #0b132b;
-                    --surface: #1c2541;
-                    --sidebar-bg: #060a17;
-                    --text: #ffffff;
-                    --muted: #94a3b8;
-                    --border: #334155;
-                    --primary: #0284c7;
-                    --accent: #10b981;
-                }
-                [data-theme="light"] {
-                    --bg: #f8fafc;
-                    --surface: #ffffff;
-                    --sidebar-bg: #ffffff;
-                    --text: #0f172a;
-                    --muted: #64748b;
-                    --border: #cbd5e1;
-                    --primary: #0284c7;
-                    --accent: #16a34a;
-                }
 
-                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; min-height: 100vh; transition: background 0.3s, color 0.3s; }
-                
-                .sidebar { width: 260px; background: var(--sidebar-bg); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; z-index: 100; }
-                .sidebar-header { padding: 24px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; background: rgba(0,0,0,0.2); }
-                .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
-                .logo-img { height: 40px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
-                .logo-text-group { display: flex; flex-direction: column; }
-                .logo-text { font-size: 1.1rem; font-weight: bold; color: #38bdf8; text-decoration: none; line-height: 1.1; }
-                .logo-tagline { font-size: 0.65rem; color: var(--muted); }
-
-                .sidebar-nav { flex: 1; padding: 20px 12px; display: flex; flex-direction: column; gap: 6px; overflow-y: auto; list-style: none; margin: 0; }
-                .sidebar-nav a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; padding: 10px 14px; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
-                .sidebar-nav a:hover, .sidebar-nav a.active { color: var(--text); background: var(--surface); }
-
-                .sidebar-auth-group { display: flex; flex-direction: column; gap: 8px; padding: 14px 12px; background: rgba(2, 132, 199, 0.08); border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
-                .sidebar-auth-btn { text-align: center; font-weight: bold; padding: 10px 14px; border-radius: 8px; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.95rem; transition: background 0.2s; }
-                .sidebar-login-btn { background: var(--primary); color: #ffffff; }
-                .sidebar-login-btn:hover { background: #0369a1; color: #ffffff; }
-                .sidebar-register-btn { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
-                .sidebar-register-btn:hover { background: var(--surface); color: var(--text); }
-
-                .sidebar-footer { padding: 15px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-                .theme-toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
-                .theme-toggle-btn:hover { background: var(--surface); }
-
-                .main-content { margin-left: 260px; flex: 1; display: flex; flex-direction: column; min-height: 100vh; }
-                .container { max-width: 100%; margin: 0 auto; padding: 0; flex: 1; width: 100%; box-sizing: border-box; }
-
-                /* Modern 4-Column Grid Homepage Styling */
-                .hero-video-container { position: relative; width: 100%; height: 420px; overflow: hidden; display: flex; align-items: center; justify-content: center; text-align: center; border-bottom: 3px solid var(--border); }
-                .hero-video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; filter: brightness(0.45); }
-                .hero-overlay-content { position: relative; z-index: 2; padding: 20px; max-width: 800px; }
-                .hero-logo-badge { height: 75px; width: auto; background: #fff; padding: 6px; border-radius: 10px; margin-bottom: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-                .hero-overlay-content h1 { font-size: 2.3rem; color: #ffffff; margin: 0 0 10px 0; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
-                .hero-overlay-content p { color: #e2e8f0; font-size: 1.15rem; margin: 0 0 20px 0; text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
-
-                .services-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; width: 100%; }
-                .service-card { padding: 40px 20px; text-align: center; display: flex; flex-direction: column; justify-content: space-between; min-height: 320px; box-sizing: border-box; transition: transform 0.2s; position: relative; }
-                .service-card:hover { transform: translateY(-4px); z-index: 10; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
-                .service-card h3 { font-size: 1.25rem; font-weight: 800; letter-spacing: 0.05em; margin: 15px 0 10px 0; text-transform: uppercase; }
-                .service-card p { font-size: 0.9rem; line-height: 1.5; margin-bottom: 25px; opacity: 0.9; }
-                .service-icon { font-size: 2.3rem; margin-bottom: 10px; }
-                
-                .card-black { background: #000000; color: #ffffff; border-right: 1px solid #1e293b; }
-                .card-gray { background: #334155; color: #ffffff; border-right: 1px solid #475569; }
-                .card-light { background: #f1f5f9; color: #0f172a; border-right: 1px solid #cbd5e1; }
-                .card-teal { background: #14b8a6; color: #000000; }
-
-                .enquire-btn { display: inline-block; background: #ffffff; color: #0f172a; padding: 10px 20px; border-radius: 4px; font-weight: bold; text-decoration: none; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; transition: background 0.2s; }
-                .card-black .enquire-btn { background: #0284c7; color: #fff; }
-                .card-black .enquire-btn:hover { background: #0369a1; }
-                .card-gray .enquire-btn { background: #0f172a; color: #fff; }
-                .card-light .enquire-btn { background: #0f172a; color: #fff; }
-                .card-teal .enquire-btn { background: #0f172a; color: #fff; }
-                .enquire-btn:hover { opacity: 0.85; }
-
-                .general-container { padding: 40px 30px; max-width: 900px; margin: 0 auto; }
-                .form-container { background: var(--surface); border: 1px solid var(--border); padding: 30px; border-radius: 12px; margin-top: 20px; text-align: left; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
-                .form-group { margin-bottom: 20px; }
-                .form-group label { display: block; margin-bottom: 8px; color: var(--primary); font-weight: 600; }
-                .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; font-size: 1rem; }
-
-                /* Modal Pop-up Styling */
-                .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.75); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
-                .modal-box { background: var(--surface); border: 2px solid var(--accent); padding: 30px; border-radius: 12px; max-width: 450px; width: 90%; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-                .modal-box h3 { color: var(--accent); margin-top: 0; font-size: 1.35rem; }
-                .modal-box p { font-size: 1.05rem; line-height: 1.5; color: var(--text); margin: 15px 0 25px 0; }
-                .modal-btn { background: var(--accent); color: #0f172a; border: none; padding: 12px 28px; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; text-transform: uppercase; }
-                .modal-btn:hover { opacity: 0.9; }
-                @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-
-                .contact-bar { background: var(--sidebar-bg); border-top: 1px solid var(--border); padding: 25px 30px; text-align: center; color: var(--muted); margin-top: auto; }
-                .contact-bar strong { color: var(--primary); }
-
-                .site-footer { background: var(--sidebar-bg); border-top: 1px solid var(--border); color: var(--muted); padding: 40px 30px 20px 30px; }
-                .footer-grid { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px; margin-bottom: 30px; }
-                .footer-col h4 { color: var(--primary); font-size: 1rem; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); padding-bottom: 6px; }
-                .footer-links { list-style: none; padding: 0; margin: 0; }
-                .footer-links li { margin-bottom: 8px; }
-                .footer-links a { color: var(--muted); text-decoration: none; font-size: 0.9rem; }
-                .footer-links a:hover { color: var(--primary); }
-                .footer-bottom { max-width: 1100px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 15px; text-align: center; font-size: 0.85rem; color: var(--muted); }
-
-                @media(max-width: 992px) {
-                    .services-grid { grid-template-columns: repeat(2, 1fr); }
-                }
-                @media(max-width: 768px) {
-                    .sidebar { width: 100%; position: relative; height: auto; }
-                    .main-content { margin-left: 0; }
-                    body { flex-direction: column; }
-                    .services-grid { grid-template-columns: 1fr; }
-                }
-            </style>
-        </head>
-        <body>
-            ${showMpesaPopup ? `
-                <div class="modal-overlay" id="mpesa-modal">
-                    <div class="modal-box">
-                        <h3>📱 M-Pesa Prompt Sent!</h3>
-                        <p>An M-Pesa payment prompt has been sent to your phone. <strong>Please put your M-Pesa PIN immediately</strong> to authorize your order and complete the transaction.</p>
-                        <button class="modal-btn" onclick="document.getElementById('mpesa-modal').style.display='none'">I Have Entered My PIN</button>
-                    </div>
-                </div>
-            ` : ''}
-
-            <aside class="sidebar">
-                <div class="sidebar-header">
-                    <a href="/" class="logo-container">
-                        <img src="/TENCENT_INNOVATIONS_logo.png.png" alt="Tencent Innovations" class="logo-img" onerror="this.style.display='none'">
-                        <div class="logo-text-group">
-                            <span class="logo-text">Tencent Innovations</span>
-                            <span class="logo-tagline">Connecting You, Faster.</span>
-                        </div>
-                    </a>
-                </div>
-                <ul class="sidebar-nav">
-                    <li><a href="/" class="${activeNav === 'home' ? 'active' : ''}">🏠 Home</a></li>
-                    <li><a href="/wifi" class="${activeNav === 'wifi' ? 'active' : ''}">📶 WiFi & Networking</a></li>
-                    <li><a href="/cctv" class="${activeNav === 'cctv' ? 'active' : ''}">📷 CCTV Systems</a></li>
-                    <li><a href="/smart-locks" class="${activeNav === 'smart-locks' ? 'active' : ''}">🔐 Smart Locks</a></li>
-                    <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
-                    <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
-                    <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
-                    ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
-                    <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
-                    
-                    <hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;">
-
-                    <div class="sidebar-auth-group">
-                        ${user ? `
-                            <div style="padding: 4px 6px; font-size: 0.9rem; color: var(--text); overflow: hidden; text-overflow: ellipsis;">
-                                👤 <strong>${esc(user.name)}</strong>
-                            </div>
-                            <a href="/logout" class="sidebar-auth-btn sidebar-register-btn" style="border-color: #f87171; color: #f87171;">🚪 Logout</a>
-                        ` : `
-                            <a href="/login" class="sidebar-auth-btn sidebar-login-btn">🔑 Sign In / Login</a>
-                            <a href="/register" class="sidebar-auth-btn sidebar-register-btn">📝 Register Account</a>
-                        `}
-                    </div>
-                </ul>
-                <div class="sidebar-footer">
-                    <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle Theme">
-                        <span id="theme-icon">☀️</span> <span id="theme-text">Light</span>
-                    </button>
-                </div>
-            </aside>
-
-            <div class="main-content">
-                <div class="container">
-                    ${content}
-                </div>
-
-                <div class="contact-bar">
-                    📍 <strong>Rangwe, Homa Bay County</strong> &nbsp;|&nbsp; 📞 <strong>0740 311 014</strong> &nbsp;|&nbsp; ✉️ <strong>tencentbz@gmail.com</strong>
-                </div>
-
-                <footer class="site-footer">
-                    <div class="footer-grid">
-                        <div class="footer-col">
-                            <h4>Find It Fast</h4>
-                            <ul class="footer-links">
-                                <li><a href="/smart-locks">Access Control</a></li>
-                                <li><a href="/cctv">Security Systems</a></li>
-                                <li><a href="/wifi">Telephony Systems</a></li>
-                                <li><a href="/survey">Site Surveys</a></li>
-                                <li><a href="/solar">Solar Systems</a></li>
-                            </ul>
-                        </div>
-                        <div class="footer-col">
-                            <h4>Customer Care</h4>
-                            <ul class="footer-links">
-                                <li><a href="/survey">My Account</a></li>
-                                <li><a href="tel:0740311014">Contact Us</a></li>
-                                <li><a href="/terms">Terms & Conditions</a></li>
-                            </ul>
-                        </div>
-                        <div class="footer-col">
-                            <h4>Tencent Innovations</h4>
-                            <p style="font-size: 0.85rem; color: var(--muted); line-height: 1.5;">
-                                Empowering homes, schools, and businesses across Rangwe and Homa Bay County with integrated internet, reliable security, and clean solar backup power.
-                            </p>
-                        </div>
-                    </div>
-                    <div class="footer-bottom">
-                        <p>&copy; 2026 Tencent Innovations. All rights reserved. Powered by Tencent Innovations Web Platform.</p>
-                    </div>
-                </footer>
-            </div>
-
-            <script>
-                function updateThemeUI(theme) {
-                    const icon = document.getElementById('theme-icon');
-                    const text = document.getElementById('theme-text');
-                    if (theme === 'light') {
-                        if (icon) icon.textContent = '🌙';
-                        if (text) text.textContent = 'Dark';
-                    } else {
-                        if (icon) icon.textContent = '☀️';
-                        if (text) text.textContent = 'Light';
-                    }
-                }
-                const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-                updateThemeUI(currentTheme);
-
-                document.getElementById('theme-toggle').addEventListener('click', () => {
-                    const current = document.documentElement.getAttribute('data-theme') || 'dark';
-                    const next = current === 'dark' ? 'light' : 'dark';
-                    document.documentElement.setAttribute('data-theme', next);
-                    localStorage.setItem('theme', next);
-                    updateThemeUI(next);
-                });
-            </script>
-        </body>
-        </html>
-    `;
-}
-
-// ---------------------------------------------------------------
-// Auth Routes (Register, Login, Logout)
-// ---------------------------------------------------------------
 app.get('/register', (req, res) => {
+    if (req.session.user) {
+        return res.redirect('/dashboard');
+    }
+
     const content = `
-        <div class="general-container">
-            <h2>Create an Account</h2>
-            <p class="sub-title">Register to book services, request surveys, and download receipts.</p>
-            <div class="form-container">
-                <form action="/register" method="POST">
-                    <div class="form-group"><label>Full Name</label><input type="text" name="name" required placeholder="John Otieno"></div>
-                    <div class="form-group"><label>Email Address (for receipt delivery)</label><input type="email" name="email" required placeholder="john@example.com"></div>
-                    <div class="form-group"><label>Phone Number</label><input type="tel" name="phone" required placeholder="0712345678"></div>
-                    <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
-                    <button type="submit" class="cta-btn" style="width:100%; padding:12px; background:var(--primary); color:#fff; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Register</button>
-                </form>
-                <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login" style="color:var(--primary);">Login here</a></p>
-            </div>
+        <h2>Create Customer Account</h2>
+        <div class="form-container">
+            <form method="POST" action="/register">
+                <label>Full name</label>
+                <input type="text" name="name"
+                    minlength="2" maxlength="100"
+                    autocomplete="name" required>
+
+                <label>Email address</label>
+                <input type="email" name="email"
+                    maxlength="254"
+                    autocomplete="email" required>
+
+                <label>Password</label>
+                <input type="password" name="password"
+                    minlength="10" maxlength="128"
+                    autocomplete="new-password" required>
+
+                <label>Confirm password</label>
+                <input type="password" name="confirmPassword"
+                    minlength="10" maxlength="128"
+                    autocomplete="new-password" required>
+
+                <button class="cta-btn" type="submit">
+                    Create Account
+                </button>
+            </form>
+
+            <p>Already registered?
+                <a href="/login">Sign in here</a>
+            </p>
         </div>
     `;
-    res.send(renderPage(req, { title: 'Register', activeNav: 'register', content }));
+
+    res.send(renderPage({
+        title: 'Customer Registration',
+        activeNav: '',
+        content
+    }));
 });
 
-app.post('/register', async (req, res) => {
-    const { name, email, phone, password } = req.body;
-    if (!name || !email || !phone || !password) {
-        return res.status(400).send('All fields are required.');
-    }
+app.post('/register', payLimiter, async (req, res) => {
     try {
-        const hash = await bcrypt.hash(password, 10);
-        const result = await pool.query(
-            'INSERT INTO users (name, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, email, phone',
-            [name, email, phone, hash]
+        const name = String(req.body.name || '').trim();
+        const email = String(req.body.email || '')
+            .trim()
+            .toLowerCase();
+
+        const password = String(req.body.password || '');
+        const confirmPassword =
+            String(req.body.confirmPassword || '');
+
+        if (
+            name.length < 2 ||
+            name.length > 100 ||
+            !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+            email.length > 254 ||
+            password.length < 10 ||
+            password.length > 128
+        ) {
+            return res.status(400).send(
+                'Please provide valid registration details. ' +
+                'Your password must contain at least 10 characters.'
+            );
+        }
+
+        if (password !== confirmPassword) {
+            return res.status(400).send(
+                'Your passwords do not match.'
+            );
+        }
+
+        const passwordHash = await bcrypt.hash(
+            password,
+            12
         );
-        req.session.user = result.rows[0];
-        res.redirect('/survey');
-    } catch (err) {
-        console.error('Registration error:', err.message);
-        res.status(400).send(renderPage(req, {
-            title: 'Registration Error',
-            activeNav: 'register',
-            content: `<div class="general-container"><h2>Registration Failed</h2><p class="intro-text">Email may already be registered. Please try logging in.</p><a href="/login" style="color:var(--primary);">Go to Login</a></div>`
-        }));
+
+        const result = await pool.query(
+            `INSERT INTO customers
+             (name, email, password_hash)
+             VALUES ($1, $2, $3)
+             RETURNING id, name, email`,
+            [name, email, passwordHash]
+        );
+
+        const customer = result.rows[0];
+
+        await new Promise((resolve, reject) => {
+            req.session.regenerate(error => {
+                if (error) return reject(error);
+                resolve();
+            });
+        });
+
+        req.session.user = {
+            id: String(customer.id),
+            name: customer.name,
+            email: customer.email
+        };
+
+        return res.redirect('/dashboard');
+    } catch (error) {
+        if (error.code === '23505') {
+            return res.status(409).send(
+                'An account with this email already exists. Please sign in.'
+            );
+        }
+
+        console.error('Registration error:', error.message);
+
+        return res.status(500).send(
+            'Registration failed. Please try again.'
+        );
     }
 });
+
+// ---------------------------------------------------------------
+// Customer login
+// ---------------------------------------------------------------
 
 app.get('/login', (req, res) => {
-    const redirectUrl = req.query.redirect || '/survey';
+    if (req.session.user) {
+        return res.redirect('/dashboard');
+    }
+
     const content = `
-        <div class="general-container">
-            <h2>Login to Your Account</h2>
-            <p class="sub-title">Access surveys, service bookings, and receipt downloads.</p>
-            <div class="form-container">
-                <form action="/login?redirect=${encodeURIComponent(redirectUrl)}" method="POST">
-                    <div class="form-group"><label>Email Address</label><input type="email" name="email" required placeholder="john@example.com"></div>
-                    <div class="form-group"><label>Password</label><input type="password" name="password" required placeholder="••••••••"></div>
-                    <button type="submit" style="width:100%; padding:12px; background:var(--primary); color:#fff; border:none; border-radius:8px; font-weight:bold; cursor:pointer;">Login</button>
-                </form>
-                <p style="margin-top: 15px; text-align:center;">Don't have an account? <a href="/register" style="color:var(--primary);">Register here</a></p>
-            </div>
+        <h2>Customer Login</h2>
+        <div class="form-container">
+            <form method="POST" action="/login">
+                <label>Email address</label>
+                <input type="email" name="email"
+                    autocomplete="email" required>
+
+                <label>Password</label>
+                <input type="password" name="password"
+                    autocomplete="current-password" required>
+
+                <input type="hidden" name="next"
+                    value="${esc(safeNext(req.query.next))}">
+
+                <button class="cta-btn" type="submit">
+                    Sign In
+                </button>
+            </form>
+
+            <p>New customer?
+                <a href="/register">Create an account</a>
+            </p>
         </div>
     `;
-    res.send(renderPage(req, { title: 'Login', activeNav: 'login', content }));
+
+    res.send(renderPage({
+        title: 'Customer Login',
+        activeNav: '',
+        content
+    }));
 });
 
-app.post('/login', async (req, res) => {
-    const { email, password } = req.body;
-    const redirectUrl = req.query.redirect || '/survey';
+app.post('/login', payLimiter, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (result.rows.length === 0) {
-            return res.status(400).send('Invalid email or password.');
+        const email = String(req.body.email || '')
+            .trim()
+            .toLowerCase();
+
+        const password = String(req.body.password || '');
+
+        const result = await pool.query(
+            `SELECT id, name, email, password_hash
+             FROM customers
+             WHERE email = $1`,
+            [email]
+        );
+
+        if (!result.rowCount) {
+            return res.status(401).send(
+                'Invalid email or password.'
+            );
         }
-        const user = result.rows[0];
-        const match = await bcrypt.compare(password, user.password_hash);
-        if (!match) {
-            return res.status(400).send('Invalid email or password.');
+
+        const customer = result.rows[0];
+
+        const valid = await bcrypt.compare(
+            password,
+            customer.password_hash
+        );
+
+        if (!valid) {
+            return res.status(401).send(
+                'Invalid email or password.'
+            );
         }
-        req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone };
-        res.redirect(redirectUrl);
-    } catch (err) {
-        console.error('Login error:', err.message);
-        res.status(500).send('Server error during login.');
+
+        await new Promise((resolve, reject) => {
+            req.session.regenerate(error => {
+                if (error) return reject(error);
+                resolve();
+            });
+        });
+
+        req.session.user = {
+            id: String(customer.id),
+            name: customer.name,
+            email: customer.email
+        };
+
+        const destination = safeNext(req.body.next);
+
+        return res.redirect(destination);
+    } catch (error) {
+        console.error('Login error:', error.message);
+
+        return res.status(500).send(
+            'Unable to sign in. Please try again.'
+        );
     }
 });
 
-app.get('/logout', (req, res) => {
-    req.session.destroy(() => {
-        res.redirect('/');
+// ---------------------------------------------------------------
+// Customer logout
+// ---------------------------------------------------------------
+
+app.post('/logout', requireLogin, (req, res) => {
+    req.session.destroy(error => {
+        if (error) {
+            console.error(
+                'Session logout error:',
+                error.message
+            );
+
+            return res.status(500).send(
+                'Unable to log out. Please try again.'
+            );
+        }
+
+        res.clearCookie('connect.sid');
+        return res.redirect('/login');
     });
 });
-
 // ---------------------------------------------------------------
-// Public Pages with Custom Background Video & 4-Column Homepage Grid
+// Customer dashboard
 // ---------------------------------------------------------------
-app.get('/', (req, res) => {
-    const content = `
-        <div class="hero-video-container">
-            <video autoplay muted loop playsinline class="hero-video">
-                <source src="https://assets.mixkit.co/videos/preview/mixkit-digital-animation-of-screens-and-connections-31917-large.mp4" type="video/mp4">
-            </video>
-            <div class="hero-overlay-content">
-                <img src="/TENCENT_INNOVATIONS_logo.png.png" alt="Tencent Innovations Logo" class="hero-logo-badge" onerror="this.style.display='none'">
-                <h1>INTEGRATED TECHNOLOGY & SECURITY LEADERS</h1>
-                <p>Providing high-performance WiFi, Solar Backup, CCTV, Smart Locks, and Electric Fences across East Africa.</p>
-                <div style="margin-top:15px;"><a href="/survey" style="background:#38bdf8; color:#0f172a; padding:12px 28px; border-radius:30px; font-weight:bold; text-decoration:none;">Book Site Survey (*384*100#)</a></div>
-            </div>
-        </div>
 
-        <div class="services-grid">
-            <div class="service-card card-black">
-                <div>
-                    <div class="service-icon">📶</div>
-                    <h3>WIFI NETWORKS</h3>
-                    <p>High-speed hotspot and dedicated home/office fiber internet installations designed for maximum uptime and stability.</p>
-                </div>
-                <div><a href="/wifi" class="enquire-btn">Enquire Now</a></div>
-            </div>
+app.get('/dashboard', requireLogin, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT booking_id, service, location, amount,
+                    status, created_at, paid_at, receipt,
+                    receipt_email_sent
+             FROM customer_bookings
+             WHERE customer_id = $1
+             ORDER BY created_at DESC
+             LIMIT 100`,
+            [req.session.user.id]
+        );
 
-            <div class="service-card card-gray">
-                <div>
-                    <div class="service-icon">☀️</div>
-                    <h3>SOLAR SOLUTIONS</h3>
-                    <p>Contact us now for your solar system quote for both Home & Commercial off-grid and hybrid kits.</p>
-                </div>
-                <div><a href="/solar" class="enquire-btn">Enquire Now</a></div>
-            </div>
+        const bookingsHtml = result.rows.length
+            ? result.rows.map(row => {
+                const paid = row.status === 'paid';
 
-            <div class="service-card card-light">
-                <div>
-                    <div class="service-icon">📷</div>
-                    <h3>CCTV SYSTEMS</h3>
-                    <p>Advanced security surveillance cameras with remote smartphone viewing and crystal-clear night vision.</p>
-                </div>
-                <div><a href="/cctv" class="enquire-btn">Enquire Now</a></div>
-            </div>
+                const statusColor = paid
+                    ? '#16803c'
+                    : row.status === 'failed'
+                        ? '#c0392b'
+                        : '#d18b00';
 
-            <div class="service-card card-teal">
-                <div>
-                    <div class="service-icon">🔐 & ⚡</div>
-                    <h3>LOCKS & FENCES</h3>
-                    <p>Secure biometric smart locks and high-voltage perimeter electric fences engineered to protect your premises.</p>
-                </div>
-                <div><a href="/smart-locks" class="enquire-btn">Enquire Now</a></div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Home', activeNav: 'home', content }));
-});
+                const receiptButton = paid
+                    ? `<a class="cta-btn"
+                        href="/payments/receipt/${encodeURIComponent(row.booking_id)}/download.pdf">
+                        Download PDF Receipt
+                       </a>`
+                    : '<span>Receipt available after payment confirmation</span>';
 
-app.get('/wifi', (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>Reliable WiFi for Homes, Rentals, and ISP Resellers.</h2>
-            <p class="sub-title">Pay-as-you-go hotspots, PPPoE client management, and dedicated fiber connections.</p>
-            
-            <div class="form-container" style="border-left: 4px solid var(--primary);">
-                <h3 style="color:var(--primary); margin-top:0;">ℹ️ Notes for WiFi Resellers, Technicians & Management</h3>
-                <ul style="line-height: 1.8; margin-bottom: 0; padding-left: 20px;">
-                    <li><strong>For Resellers:</strong> Deploy automated M-Pesa vending portals (FreeRADIUS / MikroTik integration) to manage daily/weekly/monthly subscriber vouchers seamlessly.</li>
-                    <li><strong>For Technicians:</strong> Ensure proper mast grounding, use shielded CAT6 STP cables, and configure watchdog scripts on all access points to prevent signal dropouts.</li>
-                    <li><strong>For Management:</strong> Monitor bandwidth utilization thresholds, automated payment reconciliations, and uptime SLAs directly from your dashboard.</li>
-                </ul>
-            </div>
-
-            <div class="form-container" style="margin-top: 25px;">
-                <p>Book a site visit or network review with our senior network engineers.</p>
-                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book WiFi Consultation</a>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'WiFi & Networking', activeNav: 'wifi', content }));
-});
-
-app.get('/cctv', (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>See your property from anywhere.</h2>
-            <p class="sub-title">CCTV systems for homes, shops, schools and compounds, installed and set up to view live on your phone.</p>
-            <div class="form-container">
-                <p>Get professional camera positioning and a clear quote.</p>
-                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book CCTV Survey</a>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'CCTV Systems', activeNav: 'cctv', content }));
-});
-
-app.get('/smart-locks', (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>Open your door without a key.</h2>
-            <p class="sub-title">Smart locks for homes, rental units, offices and stores. Use a code, a card, a fingerprint or your phone.</p>
-            <div class="form-container">
-                <p>Find the right smart lock model for your doors.</p>
-                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book Smart Lock Consultation</a>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Smart Locks', activeNav: 'smart-locks', content }));
-});
-
-app.get('/electric-fence', (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>Stop intruders at the boundary.</h2>
-            <p class="sub-title">Electric fence installation for homes, compounds, schools, farms and commercial plots.</p>
-            <div class="form-container">
-                <p>Measure your boundary and get a professional installation quote.</p>
-                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book Electric Fence Survey</a>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Electric Fence', activeNav: 'electric-fence', content }));
-});
-
-app.get('/solar', (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>Keep the lights, internet and cameras on when the grid goes off.</h2>
-            <p class="sub-title">Solar and battery systems sized for your home, shop, school or network site.</p>
-            <div class="form-container">
-                <p>Calculate your load requirements with our engineers.</p>
-                <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book Solar Consultation</a>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Solar Solutions', activeNav: 'solar', content }));
-});
-
-// ---------------------------------------------------------------
-// Protected Survey & Payment Page
-// ---------------------------------------------------------------
-app.get('/survey', requireAuth, (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>Know what your site needs before you spend.</h2>
-            <p class="sub-title">A site survey by an engineer, followed by a written plan and quote.</p>
-            
-            <div class="form-container" style="border-color: var(--accent);">
-                <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-                <p style="color:var(--muted); font-size:0.95rem;">Logged in as: <strong>${esc(req.session.user.email)}</strong>. Receipts will be emailed here.</p>
-                <form action="/submit-survey-payment" method="POST" id="payment-form">
-                    <div class="form-group"><label>Full Name</label><input type="text" name="name" value="${esc(req.session.user.name)}" required></div>
-                    <div class="form-group"><label>M-Pesa Phone Number</label><input type="tel" name="phone" value="${esc(req.session.user.phone)}" required placeholder="0712345678"></div>
-                    <div class="form-group">
-                        <label>Service Category</label>
-                        <select name="service" id="service-select">
-                            <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
-                            <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
-                            <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
-                            <option value="Smart Locks">Smart Locks Consultation (KES 2,500)</option>
-                            <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
-                            <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
-                        </select>
+                return `
+                    <div class="booking-card">
+                        <h3>${esc(row.service)}</h3>
+                        <p><strong>Location:</strong> ${esc(row.location)}</p>
+                        <p><strong>Amount:</strong> KES ${Number(row.amount).toLocaleString('en-KE')}</p>
+                        <p><strong>Date:</strong> ${new Date(Number(row.created_at)).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' })}</p>
+                        <p><strong>Status:</strong>
+                            <span style="color:${statusColor};font-weight:bold">
+                                ${esc(String(row.status).toUpperCase())}
+                            </span>
+                        </p>
+                        ${paid && row.receipt
+                            ? `<p><strong>M-Pesa receipt:</strong> ${esc(row.receipt)}</p>`
+                            : ''}
+                        ${receiptButton}
                     </div>
-                    <div class="form-group"><label>Physical Location / Address</label><input type="text" name="location" required placeholder="e.g. Rangwe Town, Homa Bay"></div>
-                    <button type="submit" style="width:100%; padding:14px; background:var(--accent); color:#0f172a; border:none; border-radius:8px; font-weight:bold; font-size:1.05rem; cursor:pointer;">Trigger M-Pesa Payment & Book Survey</button>
+                `;
+            }).join('')
+            : '<p>You have not made any service bookings yet.</p>';
+
+        const content = `
+            <h2>Welcome, ${esc(req.session.user.name)}</h2>
+
+            <div class="dashboard-summary">
+                <h3>Your Customer Account</h3>
+                <p><strong>Name:</strong> ${esc(req.session.user.name)}</p>
+                <p><strong>Email:</strong> ${esc(req.session.user.email)}</p>
+            </div>
+
+            <h2>Our Services</h2>
+
+            <div class="service-grid">
+                <a class="service-card" href="/wifi">
+                    <h3>WiFi Installation</h3>
+                    <p>Professional wireless networking solutions.</p>
+                </a>
+
+                <a class="service-card" href="/cctv">
+                    <h3>CCTV Installation</h3>
+                    <p>Security camera installation and monitoring.</p>
+                </a>
+
+                <a class="service-card" href="/smart-locks">
+                    <h3>Smart Locks</h3>
+                    <p>Modern access control and smart security.</p>
+                </a>
+
+                <a class="service-card" href="/electric-fence">
+                    <h3>Electric Fencing</h3>
+                    <p>Reliable perimeter security solutions.</p>
+                </a>
+
+                <a class="service-card" href="/solar">
+                    <h3>Solar Systems</h3>
+                    <p>Solar power design and installation.</p>
+                </a>
+
+                <a class="service-card" href="/survey">
+                    <h3>Site Survey</h3>
+                    <p>Request a technical site survey and quotation.</p>
+                </a>
+            </div>
+
+            <h2>Your Booking History</h2>
+
+            <div class="booking-list">
+                ${bookingsHtml}
+            </div>
+
+            <form method="POST" action="/logout">
+                <button class="logout-btn" type="submit">
+                    Log Out
+                </button>
+            </form>
+        `;
+
+        res.send(renderPage({
+            title: 'Customer Dashboard',
+            activeNav: 'dashboard',
+            content
+        }));
+
+    } catch (error) {
+        console.error(
+            'Dashboard error:',
+            error.message
+        );
+
+        res.status(500).send(
+            'Unable to load your dashboard. Please try again.'
+        );
+    }
+});
+
+// ---------------------------------------------------------------
+// Website navigation
+// ---------------------------------------------------------------
+
+function navigation() {
+    return `
+        <nav class="sidebar">
+            <div class="sidebar-brand">
+                <a href="/">TENCENT INNOVATIONS</a>
+            </div>
+
+            <a href="/dashboard">Dashboard</a>
+            <a href="/wifi">WiFi Solutions</a>
+            <a href="/cctv">CCTV Installation</a>
+            <a href="/smart-locks">Smart Locks</a>
+            <a href="/electric-fence">Electric Fence</a>
+            <a href="/solar">Solar Systems</a>
+            <a href="/survey">Site Survey</a>
+            <a href="/terms">Terms & Conditions</a>
+
+            <div class="sidebar-account">
+                <a href="/dashboard">My Account</a>
+                <form method="POST" action="/logout">
+                    <button type="submit">Log Out</button>
                 </form>
             </div>
+        </nav>
+    `;
+}
+
+// ---------------------------------------------------------------
+// Shared website layout
+// ---------------------------------------------------------------
+
+function renderPage({
+    title = 'Tencent Innovations',
+    activeNav = '',
+    content = ''
+} = {}) {
+    const loggedIn = false;
+
+    const accountLinks = `
+        <div class="account-links">
+            <a href="/login">Login</a>
+            <a href="/register">Register</a>
         </div>
     `;
-    res.send(renderPage(req, { title: 'Surveys & Quotations', activeNav: 'survey', content }));
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>${esc(title)} | Tencent Innovations</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, Helvetica, sans-serif;
+            background: #f4f6f9;
+            color: #202b3c;
+        }
+
+        a {
+            color: #145da0;
+            text-decoration: none;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #102d4f;
+            color: white;
+            padding: 16px 24px;
+        }
+
+        .topbar h1 {
+            font-size: 20px;
+            margin: 0;
+        }
+
+        .topbar a {
+            color: white;
+            margin-left: 14px;
+        }
+
+        .account-links a {
+            padding: 9px 13px;
+            border: 1px solid white;
+            border-radius: 5px;
+        }
+
+        .layout {
+            display: flex;
+            min-height: calc(100vh - 60px);
+        }
+
+        .sidebar {
+            width: 235px;
+            flex-shrink: 0;
+            background: #173b63;
+            padding: 20px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .sidebar-brand {
+            font-weight: bold;
+            padding: 10px;
+            margin-bottom: 15px;
+        }
+
+        .sidebar a,
+        .sidebar button {
+            color: white;
+            padding: 12px;
+            border: 0;
+            border-radius: 5px;
+            background: transparent;
+            text-align: left;
+            font-size: 14px;
+            cursor: pointer;
+            display: block;
+            width: 100%;
+        }
+
+        .sidebar a:hover,
+        .sidebar button:hover {
+            background: #285782;
+        }
+
+        .sidebar-account {
+            margin-top: auto;
+        }
+
+        .main-content {
+            flex: 1;
+            padding: 30px;
+            min-width: 0;
+        }
+
+        .main-content h2 {
+            color: #173b63;
+        }
+
+        .form-container {
+            max-width: 520px;
+            margin: 20px auto;
+            background: white;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 3px 12px rgba(0,0,0,.08);
+        }
+
+        input,
+        select,
+        textarea {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0 18px;
+            border: 1px solid #ccd3dc;
+            border-radius: 5px;
+            font-size: 15px;
+        }
+
+        label {
+            display: block;
+            font-weight: bold;
+            margin-top: 8px;
+        }
+
+        button,
+        .cta-btn {
+            display: inline-block;
+            border: none;
+            background: #145da0;
+            color: white;
+            padding: 12px 18px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 15px;
+        }
+
+        .cta-btn:hover,
+        button:hover {
+            background: #0d477d;
+        }
+
+        .service-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 18px;
+            margin: 25px 0;
+        }
+
+        .service-card,
+        .booking-card,
+        .dashboard-summary {
+            display: block;
+            background: white;
+            padding: 20px;
+            border-radius: 9px;
+            box-shadow: 0 2px 10px rgba(0,0,0,.06);
+        }
+
+        .service-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .booking-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 16px;
+        }
+
+        .booking-card h3 {
+            color: #173b63;
+        }
+
+        .logout-btn {
+            margin-top: 25px;
+            background: #a52a2a;
+        }
+
+        footer {
+            text-align: center;
+            background: #102d4f;
+            color: white;
+            padding: 18px;
+        }
+
+        @media(max-width: 760px) {
+            .layout {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+            }
+
+            .main-content {
+                padding: 18px;
+            }
+
+            .topbar {
+                flex-direction: column;
+                gap: 12px;
+                align-items: flex-start;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="topbar">
+        <h1>Tencent Innovations</h1>
+        ${accountLinks}
+    </header>
+
+    <div class="layout">
+        ${navigation()}
+
+        <main class="main-content">
+            ${content}
+        </main>
+    </div>
+
+    <footer>
+        &copy; ${new Date().getFullYear()} Tencent Innovations.
+        All rights reserved.
+    </footer>
+</body>
+</html>`;
+}
+// ---------------------------------------------------------------
+// Homepage
+// ---------------------------------------------------------------
+
+app.get('/', (req, res) => {
+    const content = `
+        <section class="hero">
+            <h2>Smart Technology. Reliable Security. Innovative Solutions.</h2>
+
+            <p>
+                Welcome to Tencent Innovations. We provide professional
+                networking, security, automation and renewable energy solutions.
+            </p>
+
+            <a class="cta-btn" href="${req.session.user ? '/dashboard' : '/register'}">
+                Get Started
+            </a>
+        </section>
+
+        <h2>Our Services</h2>
+
+        <div class="service-grid">
+            <a class="service-card" href="/wifi">
+                <h3>WiFi & Networking</h3>
+                <p>Reliable wireless networks for homes and businesses.</p>
+            </a>
+
+            <a class="service-card" href="/cctv">
+                <h3>CCTV Installation</h3>
+                <p>Modern surveillance and security camera systems.</p>
+            </a>
+
+            <a class="service-card" href="/smart-locks">
+                <h3>Smart Locks</h3>
+                <p>Smart access control and door security solutions.</p>
+            </a>
+
+            <a class="service-card" href="/electric-fence">
+                <h3>Electric Fencing</h3>
+                <p>Perimeter protection for residential and commercial properties.</p>
+            </a>
+
+            <a class="service-card" href="/solar">
+                <h3>Solar Energy</h3>
+                <p>Solar power solutions and system installations.</p>
+            </a>
+
+            <a class="service-card" href="/survey">
+                <h3>Site Survey & Quotation</h3>
+                <p>Request a professional site assessment and quotation.</p>
+            </a>
+        </div>
+
+        <section class="hero">
+            <h2>Ready to get started?</h2>
+            <p>Create your customer account to request a service and make payments securely.</p>
+            <a class="cta-btn" href="${req.session.user ? '/dashboard' : '/register'}">
+                ${req.session.user ? 'Open Dashboard' : 'Register Now'}
+            </a>
+        </section>
+    `;
+
+    res.send(renderPage({
+        title: 'Home',
+        activeNav: 'home',
+        content
+    }));
 });
 
-app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => {
-    const { name, phone: rawPhone, service, location } = req.body;
-    const phone = normalizePhone(rawPhone);
+// ---------------------------------------------------------------
+// Shared service-page renderer
+// ---------------------------------------------------------------
 
-    if (!name || !phone || !service || !location) {
-        return res.status(400).send('Incomplete form details.');
-    }
+function servicePage({
+    title,
+    heading,
+    description,
+    features = [],
+    image = ''
+}) {
+    const featureList = features.map(feature =>
+        `<li>${esc(feature)}</li>`
+    ).join('');
 
-    if (!phoneAttemptAllowed(phone)) {
-        return res.status(429).send('Too many payment attempts. Please try again later.');
-    }
+    const imageHtml = image
+        ? `<img src="${esc(image)}" alt="${esc(title)}"
+             style="width:100%;max-height:350px;object-fit:cover;border-radius:10px">`
+        : '';
 
-    const amount = SERVICE_PRICES[service] || 3000;
-    const bookingId = crypto.randomUUID();
-    const accountRef = `TI-${Math.floor(1000 + Math.random() * 9000)}`;
+    const content = `
+        <section class="service-detail">
+            <h2>${esc(heading)}</h2>
 
-    try {
-        await pool.query(
-            'INSERT INTO bookings (id, user_id, name, phone, service, location, amount, account_ref, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
-            [bookingId, req.session.user.id, name, phone, service, location, amount, accountRef, 'pending', Date.now()]
-        );
-    } catch (err) {
-        console.error('Booking insertion error:', err.message);
-        return res.status(500).send('Database error processing booking.');
-    }
+            <p>${esc(description)}</p>
 
-    if (!mpesaConfigured()) {
-        await notify(`📝 PENDING (M-Pesa unconfigured): ${service} - ${name}`, { Name: name, Phone: phone, Service: service, Location: location, Amount: `KES ${amount}` }, req.session.user.email);
-        return res.send(renderPage(req, {
-            title: 'Booking Received',
-            activeNav: 'survey',
-            content: `
-                <div class="general-container">
-                    <h2>Booking Received!</h2>
-                    <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our M-Pesa gateway is currently in offline mode. An engineer has received your request and will call <strong>${esc(phone)}</strong> shortly.</p>
-                    <p><a href="/requests" style="color:var(--primary); font-weight:bold;">View My Requests</a></p>
-                </div>
-            `,
-            showMpesaPopup: true
-        }));
-    }
+            ${imageHtml}
 
-    try {
-        const bookingObj = { id: bookingId, name, phone, service, location, amount, accountRef };
-        const resStk = await stkPush(bookingObj);
-        await pool.query('UPDATE bookings SET checkout_request_id = $1 WHERE id = $2', [resStk.CheckoutRequestID, bookingId]);
+            ${features.length ? `
+                <h3>What we offer</h3>
+                <ul>${featureList}</ul>
+            ` : ''}
 
-        await notify(`📱 STK sent: ${service} - ${name} (KES ${amount})`, bookingFields(bookingObj), req.session.user.email);
+            <div class="form-container">
+                <h3>Request this service</h3>
+                <p>
+                    To request this service, submit your details and
+                    our team will contact you.
+                </p>
 
-        res.send(renderPage(req, {
-            title: 'Check Your Phone',
-            activeNav: 'survey',
-            content: `
-                <div class="general-container">
-                    <h2>📱 M-Pesa Prompt Sent Successfully</h2>
-                    <div style="background:var(--surface); border:2px solid var(--accent); padding:25px; border-radius:12px; margin-top:20px; text-align:center;">
-                        <h3 style="color:var(--accent); margin-top:0; font-size:1.4rem;">⚠️ ATTENTION REQUIRED:</h3>
-                        <p style="font-size:1.2rem; color:var(--text); font-weight:bold; margin: 15px 0;">
-                            Please check your phone (${esc(phone)}) immediately and put your M-Pesa PIN to authorize KES ${amount}!
-                        </p>
-                        
-                        <div id="status-box" style="margin:25px 0; padding:15px; border-radius:8px; background:var(--bg); border:1px solid var(--border);">
-                            <p id="status-text" style="font-weight:bold; color:#38bdf8; font-size:1.05rem; margin:0;">
-                                ⏳ Waiting for your M-Pesa PIN entry...
-                            </p>
-                        </div>
-                    </div>
+                <a class="cta-btn" href="/survey">
+                    Request Site Survey
+                </a>
+            </div>
+        </section>
+    `;
 
-                    <div style="margin-top:25px; text-align:center;">
-                        <a href="/requests" style="background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">View All My Requests & Receipts</a>
-                    </div>
+    return renderPage({
+        title,
+        activeNav: '',
+        content
+    });
+}
+
+// ---------------------------------------------------------------
+// WiFi and networking
+// ---------------------------------------------------------------
+
+app.get('/wifi', requireLogin, (req, res) => {
+    res.send(servicePage({
+        title: 'WiFi & Networking',
+        heading: 'WiFi and Networking Solutions',
+        description:
+            'We design, install and configure reliable wireless and wired networks for homes, offices and businesses.',
+        features: [
+            'Wireless access point installation',
+            'Router and network configuration',
+            'Structured network cabling',
+            'Network coverage planning',
+            'Network troubleshooting and maintenance'
+        ],
+        image: '/public/wifi.jpg'
+    }));
+});
+
+// ---------------------------------------------------------------
+// CCTV installation
+// ---------------------------------------------------------------
+
+app.get('/cctv', requireLogin, (req, res) => {
+    res.send(servicePage({
+        title: 'CCTV Installation',
+        heading: 'CCTV Security Systems',
+        description:
+            'Protect your property with professionally installed CCTV surveillance systems.',
+        features: [
+            'IP and analogue CCTV installation',
+            'Indoor and outdoor cameras',
+            'Remote viewing configuration',
+            'Digital video recorder installation',
+            'System maintenance and troubleshooting'
+        ],
+        image: '/public/cctv.jpg'
+    }));
+});
+
+// ---------------------------------------------------------------
+// Smart locks
+// ---------------------------------------------------------------
+
+app.get('/smart-locks', requireLogin, (req, res) => {
+    res.send(servicePage({
+        title: 'Smart Locks',
+        heading: 'Smart Locks and Access Control',
+        description:
+            'Improve security and convenience through modern electronic locking and access control systems.',
+        features: [
+            'Smart door lock installation',
+            'Fingerprint access systems',
+            'PIN and card access control',
+            'Smartphone-controlled locks',
+            'Access control configuration'
+        ],
+        image: '/public/smart-locks.jpg'
+    }));
+});
+
+// ---------------------------------------------------------------
+// Electric fencing
+// ---------------------------------------------------------------
+
+app.get('/electric-fence', requireLogin, (req, res) => {
+    res.send(servicePage({
+        title: 'Electric Fencing',
+        heading: 'Electric Fence Installation',
+        description:
+            'We provide electric perimeter security solutions for residential, commercial and industrial properties.',
+        features: [
+            'Electric fence installation',
+            'Energizer installation and configuration',
+            'Fence wiring and accessories',
+            'Fence maintenance',
+            'Fault detection and repair'
+        ],
+        image: '/public/electric-fence.jpg'
+    }));
+});
+
+// ---------------------------------------------------------------
+// Solar energy
+// ---------------------------------------------------------------
+
+app.get('/solar', requireLogin, (req, res) => {
+    res.send(servicePage({
+        title: 'Solar Energy',
+        heading: 'Solar Power Solutions',
+        description:
+            'Explore solar energy systems designed to provide reliable and efficient power for your property.',
+        features: [
+            'Solar system consultation',
+            'Solar panel installation',
+            'Inverter and battery solutions',
+            'Solar system sizing',
+            'System inspection and maintenance'
+        ],
+        image: '/public/solar.jpg'
+    }));
+});
+
+// ---------------------------------------------------------------
+// Site survey and quotation
+// ---------------------------------------------------------------
+
+app.get('/survey', requireLogin, (req, res) => {
+    const content = `
+        <h2>Request a Site Survey</h2>
+
+        <p>
+            Submit your location and contact details so our technical
+            team can assess your requirements and prepare a quotation.
+        </p>
+
+        <div class="form-container">
+            <form method="POST" action="/submit-survey-payment">
+
+                <label>Customer name</label>
+                <input type="text"
+                    value="${esc(req.session.user.name)}"
+                    readonly>
+
+                <label>Registered email</label>
+                <input type="email"
+                    value="${esc(req.session.user.email)}"
+                    readonly>
+
+                <label>Phone number for M-Pesa</label>
+                <input type="tel"
+                    name="phone"
+                    placeholder="07XXXXXXXX or 2547XXXXXXXX"
+                    required>
+
+                <label>Service required</label>
+                <select name="service" required>
+                    <option value="">Select a service</option>
+                    <option value="Site Survey & Quotation">
+                        Site Survey & Quotation — KES 3,000
+                    </option>
+                    <option value="WiFi Setup">
+                        WiFi Setup — KES 3,000
+                    </option>
+                    <option value="CCTV Installation">
+                        CCTV Installation — KES 3,000
+                    </option>
+                    <option value="Smart Locks">
+                        Smart Locks — KES 2,500
+                    </option>
+                    <option value="Electric Fence">
+                        Electric Fence — KES 5,000
+                    </option>
+                    <option value="Solar Consultation">
+                        Solar Consultation — KES 4,000
+                    </option>
+                </select>
+
+                <label>Installation or service location</label>
+                <textarea name="location"
+                    rows="4"
+                    maxlength="250"
+                    placeholder="Enter your town, estate or physical location"
+                    required></textarea>
+
+                <button class="cta-btn" type="submit">
+                    Continue to M-Pesa Payment
+                </button>
+            </form>
+        </div>
+    `;
+
+    res.send(renderPage({
+        title: 'Site Survey & Payment',
+        activeNav: 'survey',
+        content
+    }));
+});
+// ---------------------------------------------------------------
+// Submit service request and initiate M-Pesa payment
+// ---------------------------------------------------------------
+
+app.post(
+    '/submit-survey-payment',
+    requireLogin,
+    payLimiter,
+    async (req, res) => {
+        try {
+            const phone = normalizePhone(req.body.phone);
+            const service = String(req.body.service || '').trim();
+            const location = String(req.body.location || '')
+                .trim()
+                .slice(0, 250);
+
+            const name = req.session.user.name;
+            const email = req.session.user.email;
+
+            if (!phone) {
+                return res.status(400).send(
+                    'Please enter a valid Kenyan M-Pesa phone number.'
+                );
+            }
+
+            if (!location) {
+                return res.status(400).send(
+                    'Please provide your service location.'
+                );
+            }
+
+            if (
+                !Object.prototype.hasOwnProperty.call(
+                    SERVICE_PRICES,
+                    service
+                )
+            ) {
+                return res.status(400).send(
+                    'Invalid service selected. Please return to the survey page and select a listed service.'
+                );
+            }
+
+            if (!mpesaConfigured()) {
+                console.error(
+                    'M-Pesa configuration is incomplete.'
+                );
+
+                return res.status(503).send(
+                    'M-Pesa payments are temporarily unavailable. Please contact our support team.'
+                );
+            }
+
+            if (!phoneAttemptAllowed(phone)) {
+                return res.status(429).send(
+                    'You have reached the maximum number of payment attempts for this phone number. Please try again later.'
+                );
+            }
+
+            const amount = SERVICE_PRICES[service];
+            const bookingId = crypto.randomUUID();
+
+            const accountRef =
+                `TI${Date.now().toString().slice(-8)}`;
+
+            const booking = {
+                id: bookingId,
+                customerId: String(req.session.user.id),
+                name,
+                email,
+                phone,
+                service,
+                location,
+                amount,
+                accountRef,
+                status: 'pending',
+                createdAt: Date.now(),
+                paidAt: null,
+                receipt: '',
+                checkoutRequestId: undefined,
+                lastQuery: 0,
+                receiptEmailSent: false
+            };
+
+            // Save the booking before sending the payment request.
+            bookings.set(booking.id, booking);
+
+            try {
+                await persistBooking(booking);
+            } catch (error) {
+                bookings.delete(booking.id);
+
+                console.error(
+                    'Could not save booking:',
+                    error.message
+                );
+
+                return res.status(500).send(
+                    'We could not save your booking. Please try again.'
+                );
+            }
+
+            let stkResponse;
+
+            try {
+                stkResponse = await stkPush(booking);
+            } catch (error) {
+                booking.status = 'failed';
+                booking.failureReason = error.message;
+
+                await persistBooking(booking).catch(
+                    dbError => console.error(
+                        'Could not save STK failure:',
+                        dbError.message
+                    )
+                );
+
+                console.error(
+                    'STK Push error:',
+                    error.message
+                );
+
+                return res.status(502).send(
+                    'M-Pesa could not initiate your payment. Please check your phone number and try again.'
+                );
+            }
+
+            booking.checkoutRequestId =
+                stkResponse.CheckoutRequestID;
+
+            booking.merchantRequestId =
+                stkResponse.MerchantRequestID;
+
+            booking.status = 'pending';
+
+            byCheckout.set(
+                booking.checkoutRequestId,
+                booking
+            );
+
+            try {
+                await persistBooking(booking);
+            } catch (error) {
+                console.error(
+                    'Could not save checkout request:',
+                    error.message
+                );
+
+                // Keep the booking in memory for callback processing.
+                // A database failure here must be investigated.
+                return res.status(500).send(
+                    'Your M-Pesa request was created, but we could not save its reference. Please contact support before attempting another payment.'
+                );
+            }
+
+            await notify(
+                'New service payment request',
+                bookingFields(booking, {
+                    Status: 'Awaiting M-Pesa payment',
+                    'Checkout Request ID':
+                        booking.checkoutRequestId
+                })
+            );
+
+            const content = `
+                <div class="form-container">
+                    <h2>M-Pesa Payment Request Sent</h2>
+
+                    <p>
+                        An M-Pesa payment prompt has been sent
+                        to <strong>${esc(phone)}</strong>.
+                    </p>
+
+                    <p><strong>Service:</strong>
+                        ${esc(service)}
+                    </p>
+
+                    <p><strong>Amount:</strong>
+                        KES ${Number(amount).toLocaleString('en-KE')}
+                    </p>
+
+                    <p><strong>Booking reference:</strong>
+                        ${esc(accountRef)}
+                    </p>
+
+                    <p>
+                        Enter your M-Pesa PIN on your phone
+                        to complete the payment.
+                    </p>
+
+                    <p id="payment-status">
+                        Payment status: Waiting for confirmation...
+                    </p>
+
+                    <a class="cta-btn"
+                        href="/dashboard">
+                        Go to Dashboard
+                    </a>
                 </div>
 
                 <script>
-                    async function checkStatus() {
+                    const bookingId = ${JSON.stringify(bookingId)};
+                    const statusElement =
+                        document.getElementById('payment-status');
+
+                    async function checkPayment() {
                         try {
-                            const r = await fetch('/payments/status/${bookingId}');
-                            const d = await r.json();
-                            if (d.status === 'paid') {
-                                let html = '<h3 style="color:var(--accent); margin:0;">✅ Payment Confirmed Successfully!</h3><p style="margin-top:8px;">An official PDF receipt has been sent to your email.</p>';
-                                if (d.pdf) html += '<p><a href="' + d.pdf + '" style="margin-top:12px; display:inline-block; background:var(--accent); color:#0f172a; padding:10px 20px; border-radius:6px; font-weight:bold; text-decoration:none;">📥 Download Official PDF Receipt</a></p>';
-                                html += '<p style="margin-top:12px;"><a href="/requests" style="color:var(--primary); text-decoration:underline;">Go to My Requests Dashboard</a></p>';
-                                document.getElementById('status-box').innerHTML = html;
-                                clearInterval(timer);
-                            } else if (d.status === 'failed') {
-                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">❌ Payment Cancelled or Timed Out</h3><p style="margin-top:8px; color:var(--muted);">The payment request was not completed.</p><a href="/survey" style="margin-top:15px; display:inline-block; background:var(--primary); color:#fff; padding:10px 20px; border-radius:6px; text-decoration:none;">Try Again</a>';
-                                clearInterval(timer);
+                            const response = await fetch(
+                                '/payments/status/' +
+                                encodeURIComponent(bookingId)
+                            );
+
+                            if (!response.ok) return;
+
+                            const data = await response.json();
+
+                            if (data.status === 'paid') {
+                                statusElement.textContent =
+                                    'Payment confirmed! Your receipt is available in your dashboard.';
+                                return;
                             }
-                        } catch(e) {}
+
+                            if (data.status === 'failed') {
+                                statusElement.textContent =
+                                    'Payment failed. Please return to the dashboard and try again.';
+                                return;
+                            }
+
+                            statusElement.textContent =
+                                'Payment status: ' +
+                                data.status +
+                                '. Waiting for confirmation...';
+
+                            setTimeout(checkPayment, 10000);
+                        } catch (error) {
+                            setTimeout(checkPayment, 15000);
+                        }
                     }
-                    checkStatus();
-                    const timer = setInterval(checkStatus, 3000);
+
+                    setTimeout(checkPayment, 10000);
                 </script>
-            `,
-            showMpesaPopup: true
-        }));
-    } catch (err) {
-        console.error('STK Push Error:', err.message);
-        res.status(500).send('Could not trigger M-Pesa payment prompt.');
-    }
-});
+            `;
 
-// ---------------------------------------------------------------
-// My Requests & Tracking Dashboard
-// ---------------------------------------------------------------
-app.get('/requests', requireAuth, async (req, res) => {
-    try {
-        const result = await pool.query(
-            'SELECT * FROM bookings WHERE user_id = $1 ORDER BY created_at DESC',
-            [req.session.user.id]
-        );
-        const bookings = result.rows;
+            return res.send(
+                renderPage({
+                    title: 'M-Pesa Payment',
+                    activeNav: '',
+                    content
+                })
+            );
 
-        let rowsHtml = '';
-        if (bookings.length === 0) {
-            rowsHtml = `<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--muted);">You have not made any service requests or bookings yet. <br><a href="/survey" style="color:var(--primary); font-weight:bold;">Book a Site Survey Now</a></td></tr>`;
-        } else {
-            rowsHtml = bookings.map(b => {
-                const dateStr = new Date(Number(b.created_at)).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-                let statusBadge = '';
-                if (b.status === 'paid') {
-                    statusBadge = `<span style="background:rgba(74,222,128,0.15); color:var(--accent); padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">PAID & CONFIRMED</span>`;
-                } else if (b.status === 'pending') {
-                    statusBadge = `<span style="background:rgba(56,189,248,0.15); color:#38bdf8; padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">PENDING PAYMENT</span>`;
-                } else {
-                    statusBadge = `<span style="background:rgba(248,113,113,0.15); color:#f87171; padding:4px 10px; border-radius:6px; font-weight:bold; font-size:0.85rem;">${b.status.toUpperCase()}</span>`;
-                }
+        } catch (error) {
+            console.error(
+                'Service payment submission error:',
+                error.message
+            );
 
-                const actionBtn = b.status === 'paid' 
-                    ? `<a href="/payments/receipt/${b.id}/download.pdf" style="padding:6px 12px; font-size:0.85rem; background:var(--accent); color:#0f172a; text-decoration:none; border-radius:4px; font-weight:bold; display:inline-block;">📥 Download PDF</a>`
-                    : `<a href="/survey" style="color:var(--primary); font-size:0.85rem; font-weight:bold;">Retry Payment</a>`;
-
-                return `
-                    <tr style="border-bottom: 1px solid var(--border);">
-                        <td style="padding:12px;">${dateStr}</td>
-                        <td style="padding:12px;"><strong>${esc(b.service)}</strong><br><small style="color:var(--muted);">${esc(b.location)}</small></td>
-                        <td style="padding:12px;">KES ${b.amount}</td>
-                        <td style="padding:12px;">${esc(b.account_ref)}</td>
-                        <td style="padding:12px;">${statusBadge}</td>
-                        <td style="padding:12px;">${esc(b.receipt || '-')}</td>
-                        <td style="padding:12px; text-align:center;">${actionBtn}</td>
-                    </tr>
-                `;
-            }).join('');
+            return res.status(500).send(
+                'Unable to process your service request. Please try again.'
+            );
         }
-
-        const content = `
-            <div class="general-container">
-                <h2>My Service Requests & Tracking</h2>
-                <p class="sub-title">Monitor your submitted bookings, payment statuses, and download official PDF receipts.</p>
-                
-                <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-top: 20px;">
-                    <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem;">
-                        <thead>
-                            <tr style="background: var(--bg); border-bottom: 2px solid var(--border); color: var(--primary);">
-                                <th style="padding: 14px 12px;">Date</th>
-                                <th style="padding: 14px 12px;">Service & Location</th>
-                                <th style="padding: 14px 12px;">Amount</th>
-                                <th style="padding: 14px 12px;">Reference</th>
-                                <th style="padding: 14px 12px;">Status</th>
-                                <th style="padding: 14px 12px;">M-Pesa Receipt</th>
-                                <th style="padding: 14px 12px; text-align: center;">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${rowsHtml}
-                        </tbody>
-                    </table>
-                </div>
-
-                <div style="margin-top: 30px; text-align: right;">
-                    <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:10px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">+ Book Another Service</a>
-                </div>
-            </div>
-        `;
-        res.send(renderPage(req, { title: 'My Requests', activeNav: 'requests', content }));
-    } catch (err) {
-        console.error('Error fetching requests:', err.message);
-        res.status(500).send('Error loading requests dashboard.');
     }
-});
+);
+// ---------------------------------------------------------------
+// Terms and conditions
+// ---------------------------------------------------------------
 
-// Signed booking / receipt link view
-app.get('/booking/:token', async (req, res) => {
-    const data = readBookingLink(req.params.token);
-    if (!data) return res.status(404).send('Invalid or expired receipt link.');
-
-    const isPaid = data.k === 1;
-    const dateStr = new Date(data.t).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-    const content = `
-        <div class="general-container">
-            <h2>${isPaid ? 'Payment Receipt & Booking' : 'Booking Status'}</h2>
-            <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County</p>
-            <div class="form-container">
-                <p><strong>Status:</strong> <span style="color: ${isPaid ? 'var(--accent)' : '#38bdf8'}; font-weight: bold;">${isPaid ? 'PAID & CONFIRMED' : 'PENDING'}</span></p>
-                <p><strong>Client Name:</strong> ${esc(data.n)}</p>
-                <p><strong>Phone Number:</strong> ${esc(data.p)}</p>
-                <p><strong>Service:</strong> ${esc(data.s)}</p>
-                <p><strong>Location:</strong> ${esc(data.l)}</p>
-                <p><strong>Amount:</strong> KES ${esc(data.a)}</p>
-                <p><strong>Reference:</strong> ${esc(data.f)}</p>
-                ${data.r ? `<p><strong>M-Pesa Receipt:</strong> ${esc(data.r)}</p>` : ''}
-                <p><strong>Timestamp:</strong> ${esc(dateStr)}</p>
-                ${isPaid && PDFDocument ? `<div style="margin-top: 25px;"><a href="/booking/${esc(req.params.token)}/receipt.pdf" style="background: var(--accent); color: #0f172a; padding: 12px 24px; border-radius: 8px; font-weight: bold; text-decoration: none; display: inline-block;">Download Official PDF Receipt</a></div>` : ''}
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Receipt', activeNav: 'home', content }));
-});
-
-app.get('/booking/:token/receipt.pdf', async (req, res) => {
-    if (!PDFDocument) return res.status(501).send('PDF generation disabled.');
-    const data = readBookingLink(req.params.token);
-    if (!data || data.k !== 1) return res.status(404).send('Receipt not found.');
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=Tencent-Receipt-${data.f}.pdf`);
-    try {
-        const buf = await generatePdfBuffer({
-            accountRef: data.f,
-            name: data.n,
-            phone: data.p,
-            service: data.s,
-            location: data.l,
-            amount: data.a,
-            receipt: data.r,
-            paidAt: data.t
-        });
-        res.send(buf);
-    } catch (e) {
-        res.status(500).send('Error generating PDF.');
-    }
-});
-
-// Terms and Conditions Page
 app.get('/terms', (req, res) => {
     const content = `
-        <div class="general-container">
-            <h2>Terms and Conditions of Service</h2>
-            <p class="sub-title">Tencent Innovations | Rangwe, Homa Bay County, Kenya</p>
-            <p class="intro-text">These Terms and Conditions govern the provision of internet services, security installations, and site surveys by Tencent Innovations.</p>
-            <h3>1. Services and Surveys</h3>
-            <p>Site surveys and consultations require an advance fee paid via M-Pesa. Fees cover engineer site visits and written quotations.</p>
+        <div class="form-container">
+            <h2>Terms and Conditions</h2>
+
+            <h3>1. Service Requests</h3>
+            <p>
+                Customers must provide accurate contact information
+                and service location details when submitting requests.
+            </p>
+
             <h3>2. Payments</h3>
-            <p>All payments are processed securely via M-Pesa STK Push. Receipts are delivered via email upon confirmation.</p>
+            <p>
+                Payments are processed through M-Pesa.
+                A service booking is not considered paid until
+                the payment has been verified.
+            </p>
+
+            <h3>3. Receipts</h3>
+            <p>
+                Receipts are generated after successful payment
+                verification and sent to the customer's registered
+                email address where email delivery is configured.
+            </p>
+
+            <h3>4. Customer Information</h3>
+            <p>
+                Customer information is used to manage accounts,
+                process service requests and communicate about
+                bookings and payments.
+            </p>
+
+            <h3>5. Support</h3>
+            <p>
+                Contact Tencent Innovations for assistance
+                with service requests or payment problems.
+            </p>
         </div>
     `;
-    res.send(renderPage(req, { title: 'Terms and Conditions', activeNav: 'terms', content }));
+
+    res.send(
+        renderPage({
+            title: 'Terms and Conditions',
+            activeNav: '',
+            content
+        })
+    );
 });
 
-// USSD Endpoint
-app.post('/ussd', (req, res) => {
-    const { text, phoneNumber } = req.body;
-    let response = '';
-    if (text === '') {
-        response = `CON Welcome to Tencent Innovations
-1. WiFi & Hotspot Internet
-2. CCTV Installation
-3. Smart Locks
-4. Electric Fence
-5. Solar Backup Power
-6. Site Survey & Visit`;
-    } else if (text === '1') {
-        response = `CON WiFi Consultation: KES 3,000\n1. Confirm & Pay via M-PESA`;
-    } else if (text.endsWith('*1')) {
-        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. Please enter your PIN.`;
-    } else {
-        response = `END Invalid selection.`;
+
+// ---------------------------------------------------------------
+// Basic USSD endpoint
+// ---------------------------------------------------------------
+
+app.post('/ussd', async (req, res) => {
+    try {
+        const sessionId = String(
+            req.body.sessionId || ''
+        );
+
+        const serviceCode = String(
+            req.body.serviceCode || ''
+        );
+
+        const phoneNumber = normalizePhone(
+            req.body.phoneNumber
+        );
+
+        const textValue = String(
+            req.body.text || ''
+        );
+
+        const steps = textValue
+            ? textValue.split('*')
+            : [];
+
+        let response = '';
+
+        if (!phoneNumber) {
+            response =
+                'END Invalid phone number. Please try again.';
+        } else if (steps.length === 0) {
+            response =
+                'CON Welcome to Tencent Innovations\n' +
+                '1. View Services\n' +
+                '2. Contact Support';
+        } else if (steps[0] === '1' && steps.length === 1) {
+            response =
+                'CON Select a service\n' +
+                '1. WiFi Setup\n' +
+                '2. CCTV Installation\n' +
+                '3. Smart Locks\n' +
+                '4. Electric Fence\n' +
+                '5. Solar Consultation';
+        } else if (steps[0] === '1' && steps.length === 2) {
+            const services = {
+                '1': 'WiFi Setup',
+                '2': 'CCTV Installation',
+                '3': 'Smart Locks',
+                '4': 'Electric Fence',
+                '5': 'Solar Consultation'
+            };
+
+            const selected = services[steps[1]];
+
+            if (!selected) {
+                response =
+                    'END Invalid service selection.';
+            } else {
+                response =
+                    'END You selected ' + selected +
+                    '. Please visit our website or contact support ' +
+                    'to submit a service request and make payment.';
+            }
+        } else if (steps[0] === '2') {
+            response =
+                'END Please contact Tencent Innovations ' +
+                'through the support details on our website.';
+        } else {
+            response =
+                'END Invalid selection. Please try again.';
+        }
+
+        res.set('Content-Type', 'text/plain');
+        res.send(response);
+
+    } catch (error) {
+        console.error(
+            'USSD processing error:',
+            error.message
+        );
+
+        res.set('Content-Type', 'text/plain');
+        res.send(
+            'END The service is temporarily unavailable.'
+        );
     }
-    res.set('Content-Type', 'text/plain');
-    res.send(response);
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
+
+// ---------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------
+
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        application: 'Tencent Innovations',
+        timestamp: new Date().toISOString()
+    });
+});
+
+
+// ---------------------------------------------------------------
+// Not found and error handling
+// ---------------------------------------------------------------
+
+app.use((req, res) => {
+    res.status(404).send(
+        renderPage({
+            title: 'Page Not Found',
+            activeNav: '',
+            content: `
+                <div class="form-container">
+                    <h2>Page not found</h2>
+                    <p>The page you requested does not exist.</p>
+                    <a class="cta-btn" href="/">Return Home</a>
+                </div>
+            `
+        })
+    );
+});
+
+app.use((err, req, res, next) => {
+    console.error('Application error:', err);
+
+    if (res.headersSent) {
+        return next(err);
+    }
+
+    res.status(500).send(
+        'An unexpected server error occurred. Please try again later.'
+    );
+});
+
+
+// ---------------------------------------------------------------
+// Start application
+// ---------------------------------------------------------------
+
+async function startServer() {
+    try {
+        if (!process.env.SESSION_SECRET) {
+            throw new Error(
+                'SESSION_SECRET environment variable is required.'
+            );
+        }
+
+        if (!process.env.DATABASE_URL) {
+            throw new Error(
+                'DATABASE_URL environment variable is required.'
+            );
+        }
+
+        await initDatabase();
+
+        const PORT = Number(process.env.PORT) || 3000;
+
+        app.listen(PORT, '0.0.0.0', () => {
+            console.log(
+                `Tencent Innovations server running on port ${PORT}`
+            );
+        });
+
+    } catch (error) {
+        console.error(
+            'Server startup failed:',
+            error.message
+        );
+
+        process.exit(1);
+    }
+}
+
+startServer();
