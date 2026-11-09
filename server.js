@@ -532,16 +532,21 @@ app.get('/payments/status/:id', async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ status: 'unknown' });
     let b = r.rows[0];
 
-    if (b.status === 'pending' && b.checkout_request_id &&
-        Date.now() - Number(b.created_at) > 25000) {
+    // Query Daraja status after 30 seconds if still pending
+    if (b.status === 'pending' && b.checkout_request_id && Date.now() - Number(b.created_at) > 30000) {
         try {
             const q = await stkQuery(b.checkout_request_id);
-            if (String(q.ResultCode) === '0') await markPaid(b.id, '', true);
-            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') await markFailed(b.id, q.ResultDesc);
+            if (String(q.ResultCode) === '0') {
+                await markPaid(b.id, '', true);
+            } else if (q.ResultCode !== undefined && String(q.ResultCode) !== '' && String(q.ResultCode) !== '500.001.1001') {
+                // 500.001.1001 means transaction is still being processed by Safaricom
+                await markFailed(b.id, q.ResultDesc || 'Payment cancelled');
+            }
         } catch (_) {}
         const updated = await pool.query('SELECT * FROM bookings WHERE id = $1', [req.params.id]);
         b = updated.rows[0];
     }
+
     const paidLink = b.status === 'paid' ? (makeBookingLink(b) || '') : '';
     const pdfUrl = b.status === 'paid' ? `/payments/receipt/${b.id}/download.pdf` : '';
     res.json({ status: b.status, link: paidLink, pdf: pdfUrl });
@@ -637,7 +642,6 @@ function renderPage(req, { title, activeNav, content }) {
                 .sidebar-nav a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; padding: 10px 14px; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
                 .sidebar-nav a:hover, .sidebar-nav a.active { color: var(--text); background: var(--surface); }
 
-                /* Prominent Authentication Sidebar Buttons */
                 .sidebar-auth-group { display: flex; flex-direction: column; gap: 8px; padding: 14px 12px; background: rgba(2, 132, 199, 0.08); border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
                 .sidebar-auth-btn { text-align: center; font-weight: bold; padding: 10px 14px; border-radius: 8px; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.95rem; transition: background 0.2s; }
                 .sidebar-login-btn { background: var(--primary); color: #ffffff; }
@@ -726,7 +730,6 @@ function renderPage(req, { title, activeNav, content }) {
                     
                     <hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;">
 
-                    <!-- Prominent Authentication Sidebar Buttons -->
                     <div class="sidebar-auth-group">
                         ${user ? `
                             <div style="padding: 4px 6px; font-size: 0.9rem; color: var(--text); overflow: hidden; text-overflow: ellipsis;">
@@ -1079,32 +1082,43 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
             title: 'Check Your Phone',
             activeNav: 'survey',
             content: `
-                <h2>Check Your Phone for M-Pesa</h2>
-                <p class="intro-text">An STK push for <strong>KES ${amount}</strong> has been sent to <strong>${esc(phone)}</strong>.</p>
-                <div id="status-box" style="background:var(--surface); border:1px solid var(--border); padding:20px; border-radius:8px; margin-top:20px; text-align:center;">
-                    <p id="status-text" style="font-weight:bold; color:var(--primary);">Waiting for M-Pesa PIN confirmation...</p>
+                <h2>📱 Check Your Phone</h2>
+                <div style="background:var(--surface); border:1px solid var(--primary); padding:25px; border-radius:12px; margin-top:20px; text-align:center;">
+                    <h3 style="color:#38bdf8; margin-top:0;">M-Pesa Prompt Sent to ${esc(phone)}</h3>
+                    <p style="font-size:1.1rem; color:var(--text);">An STK prompt for <strong>KES ${amount}</strong> has been pushed to your handset.</p>
+                    
+                    <div id="status-box" style="margin:25px 0; padding:15px; border-radius:8px; background:var(--bg); border:1px solid var(--border);">
+                        <p id="status-text" style="font-weight:bold; color:var(--primary); font-size:1.05rem; margin:0;">
+                            ⏳ Waiting for you to enter your M-Pesa PIN on your phone...
+                        </p>
+                    </div>
+
+                    <p style="font-size:0.9rem; color:var(--muted);">Please enter your PIN when prompted. Once complete, this page will automatically confirm your transaction and generate your receipt.</p>
                 </div>
-                <div style="margin-top:20px; text-align:center;">
-                    <a href="/requests" class="cta-btn" style="background:var(--primary);">View All My Requests & Receipts</a>
+
+                <div style="margin-top:25px; text-align:center;">
+                    <a href="/requests" class="cta-btn" style="background:var(--primary);">View All My Requests & Statuses</a>
                 </div>
+
                 <script>
                     async function checkStatus() {
                         try {
                             const r = await fetch('/payments/status/${bookingId}');
                             const d = await r.json();
                             if (d.status === 'paid') {
-                                let html = '<h3 style="color:var(--accent); margin:0;">Payment Confirmed Successfully!</h3><p>An official receipt has been emailed to you.</p>';
-                                if (d.pdf) html += '<p><a href="' + d.pdf + '" class="cta-btn" style="margin-top:10px; display:inline-block; background:var(--accent); color:#0f172a;">Download Official PDF Receipt</a></p>';
-                                html += '<p style="margin-top:10px;"><a href="/requests" style="color:var(--primary);">Go to My Requests Dashboard</a></p>';
+                                let html = '<h3 style="color:var(--accent); margin:0;">✅ Payment Confirmed Successfully!</h3><p style="margin-top:8px;">An official PDF receipt has been sent to your email.</p>';
+                                if (d.pdf) html += '<p><a href="' + d.pdf + '" class="cta-btn" style="margin-top:12px; display:inline-block; background:var(--accent); color:#0f172a;">📥 Download Official PDF Receipt</a></p>';
+                                html += '<p style="margin-top:12px;"><a href="/requests" style="color:var(--primary); text-decoration:underline;">Go to My Requests Dashboard</a></p>';
                                 document.getElementById('status-box').innerHTML = html;
                                 clearInterval(timer);
                             } else if (d.status === 'failed') {
-                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">Payment Cancelled or Failed</h3><a href="/survey" class="cta-btn" style="margin-top:15px;">Try Again</a>';
+                                document.getElementById('status-box').innerHTML = '<h3 style="color:#f87171; margin:0;">❌ Payment Cancelled or Timed Out</h3><p style="margin-top:8px; color:var(--muted);">The payment request was not completed.</p><a href="/survey" class="cta-btn" style="margin-top:15px; display:inline-block;">Try Again</a>';
                                 clearInterval(timer);
                             }
                         } catch(e) {}
                     }
-                    const timer = setInterval(checkStatus, 4000);
+                    checkStatus();
+                    const timer = setInterval(checkStatus, 3000);
                 </script>
             `
         }));
