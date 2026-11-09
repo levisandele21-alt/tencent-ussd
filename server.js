@@ -587,9 +587,9 @@ function requireAuth(req, res, next) {
 }
 
 // ---------------------------------------------------------------
-// Layout Template Helper with Left Sidebar & Modern Styling
+// Layout Template Helper with Left Sidebar, Global Modal & Styling
 // ---------------------------------------------------------------
-function renderPage(req, { title, activeNav, content }) {
+function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) {
     const user = req.session && req.session.user ? req.session.user : null;
     return `
         <!DOCTYPE html>
@@ -654,7 +654,7 @@ function renderPage(req, { title, activeNav, content }) {
                 .main-content { margin-left: 260px; flex: 1; display: flex; flex-direction: column; min-height: 100vh; }
                 .container { max-width: 100%; margin: 0 auto; padding: 0; flex: 1; width: 100%; box-sizing: border-box; }
 
-                /* Modern 4-Column Grid Homepage Styling modeled after reference */
+                /* Modern 4-Column Grid Homepage Styling */
                 .hero-video-container { position: relative; width: 100%; height: 420px; overflow: hidden; display: flex; align-items: center; justify-content: center; text-align: center; border-bottom: 3px solid var(--border); }
                 .hero-video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; filter: brightness(0.45); }
                 .hero-overlay-content { position: relative; z-index: 2; padding: 20px; max-width: 800px; }
@@ -662,7 +662,6 @@ function renderPage(req, { title, activeNav, content }) {
                 .hero-overlay-content h1 { font-size: 2.3rem; color: #ffffff; margin: 0 0 10px 0; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
                 .hero-overlay-content p { color: #e2e8f0; font-size: 1.15rem; margin: 0 0 20px 0; text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
 
-                /* 4 items in the exact same line */
                 .services-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; width: 100%; }
                 .service-card { padding: 40px 20px; text-align: center; display: flex; flex-direction: column; justify-content: space-between; min-height: 320px; box-sizing: border-box; transition: transform 0.2s; position: relative; }
                 .service-card:hover { transform: translateY(-4px); z-index: 10; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -689,6 +688,15 @@ function renderPage(req, { title, activeNav, content }) {
                 .form-group label { display: block; margin-bottom: 8px; color: var(--primary); font-weight: 600; }
                 .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); box-sizing: border-box; font-size: 1rem; }
 
+                /* Modal Pop-up Styling */
+                .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.75); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
+                .modal-box { background: var(--surface); border: 2px solid var(--accent); padding: 30px; border-radius: 12px; max-width: 450px; width: 90%; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+                .modal-box h3 { color: var(--accent); margin-top: 0; font-size: 1.35rem; }
+                .modal-box p { font-size: 1.05rem; line-height: 1.5; color: var(--text); margin: 15px 0 25px 0; }
+                .modal-btn { background: var(--accent); color: #0f172a; border: none; padding: 12px 28px; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; text-transform: uppercase; }
+                .modal-btn:hover { opacity: 0.9; }
+                @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
                 .contact-bar { background: var(--sidebar-bg); border-top: 1px solid var(--border); padding: 25px 30px; text-align: center; color: var(--muted); margin-top: auto; }
                 .contact-bar strong { color: var(--primary); }
 
@@ -713,6 +721,16 @@ function renderPage(req, { title, activeNav, content }) {
             </style>
         </head>
         <body>
+            ${showMpesaPopup ? `
+                <div class="modal-overlay" id="mpesa-modal">
+                    <div class="modal-box">
+                        <h3>📱 M-Pesa Prompt Sent!</h3>
+                        <p>An M-Pesa payment prompt has been sent to your phone. <strong>Please put your M-Pesa PIN immediately</strong> to authorize your order and complete the transaction.</p>
+                        <button class="modal-btn" onclick="document.getElementById('mpesa-modal').style.display='none'">I Have Entered My PIN</button>
+                    </div>
+                </div>
+            ` : ''}
+
             <aside class="sidebar">
                 <div class="sidebar-header">
                     <a href="/" class="logo-container">
@@ -978,10 +996,20 @@ app.get('/', (req, res) => {
 app.get('/wifi', (req, res) => {
     const content = `
         <div class="general-container">
-            <h2>Reliable WiFi for homes, rentals and businesses.</h2>
-            <p class="sub-title">Pay-as-you-go hotspot or a fixed monthly connection. We build the network, run the billing and keep it online.</p>
-            <div class="form-container">
-                <p>Book a site visit to test signal strength at your location.</p>
+            <h2>Reliable WiFi for Homes, Rentals, and ISP Resellers.</h2>
+            <p class="sub-title">Pay-as-you-go hotspots, PPPoE client management, and dedicated fiber connections.</p>
+            
+            <div class="form-container" style="border-left: 4px solid var(--primary);">
+                <h3 style="color:var(--primary); margin-top:0;">ℹ️ Notes for WiFi Resellers, Technicians & Management</h3>
+                <ul style="line-height: 1.8; margin-bottom: 0; padding-left: 20px;">
+                    <li><strong>For Resellers:</strong> Deploy automated M-Pesa vending portals (FreeRADIUS / MikroTik integration) to manage daily/weekly/monthly subscriber vouchers seamlessly.</li>
+                    <li><strong>For Technicians:</strong> Ensure proper mast grounding, use shielded CAT6 STP cables, and configure watchdog scripts on all access points to prevent signal dropouts.</li>
+                    <li><strong>For Management:</strong> Monitor bandwidth utilization thresholds, automated payment reconciliations, and uptime SLAs directly from your dashboard.</li>
+                </ul>
+            </div>
+
+            <div class="form-container" style="margin-top: 25px;">
+                <p>Book a site visit or network review with our senior network engineers.</p>
                 <a href="/survey" style="display:inline-block; background:var(--primary); color:#fff; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Book WiFi Consultation</a>
             </div>
         </div>
@@ -1117,7 +1145,8 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
                     <p class="intro-text">Thank you, <strong>${esc(name)}</strong>. Our M-Pesa gateway is currently in offline mode. An engineer has received your request and will call <strong>${esc(phone)}</strong> shortly.</p>
                     <p><a href="/requests" style="color:var(--primary); font-weight:bold;">View My Requests</a></p>
                 </div>
-            `
+            `,
+            showMpesaPopup: true
         }));
     }
 
@@ -1172,7 +1201,8 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, async (req, res) => 
                     checkStatus();
                     const timer = setInterval(checkStatus, 3000);
                 </script>
-            `
+            `,
+            showMpesaPopup: true
         }));
     } catch (err) {
         console.error('STK Push Error:', err.message);
