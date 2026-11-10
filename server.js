@@ -237,9 +237,15 @@ app.use((req, res, next) => {
     if (req.method !== 'POST' || req.path.startsWith('/payments/cb/')) return next();
     const fetchSite = req.get('sec-fetch-site');
     const origin = req.get('origin');
-    let blocked = fetchSite === 'cross-site';
-    if (!blocked && origin) {
-        try { blocked = new URL(origin).host !== req.get('host'); } catch (_) { blocked = true; }
+    let blocked = false;
+    if (fetchSite) {
+        // Modern browsers say exactly how the request relates to this site, so trust that and skip host comparisons
+        blocked = fetchSite === 'cross-site';
+    } else if (origin) {
+        // Older browsers: compare the Origin with every name this site is reached by (Render, custom domain, proxy)
+        const allowed = new Set([req.get('host'), req.get('x-forwarded-host')].filter(Boolean).map(h => h.split(',')[0].trim().toLowerCase()));
+        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) { /* not set */ }
+        try { blocked = !allowed.has(new URL(origin).host.toLowerCase()); } catch (_) { blocked = true; }
     }
     if (blocked) return errorPage(req, res, 403, 'Request blocked', 'This request came from another website, so it was blocked.');
     next();
