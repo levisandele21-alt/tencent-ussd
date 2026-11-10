@@ -256,7 +256,7 @@ const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST); 
 const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
 
 // Only go back to our own pages after login (stops //evil.com style redirects)
-const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms']);
+const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact']);
 function safeNext(value) {
     const v = typeof value === 'string' ? value : '';
     if (!v.startsWith('/') || v.startsWith('//') || v.includes('\\')) return '/survey';
@@ -1003,6 +1003,7 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
             <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
             <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
             ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
+            <li><a href="/contact" class="${activeNav === 'contact' ? 'active' : ''}">📞 Contact Us</a></li>
             <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
             <li><hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;"></li>
             <li>
@@ -1047,7 +1048,7 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
                     <h4>Customer Care</h4>
                     <ul class="footer-links">
                         <li><a href="${user ? '/requests' : '/login'}">My Account</a></li>
-                        <li><a href="tel:0740311014">Contact Us</a></li>
+                        <li><a href="/contact">Contact Us</a></li>
                         <li><a href="/terms">Terms & Conditions</a></li>
                     </ul>
                 </div>
@@ -1269,11 +1270,11 @@ servicePage('/wifi', 'wifi', 'WiFi & Networking',
     'Reliable WiFi for Homes, Rentals, and ISP Resellers.',
     'Pay-as-you-go hotspots, PPPoE client management, and dedicated fiber connections.',
     `<div class="form-container" style="border-left: 4px solid var(--primary);">
-        <h3 style="color:var(--primary); margin-top:0;">ℹ️ Notes for WiFi Resellers, Technicians & Management</h3>
+        <h3 style="color:var(--primary); margin-top:0;">What we offer WiFi resellers, technicians & network owners</h3>
         <ul style="line-height: 1.8; margin-bottom: 0; padding-left: 20px;">
-            <li><strong>For Resellers:</strong> Deploy automated M-Pesa vending portals (FreeRADIUS / MikroTik integration) to manage daily/weekly/monthly subscriber vouchers seamlessly.</li>
-            <li><strong>For Technicians:</strong> Ensure proper mast grounding, use shielded CAT6 STP cables, and configure watchdog scripts on all access points to prevent signal dropouts.</li>
-            <li><strong>For Management:</strong> Monitor bandwidth utilization thresholds, automated payment reconciliations, and uptime SLAs directly from your dashboard.</li>
+            <li><strong>For resellers:</strong> We set up automated M-Pesa hotspot vending (MikroTik and FreeRADIUS), so your customers buy daily, weekly or monthly vouchers and are connected automatically.</li>
+            <li><strong>For technicians:</strong> We install and configure the network for you: mast grounding, shielded CAT6 STP cabling, and watchdog scripts on access points to prevent signal dropouts.</li>
+            <li><strong>For network owners:</strong> We monitor bandwidth use, set up automated payment reconciliation and help you track uptime, so you can see how your network is performing.</li>
         </ul>
     </div>`,
     { text: 'Book a site visit or network review with our senior network engineers.', label: 'Book WiFi Consultation' });
@@ -1554,6 +1555,47 @@ app.get('/booking/:token/receipt.pdf', requireDb, ah(async (req, res) => {
     const b = id ? await getBooking(id) : null;
     if (!b || b.status !== 'paid') return errorPage(req, res, 404, 'Receipt not found', 'This receipt is not available. It may not be paid yet.');
     sendPdf(res, await generatePdfBuffer(b), b.accountRef);
+}));
+
+// ---------------------------------------------------------------
+// Contact page: call, WhatsApp, email, and a callback request (alerts go to you by Telegram/email)
+// ---------------------------------------------------------------
+const contactLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many requests from this network. Please call us on 0740 311 014.'
+});
+function contactPage(req, { error = '', sent = false, values = {} } = {}) {
+    const content = `
+        <div class="general-container">
+            <h2>Contact Us</h2>
+            <p class="sub-title">Call, message us on WhatsApp, or ask for a callback and an engineer will phone you.</p>
+            ${sent ? `<div class="alert ok" role="status">Thank you${values.name ? ', ' + esc(values.name) : ''}. We have received your request and will call you shortly.</div>` : ''}
+            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+            <div class="form-container">
+                <p style="margin-top:0;">📞 <strong>Calls:</strong> <a href="tel:+254740311014">0740 311 014</a></p>
+                <p>💬 <strong>WhatsApp:</strong> <a href="https://wa.me/254769306917" target="_blank" rel="noopener">0769 306 917</a></p>
+                <p>✉️ <strong>Email:</strong> <a href="mailto:tencentbz@gmail.com">tencentbz@gmail.com</a></p>
+                <p style="margin-bottom:0;">📍 <strong>Location:</strong> Rangwe, Homa Bay County, Kenya</p>
+            </div>
+            <div class="form-container">
+                <h3 style="margin-top:0; color:var(--primary);">Request a callback</h3>
+                <form action="/contact" method="POST">
+                    <div class="form-group"><label for="c-name">Your Name</label><input id="c-name" type="text" name="name" required maxlength="80" autocomplete="name" placeholder="e.g. John Otieno" value="${esc(values.name || '')}"></div>
+                    <div class="form-group"><label for="c-phone">Phone Number</label><input id="c-phone" type="tel" name="phone" required autocomplete="tel" placeholder="0712345678" value="${esc(values.phone || '')}"></div>
+                    <div class="form-group"><label for="c-msg">How can we help?</label><textarea id="c-msg" name="message" rows="4" required maxlength="600" placeholder="e.g. I need CCTV installed at my shop in Rangwe">${esc(values.message || '')}</textarea></div>
+                    <button type="submit" class="cta-btn block">Request Callback</button>
+                </form>
+            </div>
+        </div>`;
+    return renderPage(req, { title: 'Contact Us', activeNav: 'contact', content });
+}
+app.get('/contact', (req, res) => res.send(contactPage(req)));
+app.post('/contact', contactLimiter, ah(async (req, res) => {
+    const values = { name: str(req.body.name).slice(0, 80), phone: str(req.body.phone).slice(0, 30), message: str(req.body.message).slice(0, 600) };
+    if (!values.name || !values.message) return res.status(400).send(contactPage(req, { error: 'Please enter your name and a short message.', values }));
+    if (!normalizePhone(values.phone)) return res.status(400).send(contactPage(req, { error: 'Please enter a valid phone number, for example 0712345678.', values }));
+    await notify(`📞 Callback request: ${values.name}`, { Name: values.name, Phone: values.phone, Message: values.message });
+    res.send(contactPage(req, { sent: true, values: { name: values.name } }));
 }));
 
 // ---------------------------------------------------------------
