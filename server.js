@@ -187,6 +187,13 @@ async function initDb() {
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_sent BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS email_status VARCHAR(300)`);
+        // Price breakdown (older bookings keep these empty and show only the total)
+        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS base_amount INT`);
+        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_km INT`);
+        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_fee INT`);
+        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS urgency VARCHAR(20)`);
+        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS urgency_fee INT`);
+        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS geo VARCHAR(40)`);
         if (!had.rowCount) {
             // First run of this version: receipts for payments that were already made are not re-sent
             await pool.query(`UPDATE bookings SET receipt_sent = TRUE WHERE status = 'paid'`);
@@ -401,6 +408,75 @@ const SERVICE_PRICES = {
     'Solar Consultation': 4000
 };
 
+// ---------------------------------------------------------------
+// Location- and urgency-based pricing
+// The service price above is the base fee. A travel fare (by distance from Rangwe) and an
+// urgency fee are added on top. Everything is worked out here on the server, never in the browser.
+// Change the numbers in Render (Environment) without touching the code:
+//   TRAVEL_FREE_KM        km from Rangwe that carry no travel fare            (default 5)
+//   TRAVEL_RATE_PER_KM    KES charged for each km beyond the free distance    (default 40)
+//   TRAVEL_MAX_KM         furthest distance bookable online                   (default 80)
+//   URGENCY_NEXT_DAY_FEE  extra KES for next-day service                      (default 500)
+//   URGENCY_SAME_DAY_FEE  extra KES for same-day service                      (default 1000)
+// ---------------------------------------------------------------
+const envNum = (name, fallback) => {
+    const v = Number(process.env[name]);
+    return process.env[name] !== undefined && process.env[name] !== '' && Number.isFinite(v) && v >= 0 ? v : fallback;
+};
+const PRICING = {
+    base: { lat: -0.6003, lng: 34.5835 },   // Rangwe
+    roadFactor: 1.3,                          // roads are longer than the straight line
+    roundTo: 50,                              // travel fare is rounded up to the next KES 50
+    freeKm: envNum('TRAVEL_FREE_KM', 5),
+    ratePerKm: envNum('TRAVEL_RATE_PER_KM', 40),
+    maxKm: envNum('TRAVEL_MAX_KM', 80),
+    urgency: {
+        standard: { label: 'Standard (within the week)', fee: 0 },
+        'next-day': { label: 'Next day', fee: envNum('URGENCY_NEXT_DAY_FEE', 500) },
+        'same-day': { label: 'Same day', fee: envNum('URGENCY_SAME_DAY_FEE', 1000) }
+    }
+};
+// For customers who do not want to share their phone location. Coordinates are approximate town centres.
+const PLACES = {
+    rangwe: { label: 'Rangwe town', lat: -0.6003, lng: 34.5835 },
+    'homa-bay': { label: 'Homa Bay town', lat: -0.5273, lng: 34.4571 },
+    'kendu-bay': { label: 'Kendu Bay', lat: -0.3603, lng: 34.6439 },
+    oyugis: { label: 'Oyugis', lat: -0.5078, lng: 34.7358 },
+    rongo: { label: 'Rongo', lat: -0.7567, lng: 34.6 },
+    mbita: { label: 'Mbita', lat: -0.4219, lng: 34.2022 },
+    kisumu: { label: 'Kisumu', lat: -0.0917, lng: 34.7679 }
+};
+function distanceKm(lat, lng) {
+    const rad = d => d * Math.PI / 180;
+    const dLat = rad(lat - PRICING.base.lat), dLng = rad(lng - PRICING.base.lng);
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(PRICING.base.lat)) * Math.cos(rad(lat)) * Math.sin(dLng / 2) ** 2;
+    return Math.ceil(2 * 6371 * Math.asin(Math.sqrt(a)) * PRICING.roadFactor);
+}
+// input: { service, urgency, place, lat, lng } straight from the form. Returns { ok:true, ... } or { ok:false, error }.
+function computeQuote(input) {
+    const service = String(input.service || '');
+    if (!Object.hasOwn(SERVICE_PRICES, service)) return { ok: false, error: 'Please choose a valid service.' };
+    const urgencyKey = Object.hasOwn(PRICING.urgency, input.urgency) ? input.urgency : 'standard';
+    let lat = Number(input.lat), lng = Number(input.lng);
+    let source = 'gps';
+    if (input.lat === undefined || input.lat === '' || !Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        const place = Object.hasOwn(PLACES, input.place) ? PLACES[input.place] : null;
+        if (!place) return { ok: false, error: 'Please choose your area or share your location so we can work out the travel fare.' };
+        lat = place.lat; lng = place.lng; source = 'area';
+    }
+    const km = distanceKm(lat, lng);
+    if (km > PRICING.maxKm) return { ok: false, error: `That location is about ${km} km from Rangwe, which is too far to book online. Please call us on 0740 311 014 for a quote.` };
+    const chargeable = Math.max(0, km - PRICING.freeKm);
+    const travel = chargeable === 0 ? 0 : Math.ceil(chargeable * PRICING.ratePerKm / PRICING.roundTo) * PRICING.roundTo;
+    const base = SERVICE_PRICES[service];
+    const urgencyFee = PRICING.urgency[urgencyKey].fee;
+    return {
+        ok: true, service, urgency: urgencyKey, urgencyLabel: PRICING.urgency[urgencyKey].label, source,
+        lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)),
+        km, base, travel, urgencyFee, total: base + travel + urgencyFee
+    };
+}
+
 function normalizePhone(raw) {
     let p = String(raw || '').replace(/[\s\-()]/g, '');
     if (p.startsWith('+')) p = p.slice(1);
@@ -514,7 +590,13 @@ function rowToBooking(r) {
         createdAt: Number(r.created_at),
         paidAt: r.paid_at ? Number(r.paid_at) : null,
         receiptSent: Boolean(r.receipt_sent),
-        verified: Boolean(r.verified)
+        verified: Boolean(r.verified),
+        baseAmount: r.base_amount == null ? null : Number(r.base_amount),
+        travelKm: r.travel_km == null ? null : Number(r.travel_km),
+        travelFee: r.travel_fee == null ? null : Number(r.travel_fee),
+        urgency: r.urgency || '',
+        urgencyFee: r.urgency_fee == null ? null : Number(r.urgency_fee),
+        geo: r.geo || ''
     };
 }
 const BOOKING_SELECT = `SELECT b.*, COALESCE(u.email, '') AS email FROM bookings b LEFT JOIN users u ON u.id = b.user_id`;
@@ -532,9 +614,26 @@ function bookingFields(b, extra = {}) {
         Service: b.service,
         Location: b.location,
         Amount: `KES ${b.amount}`,
+        ...(b.baseAmount == null ? {} : {
+            'Service fee': `KES ${b.baseAmount}`,
+            'Travel fare': `KES ${b.travelFee || 0} (about ${b.travelKm} km from Rangwe)`,
+            Urgency: `${b.urgency || 'standard'}${b.urgencyFee ? ' (+KES ' + b.urgencyFee + ')' : ''}`
+        }),
+        ...(b.geo ? { 'Map pin': `https://www.google.com/maps?q=${b.geo}` } : {}),
         Reference: b.accountRef,
         ...extra
     };
+}
+
+// Lines like "Base fee: KES 3,000" for receipts, emails and pages. Empty for bookings made before this feature.
+function breakdownLines(b) {
+    if (b.baseAmount == null) return [];
+    const kes = n => 'KES ' + Number(n).toLocaleString('en-KE');
+    const lines = [['Service fee', kes(b.baseAmount)]];
+    lines.push([`Travel fare${b.travelKm != null ? ' (about ' + b.travelKm + ' km from Rangwe)' : ''}`, b.travelFee ? kes(b.travelFee) : 'Free']);
+    const u = PRICING.urgency[b.urgency];
+    if (b.urgencyFee) lines.push([`Urgency (${u ? u.label : b.urgency})`, kes(b.urgencyFee)]);
+    return lines;
 }
 
 // ---------------------------------------------------------------
@@ -591,6 +690,7 @@ function generatePdfBuffer(b) {
             ['Phone Number:', b.phone],
             ['Service Rendered:', b.service],
             ['Location:', b.location],
+            ...breakdownLines(b).map(([k, v]) => [k + ':', v]),
             ['Amount Paid:', `KES ${Number(b.amount).toLocaleString('en-KE')}`],
             ['M-Pesa Receipt:', b.receipt || 'See your M-Pesa SMS'],
             ['Date & Time:', dateStr],
@@ -631,7 +731,7 @@ function receiptEmailHtml(b, link) {
 <h2 style="margin:0 0 4px;">Payment received</h2>
 <p style="margin:0 0 16px;color:#5b7078;">Thank you, ${esc(b.name)}. Your receipt is attached to this email as a PDF.</p>
 <table style="width:100%;border-collapse:collapse;border-top:1px solid #d7dfd8;border-bottom:1px solid #d7dfd8;">
-${row('Service', b.service)}${row('Location', b.location)}${row('Amount paid', 'KES ' + b.amount.toLocaleString('en-KE'))}${row('M-Pesa receipt', b.receipt || 'See your M-Pesa SMS')}${row('Reference', b.accountRef)}
+${row('Service', b.service)}${row('Location', b.location)}${breakdownLines(b).map(([k, v]) => row(k, v)).join('')}${row('Amount paid', 'KES ' + b.amount.toLocaleString('en-KE'))}${row('M-Pesa receipt', b.receipt || 'See your M-Pesa SMS')}${row('Reference', b.accountRef)}
 </table>
 ${link ? `<p style="margin:20px 0;"><a href="${esc(link)}" style="display:inline-block;background:#0284c7;color:#ffffff;padding:10px 18px;border-radius:6px;text-decoration:none;font-weight:bold;">View your booking online</a></p>` : ''}
 <p>An engineer will call you on ${esc(b.phone)} to agree a time for the visit.</p>
@@ -640,7 +740,7 @@ ${link ? `<p style="margin:20px 0;"><a href="${esc(link)}" style="display:inline
 }
 function receiptEmailText(b, link) {
     return `Payment received\n\nThank you, ${b.name}. Your receipt is attached to this email as a PDF.\n\n` +
-        `Service: ${b.service}\nLocation: ${b.location}\nAmount paid: KES ${b.amount.toLocaleString('en-KE')}\n` +
+        `Service: ${b.service}\nLocation: ${b.location}\n${breakdownLines(b).map(([k, v]) => k + ': ' + v + '\n').join('')}Amount paid: KES ${b.amount.toLocaleString('en-KE')}\n` +
         `M-Pesa receipt: ${b.receipt || 'See your M-Pesa SMS'}\nReference: ${b.accountRef}\n` +
         (link ? `\nView your booking online: ${link}\n` : '') +
         `\nAn engineer will call you on ${b.phone} to agree a time for the visit.\n\nTencent Innovations, Rangwe, Homa Bay County. Calls 0740 311 014\n`;
@@ -904,6 +1004,9 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
 
         .general-container { padding: 40px 30px; max-width: 900px; margin: 0 auto; }
         .general-container h2 { margin-top: 0; }
+        .quote-box { background: var(--bg); border: 1px dashed var(--border); border-radius: 8px; padding: 12px 14px; margin: 0 0 16px 0; color: var(--muted); }
+        .quote-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; color: var(--text); }
+        .quote-row.total { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 8px; font-weight: bold; color: var(--accent); }
         .terms h3 { color: var(--primary); margin-top: 28px; }
         .terms p.clause { margin: 8px 0; }
         .terms p.clause strong { color: var(--accent); margin-right: 6px; }
@@ -1302,6 +1405,14 @@ servicePage('/solar', 'solar', 'Solar Solutions',
 // ---------------------------------------------------------------
 // 16. Survey booking and payment (login required)
 // ---------------------------------------------------------------
+const quoteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { ok: false, error: 'Too many requests. Please wait a moment.' } });
+// Live price for the booking form. The same function prices the real booking, so the two can never disagree.
+app.get('/survey/quote', requireAuth, quoteLimiter, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const q = computeQuote({ service: str(req.query.service), urgency: str(req.query.urgency), place: str(req.query.place), lat: str(req.query.lat), lng: str(req.query.lng) });
+    res.json(q.ok ? { ok: true, base: q.base, km: q.km, travel: q.travel, urgencyFee: q.urgencyFee, urgencyLabel: q.urgencyLabel, total: q.total } : q);
+});
+
 app.get('/survey', requireAuth, (req, res) => {
     const u = req.session.user;
     const content = `
@@ -1317,19 +1428,71 @@ app.get('/survey', requireAuth, (req, res) => {
                     <div class="form-group">
                         <label for="s-service">Service Category</label>
                         <select name="service" id="s-service">
-                            <option value="Site Survey & Quotation">General Site Survey (KES 3,000)</option>
-                            <option value="WiFi Setup">WiFi & Hotspot Consultation (KES 3,000)</option>
-                            <option value="CCTV Installation">CCTV System Assessment (KES 3,000)</option>
-                            <option value="Smart Locks">Smart Locks Consultation (KES 2,500)</option>
-                            <option value="Electric Fence">Electric Fence Survey (KES 5,000)</option>
-                            <option value="Solar Consultation">Solar Consultation & Sizing (KES 4,000)</option>
+                            <option value="Site Survey & Quotation">General Site Survey (from KES 3,000)</option>
+                            <option value="WiFi Setup">WiFi & Hotspot Consultation (from KES 3,000)</option>
+                            <option value="CCTV Installation">CCTV System Assessment (from KES 3,000)</option>
+                            <option value="Smart Locks">Smart Locks Consultation (from KES 2,500)</option>
+                            <option value="Electric Fence">Electric Fence Survey (from KES 5,000)</option>
+                            <option value="Solar Consultation">Solar Consultation & Sizing (from KES 4,000)</option>
                         </select>
-                        <small>Prices can change according to the location and urgency. Thank you.</small>
+                        <small>These are base fees. A travel fare (by distance from Rangwe) and an urgency fee are added below. Prices can change according to the location and urgency. Thank you.</small>
                     </div>
-                    <div class="form-group"><label for="s-loc">Physical Location / Address</label><input id="s-loc" type="text" name="location" required maxlength="120" placeholder="e.g. Rangwe Town, Homa Bay"></div>
+                    <div class="form-group">
+                        <label for="s-urgency">How soon do you need us?</label>
+                        <select name="urgency" id="s-urgency">
+                            ${Object.entries(PRICING.urgency).map(([k, u]) => `<option value="${esc(k)}">${esc(u.label)}${u.fee ? ' (+KES ' + u.fee.toLocaleString('en-KE') + ')' : ''}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="s-place">Where is the site?</label>
+                        <select name="place" id="s-place">
+                            <option value="">Choose your area...</option>
+                            ${Object.entries(PLACES).map(([k, pl]) => `<option value="${esc(k)}">${esc(pl.label)}</option>`).join('')}
+                        </select>
+                        <button type="button" id="s-gps" class="cta-btn small" style="margin-top:10px;">📍 Use my current location instead</button>
+                        <small id="s-gps-note" style="display:block; margin-top:6px;">Sharing your location gives the most accurate travel fare. It is used only for this quote and to find your site.</small>
+                        <input type="hidden" name="lat" id="s-lat"><input type="hidden" name="lng" id="s-lng">
+                    </div>
+                    <div class="form-group"><label for="s-loc">Physical Location / Address</label><input id="s-loc" type="text" name="location" required maxlength="120" placeholder="e.g. Rangwe Town, near the market"></div>
+                    <div id="quote-box" class="quote-box" aria-live="polite">Choose your area to see the total.</div>
                     <p style="color:var(--muted); font-size:0.9rem; margin:0 0 12px 0;">By booking, you agree to our <a href="/terms" target="_blank" rel="noopener">Terms and Conditions</a>.</p>
-                    <button type="submit" class="cta-btn block green">Trigger M-Pesa Payment & Book Survey</button>
+                    <button type="submit" id="s-submit" class="cta-btn block green" disabled>Trigger M-Pesa Payment & Book Survey</button>
                 </form>
+                <script nonce="${req.nonce}">
+                (function () {
+                    var f = document.getElementById('payment-form'), box = document.getElementById('quote-box'), btn = document.getElementById('s-submit');
+                    var lat = document.getElementById('s-lat'), lng = document.getElementById('s-lng'), place = document.getElementById('s-place'), note = document.getElementById('s-gps-note');
+                    function kes(n) { return 'KES ' + Number(n).toLocaleString('en-KE'); }
+                    function row(k, v, strong) { var r = document.createElement('div'); r.className = 'quote-row' + (strong ? ' total' : ''); var a = document.createElement('span'), b = document.createElement('span'); a.textContent = k; b.textContent = v; r.appendChild(a); r.appendChild(b); return r; }
+                    var seq = 0;
+                    function refresh() {
+                        var mine = ++seq;
+                        var q = new URLSearchParams({ service: f.service.value, urgency: f.urgency.value, place: place.value, lat: lat.value, lng: lng.value });
+                        btn.disabled = true;
+                        fetch('/survey/quote?' + q.toString(), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
+                            if (mine !== seq) return;
+                            box.textContent = '';
+                            if (!d.ok) { box.textContent = d.error || 'Choose your area to see the total.'; return; }
+                            box.appendChild(row('Service fee', kes(d.base)));
+                            box.appendChild(row('Travel fare (about ' + d.km + ' km from Rangwe)', d.travel ? kes(d.travel) : 'Free'));
+                            if (d.urgencyFee) box.appendChild(row('Urgency (' + d.urgencyLabel + ')', kes(d.urgencyFee)));
+                            box.appendChild(row('Total to pay now', kes(d.total), true));
+                            btn.disabled = false;
+                        }).catch(function () { if (mine === seq) box.textContent = 'We could not work out the total. Please try again.'; });
+                    }
+                    ['service', 'urgency'].forEach(function (n) { f[n].addEventListener('change', refresh); });
+                    place.addEventListener('change', function () { lat.value = ''; lng.value = ''; note.textContent = 'Using the area you chose.'; refresh(); });
+                    document.getElementById('s-gps').addEventListener('click', function () {
+                        if (!navigator.geolocation) { note.textContent = 'Your browser cannot share location. Please choose your area instead.'; return; }
+                        note.textContent = 'Finding your location...';
+                        navigator.geolocation.getCurrentPosition(function (pos) {
+                            lat.value = pos.coords.latitude.toFixed(5); lng.value = pos.coords.longitude.toFixed(5); place.value = '';
+                            note.textContent = 'Location shared. Thank you.'; refresh();
+                        }, function () { note.textContent = 'We could not get your location. Please choose your area instead.'; }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 });
+                    });
+                    refresh();
+                })();
+                </script>
             </div>
         </div>`;
     res.send(renderPage(req, { title: 'Surveys & Quotations', activeNav: 'survey', content }));
@@ -1342,9 +1505,10 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, requireDb, ah(async 
     const service = str(req.body.service);
     const phone = normalizePhone(str(req.body.phone));
     const back = { href: '/survey', label: 'Back to Surveys' };
+    const quote = computeQuote({ service, urgency: str(req.body.urgency), place: str(req.body.place), lat: str(req.body.lat), lng: str(req.body.lng) });
 
     if (!name || !location) return errorPage(req, res, 400, 'We could not start your payment', 'Please enter your name and location.', back);
-    if (!Object.hasOwn(SERVICE_PRICES, service)) return errorPage(req, res, 400, 'We could not start your payment', 'Please choose a valid service.', back);
+    if (!quote.ok) return errorPage(req, res, 400, 'We could not start your payment', quote.error, back);
     if (!phone) return errorPage(req, res, 400, 'We could not start your payment', 'Please enter a valid Safaricom number, for example 0712345678.', back);
     if (!phoneAttemptAllowed(phone)) return errorPage(req, res, 429, 'Too many attempts', 'Too many payment requests for this number. Please try again later.', back);
 
@@ -1354,15 +1518,19 @@ app.post('/submit-survey-payment', requireAuth, payLimiter, requireDb, ah(async 
         const candidate = {
             id: crypto.randomBytes(16).toString('hex'),
             userId: user.id, name, phone, service, location,
-            amount: SERVICE_PRICES[service],
+            amount: quote.total,   // base fee + travel fare + urgency fee, all worked out on the server
+            baseAmount: quote.base, travelKm: quote.km, travelFee: quote.travel, urgency: quote.urgency, urgencyFee: quote.urgencyFee,
+            geo: `${quote.lat},${quote.lng}`,
             accountRef: 'TNC' + crypto.randomBytes(4).toString('hex').toUpperCase(),
             email: user.email
         };
         try {
             await pool.query(
-                `INSERT INTO bookings (id, user_id, name, phone, service, location, amount, account_ref, status, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)`,
-                [candidate.id, candidate.userId, name, phone, service, location, candidate.amount, candidate.accountRef, Date.now()]
+                `INSERT INTO bookings (id, user_id, name, phone, service, location, amount, account_ref, status, created_at,
+                                       base_amount, travel_km, travel_fee, urgency, urgency_fee, geo)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, $14, $15)`,
+                [candidate.id, candidate.userId, name, phone, service, location, candidate.amount, candidate.accountRef, Date.now(),
+                 candidate.baseAmount, candidate.travelKm, candidate.travelFee, candidate.urgency, candidate.urgencyFee, candidate.geo]
             );
             booking = candidate;
         } catch (err) {
@@ -1538,6 +1706,7 @@ app.get('/booking/:token', requireDb, ah(async (req, res) => {
                 ${row('Phone Number', esc(b.phone))}
                 ${row('Service', esc(b.service))}
                 ${row('Location', esc(b.location))}
+                ${breakdownLines(b).map(([k, v]) => row(k, esc(v))).join('')}
                 ${row(isPaid ? 'Amount Paid' : 'Amount Due', 'KES ' + b.amount.toLocaleString('en-KE'))}
                 ${isPaid ? row('M-Pesa Receipt', esc(b.receipt || 'See your M-Pesa SMS')) : ''}
                 ${row('Reference', esc(b.accountRef))}
