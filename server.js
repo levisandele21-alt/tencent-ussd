@@ -125,6 +125,14 @@ const loginLimiter = rateLimit({
     skipSuccessfulRequests: true,   // only failed logins count
     message: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.'
 });
+const forgotLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 8, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many password reset requests from this network. Please try again later.'
+});
+const resetLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many attempts. Please wait a few minutes and try again.'
+});
 const resendLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many email requests. Please try again later.' });
 app.use(limiter);
 
@@ -198,6 +206,19 @@ async function initDb() {
             // First run of this version: receipts for payments that were already made are not re-sent
             await pool.query(`UPDATE bookings SET receipt_sent = TRUE WHERE status = 'paid'`);
         }
+        // Email confirmation and password reset
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                id SERIAL PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                kind VARCHAR(10) NOT NULL,
+                token_hash CHAR(64) NOT NULL UNIQUE,
+                expires_at BIGINT NOT NULL,
+                used_at BIGINT,
+                created_at BIGINT NOT NULL
+            )`);
+        await pool.query('CREATE INDEX IF NOT EXISTS auth_tokens_user_idx ON auth_tokens (user_id, kind)');
         await pool.query('CREATE INDEX IF NOT EXISTS bookings_user_idx ON bookings (user_id, created_at DESC)');
         await pool.query('CREATE INDEX IF NOT EXISTS bookings_checkout_idx ON bookings (checkout_request_id)');
         // Uniqueness: skipped (with a warning) only if old data already contains duplicates
@@ -284,6 +305,118 @@ function requireDb(req, res, next) {
 }
 const regenerateSession = req => new Promise((resolve, reject) => req.session.regenerate(err => (err ? reject(err) : resolve())));
 const saveSession = req => new Promise((resolve, reject) => req.session.save(err => (err ? reject(err) : resolve())));
+
+// Booking needs a confirmed email, so receipts can only ever go to an inbox the customer controls
+async function requireVerified(req, res, next) {
+    try {
+        const u = req.session && req.session.user;
+        if (!u) return res.redirect('/login');
+        if (u.verified) return next();
+        const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [u.id]);   // may have been confirmed in another browser
+        if (r.rows[0] && r.rows[0].email_verified) {
+            u.verified = true;
+            return next();
+        }
+        return res.redirect('/verify-email/pending');
+    } catch (err) { next(err); }
+}
+
+// Passwords
+const COMMON_PASSWORDS = new Set(['password', 'password1', 'password123', '12345678', '123456789', '1234567890', 'qwertyuiop', 'qwerty123', '11111111', '00000000', 'iloveyou1', 'tencent123']);
+function passwordProblem(password, confirm, email = '') {
+    if (password.length < 8) return 'Your password must be at least 8 characters.';
+    if (Buffer.byteLength(password) > 72) return 'Your password is too long. Please use 72 characters or fewer.';
+    if (COMMON_PASSWORDS.has(password.toLowerCase()) || (email && password.toLowerCase() === email.toLowerCase())) return 'That password is too easy to guess. Please choose a different one.';
+    if (password !== confirm) return 'The two passwords do not match.';
+    return '';
+}
+
+// Lockout: 6 wrong passwords for the same email within 15 minutes locks sign-in for that email for 15 minutes.
+// Unknown emails are counted the same way, so the lock message never reveals whether an account exists.
+// Resetting the password through the emailed link clears the lock.
+const LOCK_AFTER = 6, LOCK_MS = 15 * 60 * 1000;
+const loginFails = new Map();   // email -> { count, first, lockedUntil }
+function lockedMinutes(email) {
+    const f = loginFails.get(email);
+    return f && f.lockedUntil > Date.now() ? Math.ceil((f.lockedUntil - Date.now()) / 60000) : 0;
+}
+function recordLoginFailure(email) {
+    const now = Date.now();
+    let f = loginFails.get(email);
+    if (!f || now - f.first > LOCK_MS) f = { count: 0, first: now, lockedUntil: 0 };
+    f.count += 1;
+    if (f.count >= LOCK_AFTER) f.lockedUntil = now + LOCK_MS;
+    loginFails.set(email, f);
+}
+const clearLoginFailures = email => loginFails.delete(email);
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, f] of loginFails) if (now - f.first > LOCK_MS && f.lockedUntil < now) loginFails.delete(k);
+    for (const [k, t] of emailCooldown) if (now - t > 10 * 60 * 1000) emailCooldown.delete(k);
+}, 10 * 60 * 1000).unref();
+
+// One-time links sent by email (confirm email, reset password). Only a hash is stored, so a database leak cannot be used to take over accounts.
+const emailCooldown = new Map();   // "kind:userId" -> last send time
+const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
+const TOKEN_FORMAT = /^[A-Za-z0-9_-]{43}$/;
+async function createAuthToken(userId, kind, ttlMs) {
+    const raw = crypto.randomBytes(32).toString('base64url');
+    await pool.query('DELETE FROM auth_tokens WHERE user_id = $1 AND kind = $2', [userId, kind]);   // only the newest link works
+    await pool.query('INSERT INTO auth_tokens (user_id, kind, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)',
+        [userId, kind, sha256(raw), Date.now() + ttlMs, Date.now()]);
+    return raw;
+}
+async function peekAuthToken(raw, kind) {
+    if (!TOKEN_FORMAT.test(String(raw || ''))) return null;
+    const r = await pool.query('SELECT user_id FROM auth_tokens WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3', [sha256(raw), kind, Date.now()]);
+    return r.rows[0] ? r.rows[0].user_id : null;
+}
+async function useAuthToken(raw, kind) {   // atomic: a link can only be used once, even if clicked twice at the same moment
+    if (!TOKEN_FORMAT.test(String(raw || ''))) return null;
+    const r = await pool.query('UPDATE auth_tokens SET used_at = $3 WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3 RETURNING user_id', [sha256(raw), kind, Date.now()]);
+    return r.rows[0] ? r.rows[0].user_id : null;
+}
+function cooldownOk(kind, userId, ms) {
+    const key = kind + ':' + userId, now = Date.now();
+    if (now - (emailCooldown.get(key) || 0) < ms) return false;
+    emailCooldown.set(key, now);
+    return true;
+}
+// Links in emails always use your own address from PUBLIC_BASE_URL, never the Host header (that would let an attacker poison reset links)
+function emailLink(path) {
+    if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL is not set, so account emails cannot be sent');
+    return PUBLIC_BASE_URL + path;
+}
+const mailShell = (heading, bodyHtml) => `<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#17323a;line-height:1.5;"><h2 style="margin:0 0 12px;">${heading}</h2>${bodyHtml}<p style="color:#5b7078;font-size:13px;margin-top:24px;">Tencent Innovations, Rangwe, Homa Bay County. Calls 0740 311 014</p></div>`;
+const mailButton = (href, label) => `<p style="margin:20px 0;"><a href="${esc(href)}" style="display:inline-block;background:#f4b400;color:#2a1f00;padding:11px 20px;border-radius:6px;text-decoration:none;font-weight:bold;">${esc(label)}</a></p><p style="font-size:13px;color:#5b7078;">If the button does not work, copy this link into your browser:<br>${esc(href)}</p>`;
+
+async function sendVerificationEmail(user) {
+    const link = emailLink('/verify-email?token=' + await createAuthToken(user.id, 'verify', 24 * 60 * 60 * 1000));
+    await sendMail({
+        to: user.email,
+        subject: 'Confirm your email address - Tencent Innovations',
+        html: mailShell('Confirm your email', `<p>Hello ${esc(user.name)}, please confirm your email address so we can send your receipts here and let you book services.</p>${mailButton(link, 'Confirm my email')}<p style="font-size:13px;">This link works for 24 hours. If you did not create an account, you can ignore this email.</p>`),
+        text: `Hello ${user.name},\n\nConfirm your email address so we can send your receipts here and let you book services:\n${link}\n\nThis link works for 24 hours. If you did not create an account, ignore this email.\n`
+    });
+}
+async function sendResetEmail(user) {
+    const link = emailLink('/reset-password?token=' + await createAuthToken(user.id, 'reset', 60 * 60 * 1000));
+    await sendMail({
+        to: user.email,
+        subject: 'Reset your password - Tencent Innovations',
+        html: mailShell('Reset your password', `<p>Hello ${esc(user.name)}, we received a request to reset your password.</p>${mailButton(link, 'Choose a new password')}<p style="font-size:13px;">This link works for 1 hour and can be used once. If you did not ask for this, ignore this email; your password stays the same.</p>`),
+        text: `Hello ${user.name},\n\nReset your password here (valid for 1 hour, one use):\n${link}\n\nIf you did not ask for this, ignore this email; your password stays the same.\n`
+    });
+}
+async function sendPasswordChangedEmail(user) {
+    await sendMail({
+        to: user.email,
+        subject: 'Your password was changed - Tencent Innovations',
+        html: mailShell('Password changed', `<p>Hello ${esc(user.name)}, the password for your Tencent Innovations account was just changed and you were signed out everywhere.</p><p>If this was not you, call us right away on 0740 311 014 and reset your password again.</p>`),
+        text: `Hello ${user.name},\n\nThe password for your Tencent Innovations account was just changed and you were signed out everywhere.\nIf this was not you, call 0740 311 014 and reset your password again.\n`
+    });
+}
+const quietly = (label, promise) => promise.catch(err => console.error(label + ':', err.message));
 
 // ---------------------------------------------------------------
 // 6. Email (receipts and alerts) and Telegram
@@ -1130,6 +1263,7 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
 
     <div class="main-content">
         <div class="container">
+            ${user && !user.verified && !/^\/(verify-email|logout)/.test(req.path) ? '<div class="alert" role="alert" style="margin-bottom:18px;">Please confirm your email address to book services. <a href="/verify-email/pending">Check how</a></div>' : ''}
             ${content}
         </div>
         <div class="contact-bar">
@@ -1244,9 +1378,8 @@ app.post('/register', registerLimiter, requireDb, ah(async (req, res) => {
     if (values.name.length < 2) return fail('Please enter your full name.');
     if (!validEmail(values.email)) return fail('Please enter a valid email address.');
     if (!phone) return fail('Please enter a valid Safaricom number, for example 0712345678.');
-    if (password.length < 8) return fail('Your password must be at least 8 characters.');
-    if (Buffer.byteLength(password) > 72) return fail('Your password is too long. Please use 72 characters or fewer.');
-    if (password !== confirm) return fail('The two passwords do not match.');
+    const pwError = passwordProblem(password, confirm, values.email);
+    if (pwError) return fail(pwError);
 
     const hash = await bcrypt.hash(password, BCRYPT_COST);
     let user;
@@ -1261,17 +1394,20 @@ app.post('/register', registerLimiter, requireDb, ah(async (req, res) => {
         throw err;
     }
     await regenerateSession(req);   // a fresh session id at login prevents session fixation
-    req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone };
+    req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: false };
     await saveSession(req);
-    res.redirect('/survey');
+    cooldownOk('verify', user.id, 60 * 1000);   // counts as the first send, so "send again" must wait a minute
+    await quietly('Verification email failed', sendVerificationEmail(user));
+    res.redirect('/verify-email/pending');
 }));
 
-function loginForm(req, { error = '', email = '', next = '/survey' } = {}) {
+function loginForm(req, { error = '', notice = '', email = '', next = '/survey' } = {}) {
     return `
         <div class="general-container">
             <h2>Login to Your Account</h2>
             <p class="sub-title">Access surveys, service bookings, and receipt downloads.</p>
             <div class="form-container">
+                ${notice ? `<div class="alert ok" role="status">${esc(notice)}</div>` : ''}
                 ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
                 <form action="/login" method="POST">
                     <input type="hidden" name="next" value="${esc(next)}">
@@ -1279,7 +1415,8 @@ function loginForm(req, { error = '', email = '', next = '/survey' } = {}) {
                     <div class="form-group"><label for="l-pass">Password</label><input id="l-pass" type="password" name="password" required maxlength="72" autocomplete="current-password"></div>
                     <button type="submit" class="cta-btn block">Login</button>
                 </form>
-                <p style="margin-top: 15px; text-align:center;">Don't have an account? <a href="/register">Register here</a></p>
+                <p style="margin-top: 15px; text-align:center;"><a href="/forgot-password">Forgot your password?</a></p>
+                <p style="margin-top: 10px; text-align:center;">Don't have an account? <a href="/register">Register here</a></p>
             </div>
         </div>`;
 }
@@ -1287,7 +1424,7 @@ function loginForm(req, { error = '', email = '', next = '/survey' } = {}) {
 app.get('/login', (req, res) => {
     const next = safeNext(req.query.next);
     if (req.session.user) return res.redirect(next);
-    res.send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { next }) }));
+    res.send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { next, notice: req.query.reset ? 'Your password was changed. Please log in with the new one.' : '' }) }));
 });
 
 app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
@@ -1295,17 +1432,133 @@ app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
     const password = typeof req.body.password === 'string' ? req.body.password.slice(0, 72) : '';
     const next = safeNext(req.body.next);
 
-    const r = await pool.query('SELECT id, name, email, phone, password_hash FROM users WHERE lower(email) = $1', [email]);
+    const wait = lockedMinutes(email);
+    if (wait) {
+        return res.status(429).send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { error: `Too many wrong attempts. Please wait about ${wait} minute${wait === 1 ? '' : 's'}, or reset your password.`, email, next }) }));
+    }
+    const r = await pool.query('SELECT id, name, email, phone, password_hash, email_verified FROM users WHERE lower(email) = $1', [email]);
     const user = r.rows[0];
     // Always run one bcrypt comparison, so unknown emails take as long as wrong passwords
     const match = await bcrypt.compare(password, user ? user.password_hash : DUMMY_HASH);
     if (!user || !match) {
+        recordLoginFailure(email);
         return res.status(401).send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { error: 'Invalid email or password.', email, next }) }));
     }
+    clearLoginFailures(email);
     await regenerateSession(req);
-    req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone };
+    req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: Boolean(user.email_verified) };
     await saveSession(req);
     res.redirect(next);
+}));
+
+// ---------------------------------------------------------------
+// Email confirmation
+// ---------------------------------------------------------------
+const noStore = (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); };
+const simplePage = (req, res, status, title, bodyHtml) => res.status(status).send(renderPage(req, { title, activeNav: '', content: `<div class="general-container"><h2>${esc(title)}</h2>${bodyHtml}</div>` }));
+
+app.get('/verify-email/pending', requireAuth, requireDb, noStore, ah(async (req, res) => {
+    const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [req.session.user.id]);
+    if (r.rows[0] && r.rows[0].email_verified) { req.session.user.verified = true; return res.redirect('/survey'); }
+    const sent = req.query.sent === '1';
+    simplePage(req, res, 200, 'Confirm your email', `
+        ${sent ? '<div class="alert ok" role="status">We sent a new confirmation link. Please check your inbox (and spam folder).</div>' : ''}
+        <p class="intro-text">We sent a confirmation link to <strong>${esc(req.session.user.email)}</strong>. Open it to finish setting up your account. You need this before you can book a service, because your receipts are emailed to this address.</p>
+        <form action="/verify-email/resend" method="POST"><button type="submit" class="cta-btn">Send the link again</button></form>
+        <p style="margin-top:18px; color:var(--muted);">Wrong email address? Please <a href="/contact">contact us</a> and we will fix it.</p>`);
+}));
+
+app.post('/verify-email/resend', requireAuth, requireDb, resendLimiter, ah(async (req, res) => {
+    const u = req.session.user;
+    if (cooldownOk('verify', u.id, 60 * 1000)) {
+        const r = await pool.query('SELECT id, name, email, email_verified FROM users WHERE id = $1', [u.id]);
+        if (r.rows[0] && !r.rows[0].email_verified) await quietly('Verification email failed', sendVerificationEmail(r.rows[0]));
+    }
+    res.redirect('/verify-email/pending?sent=1');
+}));
+
+app.get('/verify-email', requireDb, noStore, ah(async (req, res) => {
+    const userId = await useAuthToken(String(req.query.token || ''), 'verify');
+    if (!userId) {
+        return simplePage(req, res, 400, 'Link not valid', `<p class="intro-text">This confirmation link has expired or was already used. If you have not confirmed your email yet, log in and we will send you a new link.</p><a href="/login" class="cta-btn">Log in</a>`);
+    }
+    await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [userId]);
+    if (req.session.user && req.session.user.id === userId) req.session.user.verified = true;
+    simplePage(req, res, 200, 'Email confirmed', `<div class="alert ok" role="status">Thank you. Your email address is confirmed.</div><p class="intro-text">You can now book services and receive your receipts by email.</p><a href="${req.session.user ? '/survey' : '/login'}" class="cta-btn">${req.session.user ? 'Book a Survey' : 'Log in'}</a>`);
+}));
+
+// ---------------------------------------------------------------
+// Forgot / reset password
+// ---------------------------------------------------------------
+function forgotForm(error = '') {
+    return `<div class="general-container">
+        <h2>Forgot Your Password?</h2>
+        <p class="sub-title">Enter your account email and we will send you a link to choose a new one.</p>
+        <div class="form-container">
+            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+            <form action="/forgot-password" method="POST">
+                <div class="form-group"><label for="f-email">Email Address</label><input id="f-email" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="john@example.com"></div>
+                <button type="submit" class="cta-btn block">Send Reset Link</button>
+            </form>
+            <p style="margin-top: 15px; text-align:center;"><a href="/login">Back to login</a></p>
+        </div></div>`;
+}
+app.get('/forgot-password', noStore, (req, res) => {
+    if (req.session.user) return res.redirect('/requests');
+    res.send(renderPage(req, { title: 'Forgot Password', activeNav: 'login', content: forgotForm() }));
+});
+app.post('/forgot-password', forgotLimiter, requireDb, ah(async (req, res) => {
+    const email = str(req.body.email).toLowerCase().slice(0, 254);
+    if (!validEmail(email)) return res.status(400).send(renderPage(req, { title: 'Forgot Password', activeNav: 'login', content: forgotForm('Please enter a valid email address.') }));
+    // The same answer is given whether or not the account exists, and the work happens after replying so timing reveals nothing
+    simplePage(req, res, 200, 'Check your email', `<p class="intro-text">If an account exists for <strong>${esc(email)}</strong>, we have sent a link to reset the password. It works for 1 hour. Please check your spam folder too.</p><a href="/login" class="cta-btn">Back to login</a>`);
+    quietly('Password reset email failed', (async () => {
+        const r = await pool.query('SELECT id, name, email FROM users WHERE lower(email) = $1', [email]);
+        const user = r.rows[0];
+        if (user && cooldownOk('reset', user.id, 2 * 60 * 1000)) await sendResetEmail(user);
+    })());
+}));
+
+function resetForm(token, error = '') {
+    return `<div class="general-container">
+        <h2>Choose a New Password</h2>
+        <div class="form-container">
+            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+            <form action="/reset-password" method="POST">
+                <input type="hidden" name="token" value="${esc(token)}">
+                <div class="form-group"><label for="p-pass">New Password</label><input id="p-pass" type="password" name="password" required minlength="8" maxlength="72" autocomplete="new-password"><small>At least 8 characters.</small></div>
+                <div class="form-group"><label for="p-pass2">Confirm New Password</label><input id="p-pass2" type="password" name="confirm" required minlength="8" maxlength="72" autocomplete="new-password"></div>
+                <button type="submit" class="cta-btn block">Change Password</button>
+            </form>
+        </div></div>`;
+}
+const badResetLink = (req, res) => simplePage(req, res, 400, 'Link not valid', `<p class="intro-text">This reset link has expired or was already used. Please request a new one.</p><a href="/forgot-password" class="cta-btn">Request a new link</a>`);
+app.get('/reset-password', resetLimiter, requireDb, noStore, ah(async (req, res) => {
+    const token = String(req.query.token || '');
+    if (!(await peekAuthToken(token, 'reset'))) return badResetLink(req, res);
+    res.send(renderPage(req, { title: 'Reset Password', activeNav: 'login', content: resetForm(token) }));
+}));
+app.post('/reset-password', resetLimiter, requireDb, noStore, ah(async (req, res) => {
+    const token = typeof req.body.token === 'string' ? req.body.token : '';
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    const confirm = typeof req.body.confirm === 'string' ? req.body.confirm : '';
+    if (!(await peekAuthToken(token, 'reset'))) return badResetLink(req, res);
+    const problem = passwordProblem(password, confirm);
+    if (problem) return res.status(400).send(renderPage(req, { title: 'Reset Password', activeNav: 'login', content: resetForm(token, problem) }));
+
+    const userId = await useAuthToken(token, 'reset');   // consumed here, so the link cannot be used twice
+    if (!userId) return badResetLink(req, res);
+    const hash = await bcrypt.hash(password, BCRYPT_COST);
+    // Using the emailed link proves the customer controls the inbox, so the email counts as confirmed too
+    const r = await pool.query('UPDATE users SET password_hash = $2, email_verified = TRUE WHERE id = $1 RETURNING id, name, email', [userId, hash]);
+    const user = r.rows[0];
+    await pool.query(`DELETE FROM session WHERE (sess->'user'->>'id') = $1`, [String(userId)]);   // sign the account out everywhere
+    await pool.query(`DELETE FROM auth_tokens WHERE user_id = $1`, [userId]);
+    if (user) {
+        clearLoginFailures(user.email.toLowerCase());
+        quietly('Password changed email failed', sendPasswordChangedEmail(user));
+    }
+    res.redirect('/login?reset=1');
 }));
 
 // POST, so another website cannot log people out with a link or image
@@ -1407,13 +1660,13 @@ servicePage('/solar', 'solar', 'Solar Solutions',
 // ---------------------------------------------------------------
 const quoteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { ok: false, error: 'Too many requests. Please wait a moment.' } });
 // Live price for the booking form. The same function prices the real booking, so the two can never disagree.
-app.get('/survey/quote', requireAuth, quoteLimiter, (req, res) => {
+app.get('/survey/quote', requireAuth, requireDb, requireVerified, quoteLimiter, (req, res) => {
     res.set('Cache-Control', 'no-store');
     const q = computeQuote({ service: str(req.query.service), urgency: str(req.query.urgency), place: str(req.query.place), lat: str(req.query.lat), lng: str(req.query.lng) });
     res.json(q.ok ? { ok: true, base: q.base, km: q.km, travel: q.travel, urgencyFee: q.urgencyFee, urgencyLabel: q.urgencyLabel, total: q.total } : q);
 });
 
-app.get('/survey', requireAuth, (req, res) => {
+app.get('/survey', requireAuth, requireDb, requireVerified, (req, res) => {
     const u = req.session.user;
     const content = `
         <div class="general-container">
@@ -1498,7 +1751,7 @@ app.get('/survey', requireAuth, (req, res) => {
     res.send(renderPage(req, { title: 'Surveys & Quotations', activeNav: 'survey', content }));
 });
 
-app.post('/submit-survey-payment', requireAuth, payLimiter, requireDb, ah(async (req, res) => {
+app.post('/submit-survey-payment', requireAuth, requireDb, requireVerified, payLimiter, ah(async (req, res) => {
     const user = req.session.user;
     const name = str(req.body.name).slice(0, 80);
     const location = str(req.body.location).slice(0, 120);
