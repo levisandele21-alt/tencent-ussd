@@ -23,14 +23,14 @@ process.on('unhandledRejection', err => console.error('Unhandled rejection:', er
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);   // Render sits in front of the app
+app.set('trust proxy', 1);
 
 // ---------------------------------------------------------------
 // 0. Settings
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-const LINK_SECRET = process.env.LINK_SECRET || '';   // must be its own secret, never the M-Pesa callback secret
+const LINK_SECRET = process.env.LINK_SECRET || '';
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 if (LINK_SECRET.length < 16) console.error('LINK_SECRET is missing or shorter than 16 characters: shareable booking links are switched off.');
 if (SESSION_SECRET.length < 32) console.error('SESSION_SECRET is missing or shorter than 32 characters: everyone is logged out whenever the server restarts. Add a long random value in Render.');
@@ -48,24 +48,21 @@ function esc(value = '') {
 }
 const flat = value => (Array.isArray(value) ? value.join(', ') : (value || ''));
 const str = v => (typeof v === 'string' ? v.trim() : '');
-const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);   // Express 4 does not catch async errors by itself
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-// Only plain image/video files in the project folder are public. Source code, package.json and
-// any key or .env file are never served.
 const PUBLIC_FILE = /^\/[A-Za-z0-9_.-]+\.(png|jpe?g|gif|webp|svg|ico|mp4|webm)$/i;
 const staticFiles = express.static(__dirname, { dotfiles: 'ignore', index: false, redirect: false, maxAge: '1h' });
 
-// The logo file name has been wrong before (double extension), so find it instead of hard-coding it
 let LOGO_FILE = '';
 try {
     const images = fs.readdirSync(__dirname).filter(f => /\.(png|jpe?g|webp|svg)$/i.test(f) && /logo/i.test(f));
     LOGO_FILE = images.find(f => /^tencent/i.test(f)) || images[0] || '';
-} catch (_) { /* no logo, the site still works */ }
+} catch (_) {}
 let HERO_VIDEO = false;
-try { HERO_VIDEO = fs.existsSync(path.join(__dirname, 'hero.mp4')); } catch (_) { /* optional */ }
+try { HERO_VIDEO = fs.existsSync(path.join(__dirname, 'hero.mp4')); } catch (_) {}
 
 // ---------------------------------------------------------------
-// 2. Security headers (with a Content-Security-Policy) and public files
+// 2. Security headers & public files
 // ---------------------------------------------------------------
 app.use((req, res, next) => {
     res.locals.nonce = crypto.randomBytes(16).toString('base64');
@@ -102,7 +99,7 @@ app.get('/brand-logo', (req, res, next) => {
 });
 
 // ---------------------------------------------------------------
-// 3. Rate limits (before the session, so floods never reach the database)
+// 3. Rate limits
 // ---------------------------------------------------------------
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -113,27 +110,11 @@ const limiter = rateLimit({
     skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/') || req.path.startsWith('/api/pos/mpesa/callback/')
 });
 const statusLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 400, standardHeaders: true, legacyHeaders: false, message: { status: 'unknown' } });
-const payLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many payment attempts from this network. Please try again later.'
-});
-const registerLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many sign-up attempts from this network. Please try again later.'
-});
-const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    skipSuccessfulRequests: true,   // only failed logins count
-    message: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.'
-});
-const forgotLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 8, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many password reset requests from this network. Please try again later.'
-});
-const resetLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many attempts. Please wait a few minutes and try again.'
-});
+const payLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many payment attempts from this network. Please try again later.' });
+const registerLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many sign-up attempts from this network. Please try again later.' });
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, skipSuccessfulRequests: true, message: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
+const forgotLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 8, standardHeaders: true, legacyHeaders: false, message: 'Too many password reset requests from this network. Please try again later.' });
+const resetLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: 'Too many attempts. Please wait a few minutes and try again.' });
 const resendLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many email requests. Please try again later.' });
 app.use(limiter);
 
@@ -150,12 +131,12 @@ let dbReady = false;
 
 if (dbEnabled) {
     let host = '';
-    try { host = new URL(DATABASE_URL).hostname; } catch (_) { /* pg reports a bad URL itself */ }
+    try { host = new URL(DATABASE_URL).hostname; } catch (_) {}
     const sslMode = (process.env.DATABASE_SSL || '').toLowerCase();
     let ssl;
     if (sslMode === 'off') ssl = false;
-    else if (sslMode === 'insecure') ssl = { rejectUnauthorized: false };   // only if your provider's certificate cannot be verified
-    else if (host === 'localhost' || host === '127.0.0.1' || (host && !host.includes('.'))) ssl = false;   // local, or Render's internal address
+    else if (sslMode === 'insecure') ssl = { rejectUnauthorized: false };
+    else if (host === 'localhost' || host === '127.0.0.1' || (host && !host.includes('.'))) ssl = false;
     else ssl = { rejectUnauthorized: true };
     pool = new Pool({ connectionString: DATABASE_URL, ssl, max: 8, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 });
     pool.on('error', err => console.error('Database pool error:', err.message));
@@ -191,12 +172,10 @@ async function initDb() {
                 created_at BIGINT NOT NULL,
                 paid_at BIGINT
             )`);
-        // Added later: safe to run on a database that already has the older tables
         const had = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'receipt_sent'`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_sent BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS email_status VARCHAR(300)`);
-        // Price breakdown (older bookings keep these empty and show only the total)
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS base_amount INT`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_km INT`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_fee INT`);
@@ -204,10 +183,8 @@ async function initDb() {
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS urgency_fee INT`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS geo VARCHAR(40)`);
         if (!had.rowCount) {
-            // First run of this version: receipts for payments that were already made are not re-sent
             await pool.query(`UPDATE bookings SET receipt_sent = TRUE WHERE status = 'paid'`);
         }
-        // Email confirmation and password reset
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`
             CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -220,7 +197,7 @@ async function initDb() {
                 created_at BIGINT NOT NULL
             )`);
         
-        // --- Multi-Tenant POS Tables ---
+        // Multi-Tenant POS Tables
         await pool.query(`
             CREATE TABLE IF NOT EXISTS businesses (
                 id SERIAL PRIMARY KEY,
@@ -270,12 +247,11 @@ async function initDb() {
         await pool.query('CREATE INDEX IF NOT EXISTS auth_tokens_user_idx ON auth_tokens (user_id, kind)');
         await pool.query('CREATE INDEX IF NOT EXISTS bookings_user_idx ON bookings (user_id, created_at DESC)');
         await pool.query('CREATE INDEX IF NOT EXISTS bookings_checkout_idx ON bookings (checkout_request_id)');
-        // Uniqueness: skipped (with a warning) only if old data already contains duplicates
         for (const sql of [
             'CREATE UNIQUE INDEX IF NOT EXISTS bookings_account_ref_uq ON bookings (account_ref)',
             'CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq ON users (lower(email))'
         ]) {
-            try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
+            try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index:', e.message); }
         }
         dbReady = true;
         console.log('PostgreSQL tables initialized successfully.');
@@ -294,11 +270,11 @@ app.use(session({
     name: 'tc.sid',
     secret: SESSION_SECRET.length >= 32 ? SESSION_SECRET : crypto.randomBytes(32).toString('hex'),
     resave: false,
-    saveUninitialized: false,   // visitors who never log in get no cookie
+    saveUninitialized: false,
     cookie: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: 'auto',   // secure whenever the request came over HTTPS (Render), without needing NODE_ENV
+        secure: 'auto',
         maxAge: 14 * 24 * 60 * 60 * 1000
     }
 }));
@@ -308,20 +284,16 @@ app.use((req, res, next) => {
     next();
 });
 
-// Reject form posts that come from other websites (CSRF). Browsers always say where a form came from;
-// cookies are also SameSite=Lax. Safaricom's callback is a machine call and is exempt.
 app.use((req, res, next) => {
     if (req.method !== 'POST' || req.path.startsWith('/payments/cb/') || req.path.startsWith('/api/pos/mpesa/callback/')) return next();
     const fetchSite = req.get('sec-fetch-site');
     const origin = req.get('origin');
     let blocked = false;
     if (fetchSite) {
-        // Modern browsers say exactly how the request relates to this site, so trust that and skip host comparisons
         blocked = fetchSite === 'cross-site';
     } else if (origin) {
-        // Older browsers: compare the Origin with every name this site is reached by (Render, custom domain, proxy)
         const allowed = new Set([req.get('host'), req.get('x-forwarded-host')].filter(Boolean).map(h => h.split(',')[0].trim().toLowerCase()));
-        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) { /* not set */ }
+        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) {}
         try { blocked = !allowed.has(new URL(origin).host.toLowerCase()); } catch (_) { blocked = true; }
     }
     if (blocked) return errorPage(req, res, 403, 'Request blocked', 'This request came from another website, so it was blocked.');
@@ -329,10 +301,9 @@ app.use((req, res, next) => {
 });
 
 const BCRYPT_COST = 11;
-const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST);   // compared when the email is unknown, so timing does not reveal which emails exist
+const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST);
 const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
 
-// Only go back to our own pages after login (stops //evil.com style redirects)
 const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos']);
 function safeNext(value) {
     const v = typeof value === 'string' ? value : '';
@@ -355,13 +326,12 @@ function requireDb(req, res, next) {
 const regenerateSession = req => new Promise((resolve, reject) => req.session.regenerate(err => (err ? reject(err) : resolve())));
 const saveSession = req => new Promise((resolve, reject) => req.session.save(err => (err ? reject(err) : resolve())));
 
-// Booking needs a confirmed email, so receipts can only ever go to an inbox the customer controls
 async function requireVerified(req, res, next) {
     try {
         const u = req.session && req.session.user;
         if (!u) return res.redirect('/login');
         if (u.verified) return next();
-        const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [u.id]);   // may have been confirmed in another browser
+        const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [u.id]);
         if (r.rows[0] && r.rows[0].email_verified) {
             u.verified = true;
             return next();
@@ -370,7 +340,6 @@ async function requireVerified(req, res, next) {
     } catch (err) { next(err); }
 }
 
-// Passwords
 const COMMON_PASSWORDS = new Set(['password', 'password1', 'password123', '12345678', '123456789', '1234567890', 'qwertyuiop', 'qwerty123', '11111111', '00000000', 'iloveyou1', 'tencent123']);
 function passwordProblem(password, confirm, email = '') {
     if (password.length < 8) return 'Your password must be at least 8 characters.';
@@ -380,11 +349,8 @@ function passwordProblem(password, confirm, email = '') {
     return '';
 }
 
-// Lockout: 6 wrong passwords for the same email within 15 minutes locks sign-in for that email for 15 minutes.
-// Unknown emails are counted the same way, so the lock message never reveals whether an account exists.
-// Resetting the password through the emailed link clears the lock.
 const LOCK_AFTER = 6, LOCK_MS = 15 * 60 * 1000;
-const loginFails = new Map();   // email -> { count, first, lockedUntil }
+const loginFails = new Map();
 function lockedMinutes(email) {
     const f = loginFails.get(email);
     return f && f.lockedUntil > Date.now() ? Math.ceil((f.lockedUntil - Date.now()) / 60000) : 0;
@@ -404,13 +370,12 @@ setInterval(() => {
     for (const [k, t] of emailCooldown) if (now - t > 10 * 60 * 1000) emailCooldown.delete(k);
 }, 10 * 60 * 1000).unref();
 
-// One-time links sent by email (confirm email, reset password). Only a hash is stored, so a database leak cannot be used to take over accounts.
-const emailCooldown = new Map();   // "kind:userId" -> last send time
+const emailCooldown = new Map();
 const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
 const TOKEN_FORMAT = /^[A-Za-z0-9_-]{43}$/;
 async function createAuthToken(userId, kind, ttlMs) {
     const raw = crypto.randomBytes(32).toString('base64url');
-    await pool.query('DELETE FROM auth_tokens WHERE user_id = $1 AND kind = $2', [userId, kind]);   // only the newest link works
+    await pool.query('DELETE FROM auth_tokens WHERE user_id = $1 AND kind = $2', [userId, kind]);
     await pool.query('INSERT INTO auth_tokens (user_id, kind, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)',
         [userId, kind, sha256(raw), Date.now() + ttlMs, Date.now()]);
     return raw;
@@ -420,7 +385,7 @@ async function peekAuthToken(raw, kind) {
     const r = await pool.query('SELECT user_id FROM auth_tokens WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3', [sha256(raw), kind, Date.now()]);
     return r.rows[0] ? r.rows[0].user_id : null;
 }
-async function useAuthToken(raw, kind) {   // atomic: a link can only be used once, even if clicked twice at the same moment
+async function useAuthToken(raw, kind) {
     if (!TOKEN_FORMAT.test(String(raw || ''))) return null;
     const r = await pool.query('UPDATE auth_tokens SET used_at = $3 WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3 RETURNING user_id', [sha256(raw), kind, Date.now()]);
     return r.rows[0] ? r.rows[0].user_id : null;
@@ -431,7 +396,6 @@ function cooldownOk(kind, userId, ms) {
     emailCooldown.set(key, now);
     return true;
 }
-// Links in emails always use your own address from PUBLIC_BASE_URL, never the Host header (that would let an attacker poison reset links)
 function emailLink(path) {
     if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL is not set, so account emails cannot be sent');
     return PUBLIC_BASE_URL + path;
@@ -468,11 +432,11 @@ async function sendPasswordChangedEmail(user) {
 const quietly = (label, promise) => promise.catch(err => console.error(label + ':', err.message));
 
 // ---------------------------------------------------------------
-// 6. Email (receipts and alerts) and Telegram
+// 6. Email and Telegram
 // ---------------------------------------------------------------
 const MAIL = {
     brevoKey: process.env.BREVO_API_KEY || '',
-    brevoUrl: process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email',   // BREVO_API_URL exists so tests can use a mock
+    brevoUrl: process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email',
     fromEmail: process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || '',
     fromName: process.env.MAIL_FROM_NAME || 'Tencent Innovations',
     adminTo: process.env.NOTIFY_TO || process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || ''
@@ -489,7 +453,6 @@ function getSmtp() {
     return smtp;
 }
 
-// attachments: [{ filename, content: Buffer, contentType }]
 async function sendMail({ to, subject, html, text, attachments = [] }) {
     if (MAIL.brevoKey && MAIL.fromEmail) {
         const body = { sender: { name: MAIL.fromName, email: MAIL.fromEmail }, to: [{ email: to }], subject, htmlContent: html, textContent: text };
@@ -514,7 +477,6 @@ async function sendMail({ to, subject, html, text, attachments = [] }) {
     throw new Error('No email service is set up (add BREVO_API_KEY and MAIL_FROM_EMAIL in Render)');
 }
 
-// Alerts to YOU only (Telegram + email). Customers never receive these.
 async function notify(subject, fields) {
     const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
     const rows = Object.entries(fields).map(([label, val]) => {
@@ -590,7 +552,7 @@ const envNum = (name, fallback) => {
     return process.env[name] !== undefined && process.env[name] !== '' && Number.isFinite(v) && v >= 0 ? v : fallback;
 };
 const PRICING = {
-    base: { lat: -0.6003, lng: 34.5835 },   // Rangwe
+    base: { lat: -0.6003, lng: 34.5835 },
     roadFactor: 1.3,
     roundTo: 50,
     freeKm: envNum('TRAVEL_FREE_KM', 5),
@@ -756,14 +718,12 @@ async function getTenantMpesaToken(businessId) {
     return { token: tokenRes.data.access_token, baseUrl };
 }
 
-// Get products for a business
 app.get('/api/pos/products', requireAuth, ah(async (req, res) => {
     const businessId = req.query.business_id || 1;
     const result = await pool.query('SELECT * FROM products WHERE business_id = $1 ORDER BY name ASC', [businessId]);
     res.json(result.rows);
 }));
 
-// Process Cash Sale
 app.post('/api/pos/checkout/cash', requireAuth, ah(async (req, res) => {
     const { business_id = 1, items, total_amount } = req.body;
     const receiptNumber = 'POS-' + crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -799,7 +759,6 @@ app.post('/api/pos/checkout/cash', requireAuth, ah(async (req, res) => {
     }
 }));
 
-// Process M-Pesa STK Push Sale
 app.post('/api/pos/checkout/mpesa', requireAuth, ah(async (req, res) => {
     const { business_id = 1, phone, items, total_amount } = req.body;
     const receiptNumber = 'POS-' + crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -868,7 +827,6 @@ app.post('/api/pos/checkout/mpesa', requireAuth, ah(async (req, res) => {
     }
 }));
 
-// M-Pesa Webhook Callback
 app.post('/api/pos/mpesa/callback/:saleId', ah(async (req, res) => {
     const { saleId } = req.params;
     const body = req.body.Body.stkCallback;
@@ -902,14 +860,12 @@ app.post('/api/pos/mpesa/callback/:saleId', ah(async (req, res) => {
     }
 }));
 
-// Poll payment status
 app.get('/api/pos/sales/:id/status', requireAuth, ah(async (req, res) => {
     const result = await pool.query('SELECT payment_status, receipt_number, mpesa_receipt_no FROM pos_sales WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Sale not found' });
     res.json(result.rows[0]);
 }));
 
-// Product Seeder Endpoint
 app.get('/api/pos/seed', requireAuth, ah(async (req, res) => {
     await pool.query(`
         INSERT INTO businesses (id, name, mpesa_shortcode) 
@@ -1453,7 +1409,6 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
             <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
             <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
             <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
-            <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">⚡ POS Terminal</a></li>
             <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">⚡ POS Terminal</a></li>
             ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
             <li><a href="/contact" class="${activeNav === 'contact' ? 'active' : ''}">📞 Contact Us</a></li>
