@@ -1454,6 +1454,7 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
             <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
             <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
             <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">⚡ POS Terminal</a></li>
+            <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">⚡ POS Terminal</a></li>
             ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
             <li><a href="/contact" class="${activeNav === 'contact' ? 'active' : ''}">📞 Contact Us</a></li>
             <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
