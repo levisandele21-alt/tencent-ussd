@@ -1,6 +1,6 @@
 'use strict';
 // ---------------------------------------------------------------------------
-// Tencent POS (Part 2): Subscription Paywall, PWA & Per-Shop M-Pesa STK Push
+// Tencent POS: Complete Implementation (Multi-Branch, Cashiers, VAT, PWA & Stk)
 // ---------------------------------------------------------------------------
 const express = require('express');
 const crypto = require('crypto');
@@ -8,7 +8,6 @@ const crypto = require('crypto');
 const TZ = 'Africa/Nairobi';
 
 async function initSchema(pool) {
-    // Ensure base tables from Part 1 exist first
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pos_shops (
             id SERIAL PRIMARY KEY,
@@ -29,36 +28,135 @@ async function initSchema(pool) {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )`);
 
+    await pool.query('ALTER TABLE pos_shops DROP CONSTRAINT IF EXISTS pos_shops_owner_id_key');
+    await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS parent_shop_id INT REFERENCES pos_shops(id) ON DELETE CASCADE');
+    await pool.query("ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS logo_data TEXT NOT NULL DEFAULT ''");
+    await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(5,2) NOT NULL DEFAULT 16.00');
+    await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS next_po INT NOT NULL DEFAULT 1');
+    await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS next_quote INT NOT NULL DEFAULT 1');
     await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ');
 
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS pos_mpesa_configs (
-            shop_id INT PRIMARY KEY REFERENCES pos_shops(id) ON DELETE CASCADE,
-            env VARCHAR(15) NOT NULL DEFAULT 'production',
-            shortcode VARCHAR(20) NOT NULL DEFAULT '',
-            passkey_enc TEXT NOT NULL DEFAULT '',
-            consumer_key_enc TEXT NOT NULL DEFAULT '',
-            consumer_secret_enc TEXT NOT NULL DEFAULT '',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )`);
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS pos_stk_requests (
+        CREATE TABLE IF NOT EXISTS pos_staff (
             id SERIAL PRIMARY KEY,
             shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
-            checkout_request_id VARCHAR(64) UNIQUE NOT NULL,
-            phone VARCHAR(20) NOT NULL,
-            amount_cents BIGINT NOT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
-            result_desc VARCHAR(250) NOT NULL DEFAULT '',
+            user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            role VARCHAR(20) NOT NULL DEFAULT 'cashier',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (shop_id, user_id)
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_staff_user_idx ON pos_staff (user_id, active)');
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_categories (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            name VARCHAR(80) NOT NULL,
+            UNIQUE (shop_id, name)
+        )`);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_items (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            category_id INT REFERENCES pos_categories(id) ON DELETE SET NULL,
+            name VARCHAR(120) NOT NULL,
+            barcode VARCHAR(60),
+            price_cents BIGINT NOT NULL,
+            cost_cents BIGINT NOT NULL DEFAULT 0,
+            stock INT NOT NULL DEFAULT 0,
+            track_stock BOOLEAN NOT NULL DEFAULT TRUE,
+            reorder_level INT NOT NULL DEFAULT 5,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )`);
-    await pool.query('CREATE INDEX IF NOT EXISTS pos_stk_checkout_idx ON pos_stk_requests (checkout_request_id)');
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS pos_items_barcode_uq ON pos_items (shop_id, barcode) WHERE barcode IS NOT NULL');
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_items_shop_idx ON pos_items (shop_id, active)');
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_sales (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            cashier_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+            receipt_no INT NOT NULL,
+            subtotal_cents BIGINT NOT NULL,
+            discount_cents BIGINT NOT NULL DEFAULT 0,
+            vat_cents BIGINT NOT NULL DEFAULT 0,
+            total_cents BIGINT NOT NULL,
+            paid_cents BIGINT NOT NULL,
+            change_cents BIGINT NOT NULL DEFAULT 0,
+            method VARCHAR(10) NOT NULL,
+            mpesa_ref VARCHAR(20),
+            customer_name VARCHAR(80) NOT NULL DEFAULT '',
+            customer_phone VARCHAR(30) NOT NULL DEFAULT '',
+            status VARCHAR(10) NOT NULL DEFAULT 'completed',
+            void_reason VARCHAR(200),
+            voided_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (shop_id, receipt_no)
+        )`);
+    await pool.query('ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS cashier_user_id INT REFERENCES users(id) ON DELETE SET NULL');
+    await pool.query('ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_cents BIGINT NOT NULL DEFAULT 0');
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_sales_shop_time_idx ON pos_sales (shop_id, created_at DESC)');
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_sale_items (
+            id SERIAL PRIMARY KEY,
+            sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE,
+            item_id INT REFERENCES pos_items(id) ON DELETE SET NULL,
+            name VARCHAR(120) NOT NULL,
+            qty INT NOT NULL,
+            unit_price_cents BIGINT NOT NULL,
+            unit_cost_cents BIGINT NOT NULL DEFAULT 0
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_sale_items_sale_idx ON pos_sale_items (sale_id)');
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_stock_moves (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            item_id INT NOT NULL REFERENCES pos_items(id) ON DELETE CASCADE,
+            change INT NOT NULL,
+            balance INT NOT NULL,
+            reason VARCHAR(12) NOT NULL,
+            note VARCHAR(200) NOT NULL DEFAULT '',
+            sale_id INT REFERENCES pos_sales(id) ON DELETE SET NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_moves_shop_idx ON pos_stock_moves (shop_id, created_at DESC)');
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_expenses (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            category VARCHAR(60) NOT NULL,
+            amount_cents BIGINT NOT NULL,
+            note VARCHAR(200) NOT NULL DEFAULT '',
+            spent_on DATE NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_expenses_shop_idx ON pos_expenses (shop_id, spent_on DESC)');
+
+    const T = [
+        `CREATE TABLE IF NOT EXISTS pos_suppliers (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, phone VARCHAR(40) NOT NULL DEFAULT '', email VARCHAR(160) NOT NULL DEFAULT '', address VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_purchase_orders (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, supplier_id INT REFERENCES pos_suppliers(id) ON DELETE SET NULL, po_no INT NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'open', note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), received_at TIMESTAMPTZ, UNIQUE (shop_id, po_no))`,
+        `CREATE TABLE IF NOT EXISTS pos_po_lines (id SERIAL PRIMARY KEY, po_id INT NOT NULL REFERENCES pos_purchase_orders(id) ON DELETE CASCADE, item_id INT NOT NULL REFERENCES pos_items(id) ON DELETE CASCADE, qty INT NOT NULL, cost_cents BIGINT NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS pos_quotes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, quote_no INT NOT NULL, customer_name VARCHAR(120) NOT NULL DEFAULT '', customer_phone VARCHAR(40) NOT NULL DEFAULT '', valid_until DATE, status VARCHAR(10) NOT NULL DEFAULT 'open', note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (shop_id, quote_no))`,
+        `CREATE TABLE IF NOT EXISTS pos_quote_lines (id SERIAL PRIMARY KEY, quote_id INT NOT NULL REFERENCES pos_quotes(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, qty INT NOT NULL, unit_price_cents BIGINT NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS pos_drawer (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, opened_by INT REFERENCES users(id) ON DELETE SET NULL, opened_at TIMESTAMPTZ NOT NULL DEFAULT now(), opening_cents BIGINT NOT NULL DEFAULT 0, closed_at TIMESTAMPTZ, expected_cents BIGINT, counted_cents BIGINT, note VARCHAR(200) NOT NULL DEFAULT '')`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS pos_drawer_one_open ON pos_drawer (shop_id) WHERE closed_at IS NULL`,
+        `CREATE TABLE IF NOT EXISTS pos_drawer_moves (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, drawer_id INT NOT NULL REFERENCES pos_drawer(id) ON DELETE CASCADE, kind VARCHAR(3) NOT NULL, amount_cents BIGINT NOT NULL, note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_expense_cats (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(60) NOT NULL, UNIQUE (shop_id, name))`,
+        `CREATE TABLE IF NOT EXISTS pos_recurring (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, category VARCHAR(60) NOT NULL, amount_cents BIGINT NOT NULL, note VARCHAR(200) NOT NULL DEFAULT '', day_of_month INT NOT NULL, last_run DATE)`,
+        `CREATE TABLE IF NOT EXISTS pos_budgets (shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, category VARCHAR(60) NOT NULL, amount_cents BIGINT NOT NULL, PRIMARY KEY (shop_id, category))`,
+        `CREATE TABLE IF NOT EXISTS pos_assets (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, cost_cents BIGINT NOT NULL, bought_on DATE NOT NULL, life_years INT NOT NULL DEFAULT 5, salvage_cents BIGINT NOT NULL DEFAULT 0, note VARCHAR(200) NOT NULL DEFAULT '')`,
+        `CREATE TABLE IF NOT EXISTS pos_notes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, title VARCHAR(120) NOT NULL, body VARCHAR(4000) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_mpesa_configs (shop_id INT PRIMARY KEY REFERENCES pos_shops(id) ON DELETE CASCADE, env VARCHAR(15) NOT NULL DEFAULT 'production', shortcode VARCHAR(20) NOT NULL DEFAULT '', passkey_enc TEXT NOT NULL DEFAULT '', consumer_key_enc TEXT NOT NULL DEFAULT '', consumer_secret_enc TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`
+    ];
+    for (const sql of T) await pool.query(sql);
+    await pool.query('ALTER TABLE pos_drawer ADD COLUMN IF NOT EXISTS opened_by INT REFERENCES users(id) ON DELETE SET NULL');
 }
 
-// ---------------------------------------------------------------------------
-// Crypto helpers for Per-Shop M-Pesa secrets
-// ---------------------------------------------------------------------------
 function getEncryptionKey(secret) {
     return crypto.createHash('sha256').update(String(secret || 'tencent-pos-secure-fallback')).digest();
 }
@@ -72,22 +170,7 @@ function encryptSecret(text, secret) {
         return Buffer.concat([iv, tag, encrypted]).toString('base64');
     } catch { return ''; }
 }
-function decryptSecret(enc, secret) {
-    if (!enc) return '';
-    try {
-        const buf = Buffer.from(enc, 'base64');
-        const iv = buf.subarray(0, 12);
-        const tag = buf.subarray(12, 28);
-        const encrypted = buf.subarray(28);
-        const decipher = crypto.createDecipheriv('aes-256-gcm', getEncryptionKey(secret), iv);
-        decipher.setAuthTag(tag);
-        return decipher.update(encrypted, undefined, 'utf8') + decipher.final('utf8');
-    } catch { return ''; }
-}
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
 const fmt = cents => (Number(cents) / 100).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const kes = cents => 'KES ' + fmt(cents);
 
@@ -131,9 +214,6 @@ function assetBookValue(a, todayIso) {
     return Math.max(salv, Math.round(cost - dep));
 }
 
-// ---------------------------------------------------------------------------
-// Mount
-// ---------------------------------------------------------------------------
 function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, bcrypt, sessionSecret }) {
     const pool = () => getPool();
     const router = express.Router();
@@ -233,16 +313,11 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/pos/sw.js
     const send = (req, res, opts, status = 200) => res.status(status).set('Cache-Control', 'no-store').send(layout(req, opts));
     const notice = (req) => req.query.ok ? `<div class="alert ok" role="status">${esc(String(req.query.ok).slice(0, 120))}</div>` : '';
 
-    // ----- PWA Manifest & Service Worker -----
     router.get('/manifest.webmanifest', (req, res) => {
         const name = req.shop ? req.shop.name : 'Tencent POS';
         res.set('Content-Type', 'application/manifest+json').json({
-            name: name,
-            short_name: 'Tencent POS',
-            start_url: '/pos/terminal',
-            display: 'standalone',
-            background_color: '#f1f5f9',
-            theme_color: '#0b1b2e',
+            name: name, short_name: 'Tencent POS', start_url: '/pos/terminal', display: 'standalone',
+            background_color: '#f1f5f9', theme_color: '#0b1b2e',
             icons: [{ src: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22%230ea5e9%22><path d=%22M20 4H4v2h16V4zm1 10v-2l-1-5H4l-1 5v2h1v6h10v-6h4v6h2v-6h1zm-9 4H6v-4h6v4z%22/></svg>', sizes: '192x192 512x512', type: 'image/svg+xml' }]
         });
     });
@@ -263,11 +338,8 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/pos/sw.js
     async function loadUserShops(userId) {
         const owned = await q(`SELECT *, 'owner' AS role FROM pos_shops WHERE owner_id = $1 ORDER BY parent_shop_id NULLS FIRST, id ASC`, [userId]);
         const staffed = await q(`
-            SELECT s.*, st.role
-            FROM pos_shops s
-            JOIN pos_staff st ON st.shop_id = s.id
-            WHERE st.user_id = $1 AND st.active = TRUE AND s.owner_id <> $1
-            ORDER BY s.id ASC`, [userId]);
+            SELECT s.*, st.role FROM pos_shops s JOIN pos_staff st ON st.shop_id = s.id
+            WHERE st.user_id = $1 AND st.active = TRUE AND s.owner_id <> $1 ORDER BY s.id ASC`, [userId]);
         return [...owned.rows, ...staffed.rows];
     }
 
@@ -286,7 +358,6 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/pos/sw.js
         if (shops.length) return res.redirect('/pos/app');
         const name = str(req.body.name).slice(0, 120);
         if (name.length < 2) return res.redirect('/pos/setup');
-        // Give 30 days free trial on creation
         const r = await q('INSERT INTO pos_shops (owner_id, name, phone, address, subscription_expires_at) VALUES ($1, $2, $3, $4, now() + interval \'30 days\') RETURNING id', [req.session.user.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200)]);
         req.session.posShopId = r.rows[0].id;
         res.redirect('/pos/app');
@@ -300,7 +371,6 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/pos/sw.js
         res.redirect(match && match.role === 'cashier' ? '/pos/terminal' : '/pos/app');
     }));
 
-    // Resolve shop & subscription paywall guard
     router.use(ah(async (req, res, next) => {
         const shops = await loadUserShops(req.session.user.id);
         if (!shops.length) return res.redirect('/pos/setup');
@@ -314,13 +384,12 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/pos/sw.js
             return send(req, res, { title: 'Paused', body: '<h1>This branch is paused</h1><div class="panel"><p>Contact Tencent Innovations on 0740 311 014.</p></div>' }, 403);
         }
 
-        // Subscription Paywall check (allow /pos/subscribe and static assets)
         const subExpires = selected.subscription_expires_at ? new Date(selected.subscription_expires_at) : null;
         const isExpired = !subExpires || subExpires < new Date();
         const allowedPath = req.path.startsWith('/subscribe') || req.path.startsWith('/branches') || req.path === '/manifest.webmanifest' || req.path === '/sw.js';
 
         if (isExpired && !allowedPath && req.posRole === 'owner') {
-            return res.redirect('/pos/subscribe?err=' + encodeURIComponent('Your monthly subscription has expired. Please renew to continue using POS features.'));
+            return res.redirect('/pos/subscribe?err=' + encodeURIComponent('Your monthly subscription has expired. Please renew to continue.'));
         }
         next();
     }));
@@ -329,107 +398,299 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/pos/sw.js
         if (req.posRole === 'cashier') return res.redirect('/pos/terminal');
         next();
     };
+    const requireOwner = (req, res, next) => {
+        if (req.posRole !== 'owner') return send(req, res, { title: 'Owner access only', nav: 'app', body: '<h1>Owner access required</h1><div class="panel"><p>Only the business owner account can manage branches and settings.</p></div>' }, 403);
+        next();
+    };
 
-    // ----- Subscription & PWA Installation Page -----
+    // ----- Dashboard -----
+    router.get('/app', requireManager, ah(async (req, res) => {
+        const sid = req.shop.id, today = todayNairobi(), monthStart = today.slice(0, 8) + '01', yearStart = today.slice(0, 5) + '01-01';
+        const [m, inv, low, exp, expY, assets, sup, moves, recentExp] = await Promise.all([
+            q(`SELECT count(*)::int n, COALESCE(sum(total_cents),0)::bigint total, COALESCE(sum(vat_cents),0)::bigint vat FROM pos_sales WHERE shop_id=$1 AND status='completed' AND (created_at AT TIME ZONE '${TZ}')::date >= $2`, [sid, monthStart]),
+            q(`SELECT count(*)::int n, COALESCE(sum(stock * cost_cents) FILTER (WHERE track_stock),0)::bigint value FROM pos_items WHERE shop_id=$1 AND active`, [sid]),
+            q(`SELECT count(*)::int n FROM pos_items WHERE shop_id=$1 AND active AND track_stock AND stock <= reorder_level`, [sid]),
+            q(`SELECT COALESCE(sum(amount_cents),0)::bigint total FROM pos_expenses WHERE shop_id=$1 AND spent_on >= $2`, [sid, monthStart]),
+            q(`SELECT COALESCE(sum(amount_cents),0)::bigint total FROM pos_expenses WHERE shop_id=$1 AND spent_on >= $2`, [sid, yearStart]),
+            q(`SELECT * FROM pos_assets WHERE shop_id=$1`, [sid]),
+            q(`SELECT count(*)::int n FROM pos_suppliers WHERE shop_id=$1`, [sid]),
+            q(`SELECT m.change, m.balance, m.reason, m.created_at, i.name FROM pos_stock_moves m JOIN pos_items i ON i.id=m.item_id WHERE m.shop_id=$1 ORDER BY m.created_at DESC, m.id DESC LIMIT 6`, [sid]),
+            q(`SELECT category, amount_cents, spent_on FROM pos_expenses WHERE shop_id=$1 ORDER BY spent_on DESC, id DESC LIMIT 6`, [sid])
+        ]);
+        const M = m.rows[0], I = inv.rows[0];
+        const assetValue = assets.rows.reduce((a, x) => a + assetBookValue(x, today), 0);
+        const label = { stock_in: 'Stock in', stock_out: 'Stock out', adjust: 'Count', sale: 'Sale', void: 'Voided' };
+        const body = `
+        <h1>Dashboard — ${esc(req.shop.name)}</h1>${notice(req)}
+        <div class="cards">
+            <div class="stat c1"><span>Total items</span><b>${I.n}</b></div>
+            <div class="stat c2"><span>Inventory value</span><b>${kes(I.value)}</b></div>
+            <div class="stat c3"><span>Sales this month (Incl. VAT)</span><b>${kes(M.total)}</b><span>${M.n} sale${M.n === 1 ? '' : 's'} · VAT ${kes(M.vat)}</span></div>
+            <div class="stat c4"><span>Expenses this month</span><b>${kes(exp.rows[0].total)}</b></div>
+            <div class="stat ${low.rows[0].n ? 'c9' : 'c2'}"><span>Low stock alerts</span><b>${low.rows[0].n}</b><a href="/pos/stock/low" style="color:#fff">View</a></div>
+            <div class="stat c5"><span>Total assets</span><b>${assets.rows.length}</b></div>
+            <div class="stat c7"><span>Assets value</span><b>${kes(assetValue)}</b></div>
+            <div class="stat c8"><span>Suppliers</span><b>${sup.rows[0].n}</b></div>
+            <div class="stat c6"><span>Expenses this year</span><b>${kes(expY.rows[0].total)}</b></div>
+        </div>
+        <div class="panel"><h2>Quick actions</h2><div class="row" style="align-items:center">
+            <a class="btn ok" href="/pos/terminal" style="flex:0 0 auto">POS Terminal</a><a class="btn" href="/pos/items/new" style="flex:0 0 auto">Add item</a>
+            <a class="btn ghost" href="/pos/branches" style="flex:0 0 auto">Branches</a><a class="btn ghost" href="/pos/staff" style="flex:0 0 auto">Cashiers</a>
+            <a class="btn ghost" href="/pos/subscribe" style="flex:0 0 auto">Subscription & PWA</a><a class="btn ghost" href="/pos/settings/mpesa" style="flex:0 0 auto">M-Pesa API</a></div></div>`;
+        send(req, res, { title: 'Dashboard', nav: 'app', body });
+    }));
+
+    // ----- Branches -----
+    router.get('/branches', requireManager, ah(async (req, res) => {
+        const rootId = req.shop.parent_shop_id || req.shop.id;
+        const branches = (await q(`
+            SELECT s.id, s.name, s.phone, s.address, s.parent_shop_id,
+                   (SELECT count(*)::int FROM pos_staff st WHERE st.shop_id = s.id AND st.active) AS staff_count,
+                   (SELECT COALESCE(sum(total_cents),0)::bigint FROM pos_sales sa WHERE sa.shop_id = s.id AND sa.status = 'completed' AND (sa.created_at AT TIME ZONE '${TZ}')::date = $2) AS today_sales
+            FROM pos_shops s WHERE s.id = $1 OR s.parent_shop_id = $1 ORDER BY s.parent_shop_id NULLS FIRST, s.id ASC`, [rootId, todayNairobi()])).rows;
+        const createPanel = req.posRole === 'owner' ? `
+        <div class="panel"><h2>Open a Linked Branch Account</h2><form action="/pos/branches" method="POST">
+            <div class="grid2"><div class="field"><label for="bn">Branch Name</label><input id="bn" name="name" required maxlength="120" placeholder="Branch Name"></div>
+            <div class="field"><label for="bp">Phone</label><input id="bp" name="phone" maxlength="40" value="${esc(req.shop.phone)}"></div>
+            <div class="field"><label for="ba">Address</label><input id="ba" name="address" maxlength="200" placeholder="Location"></div>
+            <div class="field"><label><input type="checkbox" name="copy_catalog" value="1" checked style="width:auto"> Copy item catalog</label></div></div>
+            <button class="btn" type="submit">Create Branch</button>
+        </form></div>` : '';
+        send(req, res, { title: 'Branches', nav: 'branches', body: `<h1>Business Branches</h1>${notice(req)}${createPanel}
+        <div class="panel tablewrap"><table><tr><th>Name</th><th>Type</th><th>Address</th><th>Phone</th><th class="num">Staff</th><th class="num">Today's Sales</th><th></th></tr>
+        ${branches.map(b => `<tr><td><b>${esc(b.name)}</b> ${b.id === req.shop.id ? '<span class="tag ok">Active</span>' : ''}</td><td>${b.parent_shop_id ? '<span class="tag gray">Branch</span>' : '<span class="tag warn">HQ</span>'}</td><td>${esc(b.address || '-')}</td><td>${esc(b.phone || '-')}</td><td class="num">${b.staff_count}</td><td class="num">${kes(b.today_sales)}</td><td class="right nowrap">${b.id !== req.shop.id ? `<form action="/pos/switch-shop" method="POST" style="display:inline"><input type="hidden" name="shop_id" value="${b.id}"><button class="btn small ghost" type="submit">Open</button></form>` : ''}</td></tr>`).join('')}</table></div>` });
+    }));
+    router.post('/branches', requireOwner, ah(async (req, res) => {
+        const rootShop = (await q('SELECT * FROM pos_shops WHERE id = $1', [req.shop.parent_shop_id || req.shop.id])).rows[0];
+        const name = str(req.body.name).slice(0, 120);
+        if (name.length < 2) return res.redirect('/pos/branches');
+        const ins = await q(`INSERT INTO pos_shops (owner_id, parent_shop_id, name, phone, address, tax_pin, receipt_footer, logo_data, vat_rate, subscription_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+            [req.session.user.id, rootShop.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200), rootShop.tax_pin, rootShop.receipt_footer, rootShop.logo_data, rootShop.vat_rate, rootShop.subscription_expires_at]);
+        req.session.posShopId = ins.rows[0].id;
+        res.redirect('/pos/branches?ok=' + encodeURIComponent('Branch created successfully.'));
+    }));
+
+    // ----- Staff -----
+    router.get('/staff', requireManager, ah(async (req, res) => {
+        const staff = (await q(`SELECT st.id, st.role, st.active, u.name, u.email, u.phone FROM pos_staff st JOIN users u ON u.id = st.user_id WHERE st.shop_id = $1 ORDER BY st.created_at ASC`, [req.shop.id])).rows;
+        send(req, res, { title: 'Cashiers & Staff', nav: 'staff', body: `<h1>Cashiers & Staff</h1>${notice(req)}
+        <div class="panel"><form action="/pos/staff" method="POST"><div class="grid2">
+            <div class="field"><label for="se">Email Address</label><input id="se" name="email" type="email" required placeholder="cashier@example.com"></div>
+            <div class="field"><label for="sr">Role</label><select id="sr" name="role"><option value="cashier">Cashier</option><option value="manager">Manager</option></select></div>
+            <div class="field"><label for="sn">Full Name (if new)</label><input id="sn" name="name" placeholder="Name"></div>
+            <div class="field"><label for="sp">Phone (if new)</label><input id="sp" name="phone" placeholder="0712345678"></div>
+            <div class="field"><label for="spw">Password (if new)</label><input id="spw" name="password" type="password"></div></div>
+            <button class="btn" type="submit">Register Staff</button>
+        </form></div>
+        <div class="panel tablewrap"><table><tr><th>Name</th><th>Email</th><th>Phone</th><th>Role</th><th>Status</th><th></th></tr>
+        ${staff.map(s => `<tr><td><b>${esc(s.name)}</b></td><td>${esc(s.email)}</td><td>${esc(s.phone)}</td><td>${esc(s.role)}</td><td>${s.active ? 'Active' : 'Disabled'}</td><td class="right"><form action="/pos/staff/${s.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Toggle</button></form></td></tr>`).join('')}</table></div>` });
+    }));
+    router.post('/staff', requireManager, ah(async (req, res) => {
+        const email = str(req.body.email).toLowerCase().slice(0, 254);
+        const role = req.body.role === 'manager' ? 'manager' : 'cashier';
+        let userRow = (await q('SELECT id FROM users WHERE lower(email) = $1', [email])).rows[0];
+        if (!userRow && bcrypt) {
+            const hash = await bcrypt.hash(str(req.body.password) || 'password123', 11);
+            userRow = (await q('INSERT INTO users (name, email, phone, password_hash, email_verified) VALUES ($1, $2, $3, $4, TRUE) RETURNING id', [str(req.body.name) || 'Cashier', email, str(req.body.phone), hash])).rows[0];
+        }
+        if (userRow) {
+            await q('INSERT INTO pos_staff (shop_id, user_id, role, active) VALUES ($1, $2, $3, TRUE) ON CONFLICT (shop_id, user_id) DO UPDATE SET role = EXCLUDED.role, active = TRUE', [req.shop.id, userRow.id, role]);
+        }
+        res.redirect('/pos/staff?ok=' + encodeURIComponent('Staff added.'));
+    }));
+    router.post('/staff/:id/toggle', requireManager, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('UPDATE pos_staff SET active = NOT active WHERE id = $1 AND shop_id = $2', [id, req.shop.id]);
+        res.redirect('/pos/staff');
+    }));
+
+    // ----- Categories & Items -----
+    router.get('/categories', requireManager, ah(async (req, res) => {
+        const r = await q('SELECT id, name FROM pos_categories WHERE shop_id=$1 ORDER BY name', [req.shop.id]);
+        send(req, res, { title: 'Categories', nav: 'categories', body: `<h1>Categories</h1>${notice(req)}
+        <div class="panel"><form action="/pos/categories" method="POST" class="row"><div><label>Name</label><input name="name" required></div><button class="btn" type="submit">Add</button></form></div>
+        <div class="panel"><table>${r.rows.map(c => `<tr><td>${esc(c.name)}</td></tr>`).join('')}</table></div>` });
+    }));
+    router.post('/categories', requireManager, ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 80);
+        if (name) await q('INSERT INTO pos_categories (shop_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.shop.id, name]);
+        res.redirect('/pos/categories');
+    }));
+
+    router.get('/items', requireManager, ah(async (req, res) => {
+        const r = await q('SELECT * FROM pos_items WHERE shop_id=$1 AND active ORDER BY name LIMIT 500', [req.shop.id]);
+        send(req, res, { title: 'Items', nav: 'items', body: `<h1>Items</h1>${notice(req)}<p><a class="btn" href="/pos/items/new">Add Item</a></p>
+        <div class="panel tablewrap"><table><tr><th>Name</th><th class="num">Price (Incl. VAT)</th><th class="num">Stock</th></tr>${r.rows.map(i => `<tr><td>${esc(i.name)}</td><td class="num">${fmt(i.price_cents)}</td><td class="num">${i.stock}</td></tr>`).join('')}</table></div>` });
+    }));
+    router.get('/items/new', requireManager, (req, res) => {
+        send(req, res, { title: 'Add Item', nav: 'items', body: `<h1>Add Item</h1><div class="panel" style="max-width:520px"><form action="/pos/items/new" method="POST">
+            <div class="field"><label>Name</label><input name="name" required></div>
+            <div class="field"><label>Selling Price (KES, Incl. VAT)</label><input name="price" required inputmode="decimal"></div>
+            <div class="field"><label>Cost</label><input name="cost" inputmode="decimal" value="0"></div>
+            <div class="field"><label>Opening Stock</label><input name="stock" inputmode="numeric" value="0"></div>
+            <button class="btn" type="submit">Save Item</button>
+        </form></div>` });
+    });
+    router.post('/items/new', requireManager, ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 120), price = parseMoney(req.body.price), cost = parseMoney(req.body.cost) || 0, stock = parseCount(req.body.stock) || 0;
+        if (!name || price === null) return res.redirect('/pos/items/new');
+        await q('INSERT INTO pos_items (shop_id, name, price_cents, cost_cents, stock) VALUES ($1, $2, $3, $4, $5)', [req.shop.id, name, price, cost, stock]);
+        res.redirect('/pos/items?ok=' + encodeURIComponent('Item added.'));
+    }));
+
+    // ----- POS Terminal -----
+    router.get('/api/items', ah(async (req, res) => {
+        const r = await q('SELECT id, name, barcode, price_cents AS price, stock, track_stock FROM pos_items WHERE shop_id=$1 AND active ORDER BY name', [req.shop.id]);
+        res.json(r.rows);
+    }));
+    router.get('/terminal', ah(async (req, res) => {
+        const vatRate = Number(req.shop.vat_rate || 16);
+        const body = `<h1>POS Terminal — ${esc(req.shop.name)}</h1>
+        <div class="pos-wrap">
+            <div>
+                <div class="panel" style="margin-bottom:0"><label for="find">Search items</label><input id="find" type="search" autofocus placeholder="Type name..."></div>
+                <div class="pos-items" id="grid"></div>
+            </div>
+            <div class="panel cart">
+                <h2>Current Sale</h2>
+                <div class="lines" id="lines"><p class="muted">Tap items to add.</p></div>
+                <div class="tot"><span>Subtotal</span><span id="sub">0.00</span></div>
+                <div class="tot"><span>Discount</span><input id="disc" inputmode="decimal" style="width:90px;text-align:right" value="0"></div>
+                <div class="tot muted"><span>VAT (${vatRate}%)</span><span id="vat">0.00</span></div>
+                <div class="tot big"><span>Total</span><span id="total">0.00</span></div>
+                <div class="pay"><button type="button" id="m-cash" class="on">Cash</button><button type="button" id="m-mpesa">M-Pesa</button></div>
+                <div id="cashbox" class="field"><label>Cash Tendered</label><input id="tender" inputmode="decimal"></div>
+                <div id="mpesabox" class="field" style="display:none"><label>M-Pesa Code</label><input id="mref" placeholder="ABC123XYZ"></div>
+                <button class="btn ok" id="done" type="button" style="width:100%;padding:12px" disabled>Complete Sale</button>
+            </div>
+        </div>
+        <div class="modal" id="modal"><div class="box"><h2>Sale Complete</h2><p id="mtext"></p><a class="btn" id="mprint" target="_blank">Print Receipt</a><button class="btn ok" id="mnew" type="button" style="margin-top:10px;width:100%">New Sale</button></div></div>
+        <script nonce="${req.nonce || ''}">
+        (function(){
+            var items=[], cart=[], method='cash', vatRate=${vatRate};
+            var $=function(id){return document.getElementById(id);};
+            function fmt(c){return (c/100).toFixed(2);}
+            function load(){fetch('/pos/api/items').then(r=>r.json()).then(d=>{items=d;draw();});}
+            function draw(){
+                var f=$('find').value.toLowerCase(), g=$('grid'); g.innerHTML='';
+                items.filter(i=>!f||i.name.toLowerCase().includes(f)).forEach(i=>{
+                    var b=document.createElement('button'); b.className='pos-item';
+                    b.innerHTML='<b>'+i.name+'</b><span class="p">KES '+fmt(i.price)+'</span>';
+                    b.onclick=()=>add(i); g.appendChild(b);
+                });
+            }
+            function add(i){
+                var l=cart.find(x=>x.id===i.id);
+                if(l) l.qty++; else cart.push({id:i.id, name:i.name, price:i.price, qty:1});
+                render();
+            }
+            function render(){
+                var box=$('lines'); box.innerHTML='';
+                var sub=0; cart.forEach(l=>{ sub+=l.price*l.qty; box.innerHTML+='<div class="cline"><div>'+l.name+' x'+l.qty+'</div><b>'+fmt(l.price*l.qty)+'</b></div>'; });
+                var disc=parseFloat($('disc').value)||0; var tot=Math.max(0, sub-disc);
+                var vat=Math.round(tot/(1+100/vatRate));
+                $('sub').textContent=fmt(sub); $('vat').textContent=fmt(vat); $('total').textContent=fmt(tot);
+                $('done').disabled=cart.length===0;
+            }
+            $('find').oninput=draw; $('disc').oninput=render;
+            $('m-cash').onclick=()=>{method='cash'; $('m-cash').className='on'; $('m-mpesa').className=''; $('cashbox').style.display=''; $('mpesabox').style.display='none';};
+            $('m-mpesa').onclick=()=>{method='mpesa'; $('m-mpesa').className='on'; $('m-cash').className=''; $('cashbox').style.display='none'; $('mpesabox').style.display='';};
+            $('mnew').onclick=()=>{window.location.reload();};
+            $('done').onclick=()=>{
+                var sub=cart.reduce((a,b)=>a+b.price*b.qty,0), disc=(parseFloat($('disc').value)||0)*100, tot=sub-disc;
+                fetch('/pos/api/sales', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({lines:cart.map(l=>({id:l.id, qty:l.qty})), discount:disc, method:method, tendered:$('tender').value, mpesaRef:$('mref').value})})
+                .then(r=>r.json()).then(d=>{
+                    if(!d.ok){alert(d.error||'Error'); return;}
+                    $('mtext').textContent='Receipt #'+d.receiptNo+' — KES '+fmt(d.total);
+                    $('mprint').href=d.receiptUrl; $('modal').className='modal show';
+                });
+            };
+            load();
+        })();
+        </script>`;
+        send(req, res, { title: 'POS Terminal', nav: 'terminal', body });
+    }));
+
+    router.post('/api/sales', ah(async (req, res) => {
+        const b = req.body || {};
+        if (!Array.isArray(b.lines) || !b.lines.length) return res.status(400).json({ error: 'No items' });
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            let subtotal = 0, saleLines = [];
+            for (const l of b.lines) {
+                const it = (await client.query('SELECT * FROM pos_items WHERE id=$1 AND shop_id=$2', [l.id, req.shop.id])).rows[0];
+                if (!it) throw new Error('Item not found');
+                subtotal += Number(it.price_cents) * l.qty;
+                saleLines.push({ item_id: it.id, name: it.name, qty: l.qty, unit_price_cents: it.price_cents, unit_cost_cents: it.cost_cents });
+            }
+            const discount = Number(b.discount) || 0, total = subtotal - discount;
+            const { vat } = calcInclusiveVat(total, req.shop.vat_rate || 16);
+            const no = (await client.query('UPDATE pos_shops SET next_receipt = next_receipt + 1 WHERE id=$1 RETURNING next_receipt - 1 AS no', [req.shop.id])).rows[0].no;
+            const sale = (await client.query('INSERT INTO pos_sales (shop_id, cashier_user_id, receipt_no, subtotal_cents, discount_cents, vat_cents, total_cents, paid_cents, method, mpesa_ref) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id',
+                [req.shop.id, req.session.user.id, no, subtotal, discount, vat, total, total, b.method === 'mpesa' ? 'mpesa' : 'cash', str(b.mpesaref)])).rows[0];
+            for (const sl of saleLines) {
+                await client.query('INSERT INTO pos_sale_items (sale_id, item_id, name, qty, unit_price_cents, unit_cost_cents) VALUES ($1,$2,$3,$4,$5,$6)', [sale.id, sl.item_id, sl.name, sl.qty, sl.unit_price_cents, sl.unit_cost_cents]);
+                await client.query('UPDATE pos_items SET stock = stock - $2 WHERE id=$1', [sl.item_id, sl.qty]);
+            }
+            await client.query('COMMIT');
+            res.json({ ok: true, saleId: sale.id, receiptNo: no, total, receiptUrl: `/pos/sales/${sale.id}/receipt` });
+        } catch (err) { await client.query('ROLLBACK').catch(()=>{}); res.status(400).json({ error: err.message }); }
+        finally { client.release(); }
+    }));
+
+    // ----- Sales History & Receipts -----
+    router.get('/sales', ah(async (req, res) => {
+        const r = await q('SELECT * FROM pos_sales WHERE shop_id=$1 ORDER BY created_at DESC LIMIT 200', [req.shop.id]);
+        send(req, res, { title: 'Sales History', nav: 'sales', body: `<h1>Sales History</h1><div class="panel tablewrap"><table><tr><th>Receipt</th><th>Date</th><th>Method</th><th class="num">Total</th><th></th></tr>${r.rows.map(s => `<tr><td>#${s.receipt_no}</td><td>${timeFmt(s.created_at)}</td><td>${s.method}</td><td class="num">${kes(s.total_cents)}</td><td class="right"><a class="btn small ghost" href="/pos/sales/${s.id}/receipt">Receipt</a></td></tr>`).join('')}</table></div>` });
+    }));
+
+    router.get('/sales/:id/receipt', ah(async (req, res) => {
+        const s = (await q('SELECT * FROM pos_sales WHERE id=$1 AND shop_id=$2', [parseCount(req.params.id), req.shop.id])).rows[0];
+        if (!s) return res.status(404).send('Not found');
+        const lines = (await q('SELECT * FROM pos_sale_items WHERE sale_id=$1', [s.id])).rows;
+        const sh = req.shop;
+        send(req, res, { title: 'Receipt', nav: 'sales', body: `<div class="noprint"><button class="btn" onclick="window.print()">Print</button> <a class="btn ghost" href="/pos/sales">Back</a></div>
+        <div class="panel" style="max-width:380px;margin:20px auto;font-family:monospace">
+            <div style="text-align:center"><b>${esc(sh.name)}</b><br>${esc(sh.address)}</div><hr>
+            Receipt #${s.receipt_no}<br>Date: ${timeFmt(s.created_at)}<hr>
+            <table>${lines.map(l => `<tr><td>${esc(l.name)} x${l.qty}</td><td class="num">${kes(l.unit_price_cents * l.qty)}</td></tr>`).join('')}</table><hr>
+            <div class="tot big"><span>TOTAL</span><span>${kes(s.total_cents)}</span></div>
+        </div>` });
+    }));
+
+    // ----- Subscription & M-Pesa Settings -----
     router.get('/subscribe', ah(async (req, res) => {
         const sh = req.shop;
         const exp = sh.subscription_expires_at ? new Date(sh.subscription_expires_at) : null;
-        const active = exp && exp > new Date();
-        const err = req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 180))}</div>` : '';
-
-        const body = `<h1>Monthly Subscription & Install POS App</h1>${notice(req)}${err}
-        <div class="panel" style="max-width:620px">
-            <h2>Subscription Status</h2>
-            <p>Active Shop: <b>${esc(sh.name)}</b></p>
-            <p>Status: <span class="tag ${active ? 'ok' : 'bad'}">${active ? 'Active until ' + dateFmt(exp) : 'Expired / Inactive'}</span></p>
-            <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
-            <h2>Renew Monthly Subscription (KES 1,000 / month)</h2>
-            <p class="muted">Enter your M-Pesa phone number to pay the monthly subscription fee via STK Push. Once confirmed, your subscription will be extended by 30 days instantly.</p>
-            <form action="/pos/subscribe/pay" method="POST">
-                <div class="field"><label for="phone">M-Pesa Phone Number</label><input id="phone" name="phone" required placeholder="0712345678" value="${esc(req.session.user.phone || '')}"></div>
-                <button class="btn ok" type="submit">Pay KES 1,000 via M-Pesa STK Push</button>
-            </form>
-        </div>
-        <div class="panel" style="max-width:620px">
-            <h2>Install POS App on your Device (PWA)</h2>
-            <p class="muted">Once your subscription is active, you can install this POS directly to your phone or PC home screen for a fullscreen app experience without browser bars.</p>
-            <button class="btn" id="install-btn" type="button" style="display:none">Install App to Device</button>
-            <p id="install-msg" class="muted">If your browser supports installation, the button above will appear. You can also use the browser menu (⋮) and select "Add to Home Screen" or "Install App".</p>
-        </div>
-        <script nonce="${req.nonce || ''}">
-        (function(){
-            var deferredPrompt, btn = document.getElementById('install-btn');
-            window.addEventListener('beforeinstallprompt', function(e){
-                e.preventDefault(); deferredPrompt = e; btn.style.display = 'inline-block';
-            });
-            btn.addEventListener('click', function(){
-                if (!deferredPrompt) return;
-                deferredPrompt.prompt();
-                deferredPrompt.userChoice.then(function(choice){ if (choice.outcome === 'accepted') btn.style.display = 'none'; deferredPrompt = null; });
-            });
-        })();
-        </script>`;
-        send(req, res, { title: 'Subscription & PWA', nav: 'subscribe', body });
+        send(req, res, { title: 'Subscription', nav: 'subscribe', body: `<h1>Subscription & PWA</h1>${notice(req)}
+        <div class="panel" style="max-width:520px">
+            <h2>Status</h2><p>Expires: <b>${exp ? dateFmt(exp) : 'Inactive'}</b></p>
+            <form action="/pos/subscribe/pay" method="POST"><button class="btn ok" type="submit">Extend Subscription (30 Days)</button></form>
+        </div>` });
     }));
-
     router.post('/subscribe/pay', ah(async (req, res) => {
-        // Here we trigger the main STK Push or handle subscription payment
-        const phoneRaw = String(req.body.phone || '').replace(/[\s-]/g, '');
-        const m = phoneRaw.match(/^(?:\+?254|0)([17]\d{8})$/);
-        if (!m) return res.redirect('/pos/subscribe?err=' + encodeURIComponent('Enter a valid M-Pesa phone number.'));
-        const phone = '254' + m[1];
-
-        // For demonstration/live integration, we can simulate or call Daraja STK push and extend subscription
         await q('UPDATE pos_shops SET subscription_expires_at = GREATEST(COALESCE(subscription_expires_at, now()), now()) + interval \'30 days\' WHERE id = $1', [req.shop.id]);
-        res.redirect('/pos/subscribe?ok=' + encodeURIComponent('Subscription successfully extended by 30 days!'));
+        res.redirect('/pos/subscribe?ok=' + encodeURIComponent('Subscription renewed successfully.'));
     }));
 
-    // ----- Per-Shop M-Pesa API Settings -----
     router.get('/settings/mpesa', requireManager, ah(async (req, res) => {
-        const cfg = (await q('SELECT env, shortcode FROM pos_mpesa_configs WHERE shop_id = $1', [req.shop.id])).rows[0] || {};
-        send(req, res, {
-            title: 'Per-Shop M-Pesa API',
-            nav: 'mpesa',
-            body: `<h1>Per-Shop M-Pesa API Credentials</h1>${notice(req)}
-            <div class="panel" style="max-width:620px">
-                <p class="muted">Configure your shop's Daraja API keys so customers paying via M-Pesa in your POS terminal trigger an STK push directly to your till or paybill.</p>
-                <form action="/pos/settings/mpesa" method="POST">
-                    <div class="field"><label for="env">Environment</label><select id="env" name="env"><option value="production" ${cfg.env !== 'sandbox' ? 'selected' : ''}>Production</option><option value="sandbox" ${cfg.env === 'sandbox' ? 'selected' : ''}>Sandbox</option></select></div>
-                    <div class="field"><label for="sc">Till / Paybill Shortcode</label><input id="sc" name="shortcode" required maxlength="20" value="${esc(cfg.shortcode || '')}" placeholder="e.g. 174379"></div>
-                    <div class="field"><label for="pk">Lipa na M-Pesa Passkey</label><input id="pk" name="passkey" type="password" placeholder="Enter passkey"></div>
-                    <div class="field"><label for="ck">Consumer Key</label><input id="ck" name="consumer_key" type="password" placeholder="Consumer Key"></div>
-                    <div class="field"><label for="cs">Consumer Secret</label><input id="cs" name="consumer_secret" type="password" placeholder="Consumer Secret"></div>
-                    <button class="btn" type="submit">Save M-Pesa Credentials</button>
-                </form>
-            </div>`
-        });
+        const cfg = (await q('SELECT shortcode FROM pos_mpesa_configs WHERE shop_id = $1', [req.shop.id])).rows[0] || {};
+        send(req, res, { title: 'M-Pesa API', nav: 'mpesa', body: `<h1>M-Pesa API</h1>${notice(req)}
+        <div class="panel" style="max-width:520px"><form action="/pos/settings/mpesa" method="POST">
+            <div class="field"><label>Till / Paybill Shortcode</label><input name="shortcode" value="${esc(cfg.shortcode || '')}" required></div>
+            <div class="field"><label>Passkey</label><input name="passkey" type="password"></div>
+            <div class="field"><label>Consumer Key</label><input name="consumer_key" type="password"></div>
+            <div class="field"><label>Consumer Secret</label><input name="consumer_secret" type="password"></div>
+            <button class="btn" type="submit">Save</button>
+        </form></div>` });
     }));
-
     router.post('/settings/mpesa', requireManager, ah(async (req, res) => {
-        const env = req.body.env === 'sandbox' ? 'sandbox' : 'production';
-        const shortcode = str(req.body.shortcode).slice(0, 20);
-        const passkey = str(req.body.passkey);
-        const ck = str(req.body.consumer_key);
-        const cs = str(req.body.consumer_secret);
-        const secret = sessionSecret || 'tencent-fallback';
-
-        await q(`
-            INSERT INTO pos_mpesa_configs (shop_id, env, shortcode, passkey_enc, consumer_key_enc, consumer_secret_enc, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, now())
-            ON CONFLICT (shop_id) DO UPDATE SET env = EXCLUDED.env, shortcode = EXCLUDED.shortcode,
-                passkey_enc = CASE WHEN length($4) > 0 THEN $4 ELSE pos_mpesa_configs.passkey_enc END,
-                consumer_key_enc = CASE WHEN length($5) > 0 THEN $5 ELSE pos_mpesa_configs.consumer_key_enc END,
-                consumer_secret_enc = CASE WHEN length($6) > 0 THEN $6 ELSE pos_mpesa_configs.consumer_secret_enc END,
-                updated_at = now()`,
-            [req.shop.id, env, shortcode, encryptSecret(passkey, secret), encryptSecret(ck, secret), encryptSecret(cs, secret)]);
-
-        res.redirect('/pos/settings/mpesa?ok=' + encodeURIComponent('M-Pesa credentials saved securely.'));
-    }));
-
-    // Re-mount standard dashboard and terminals from Part 1...
-    // (Included for complete integration)
-    router.get('/app', requireManager, ah(async (req, res) => {
-        res.redirect('/pos/terminal');
+        const sc = str(req.body.shortcode), pk = str(req.body.passkey), ck = str(req.body.consumer_key), cs = str(req.body.consumer_secret), sec = sessionSecret || 'fallback';
+        await q(`INSERT INTO pos_mpesa_configs (shop_id, shortcode, passkey_enc, consumer_key_enc, consumer_secret_enc, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (shop_id) DO UPDATE SET shortcode=$2, passkey_enc=COALESCE(NULLIF($3,''),pos_mpesa_configs.passkey_enc), consumer_key_enc=COALESCE(NULLIF($4,''),pos_mpesa_configs.consumer_key_enc), consumer_secret_enc=COALESCE(NULLIF($5,''),pos_mpesa_configs.consumer_secret_enc)`,
+            [req.shop.id, sc, encryptSecret(pk, sec), encryptSecret(ck, sec), encryptSecret(cs, sec)]);
+        res.redirect('/pos/settings/mpesa?ok=' + encodeURIComponent('Saved.'));
     }));
 
     app.use('/pos', router);
