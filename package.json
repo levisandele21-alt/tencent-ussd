@@ -1,21 +1,22 @@
 {
-  "name": "tencent-innovations",
+  "name": "tencent-ussd",
   "version": "1.0.0",
-  "description": "",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "axios": "^1.7.9",
     "bcryptjs": "^2.4.3",
-    "connect-pg-simple": "^9.0.1",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.2.0",
-    "express-session": "^1.8.0",
+    "connect-pg-simple": "^10.0.0",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-session": "^1.18.1",
     "helmet": "^7.1.0",
-    "nodemailer": "^6.9.13",
-    "pdfkit": "^0.15.0",
-    "pg": "^8.11.3"
+    "nodemailer": "^10.2.1",
+    "pdfkit": "^0.16.0",
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
