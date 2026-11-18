@@ -10,7 +10,6 @@ const { Pool } = require('pg');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 const bcrypt = require('bcryptjs');
-const axios = require('axios');
 
 let PDFDocument = null;
 try {
@@ -23,14 +22,14 @@ process.on('unhandledRejection', err => console.error('Unhandled rejection:', er
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
+app.set('trust proxy', 1);   // Render sits in front of the app
 
 // ---------------------------------------------------------------
 // 0. Settings
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 10000;
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-const LINK_SECRET = process.env.LINK_SECRET || '';
+const LINK_SECRET = process.env.LINK_SECRET || '';   // must be its own secret, never the M-Pesa callback secret
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
 if (LINK_SECRET.length < 16) console.error('LINK_SECRET is missing or shorter than 16 characters: shareable booking links are switched off.');
 if (SESSION_SECRET.length < 32) console.error('SESSION_SECRET is missing or shorter than 32 characters: everyone is logged out whenever the server restarts. Add a long random value in Render.');
@@ -48,21 +47,24 @@ function esc(value = '') {
 }
 const flat = value => (Array.isArray(value) ? value.join(', ') : (value || ''));
 const str = v => (typeof v === 'string' ? v.trim() : '');
-const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);   // Express 4 does not catch async errors by itself
 
+// Only plain image/video files in the project folder are public. Source code, package.json and
+// any key or .env file are never served.
 const PUBLIC_FILE = /^\/[A-Za-z0-9_.-]+\.(png|jpe?g|gif|webp|svg|ico|mp4|webm)$/i;
 const staticFiles = express.static(__dirname, { dotfiles: 'ignore', index: false, redirect: false, maxAge: '1h' });
 
+// The logo file name has been wrong before (double extension), so find it instead of hard-coding it
 let LOGO_FILE = '';
 try {
     const images = fs.readdirSync(__dirname).filter(f => /\.(png|jpe?g|webp|svg)$/i.test(f) && /logo/i.test(f));
     LOGO_FILE = images.find(f => /^tencent/i.test(f)) || images[0] || '';
-} catch (_) {}
+} catch (_) { /* no logo, the site still works */ }
 let HERO_VIDEO = false;
-try { HERO_VIDEO = fs.existsSync(path.join(__dirname, 'hero.mp4')); } catch (_) {}
+try { HERO_VIDEO = fs.existsSync(path.join(__dirname, 'hero.mp4')); } catch (_) { /* optional */ }
 
 // ---------------------------------------------------------------
-// 2. Security headers & public files
+// 2. Security headers (with a Content-Security-Policy) and public files
 // ---------------------------------------------------------------
 app.use((req, res, next) => {
     res.locals.nonce = crypto.randomBytes(16).toString('base64');
@@ -73,12 +75,12 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", "https://cdn.jsdelivr.net", (req, res) => `'nonce-${res.locals.nonce}'`],
-            styleSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+            scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`],
+            styleSrc: ["'self'", "'unsafe-inline'"],
             imgSrc: ["'self'", 'data:'],
             mediaSrc: ["'self'"],
             connectSrc: ["'self'"],
-            fontSrc: ["'self'", "https://cdn.jsdelivr.net"],
+            fontSrc: ["'self'"],
             formAction: ["'self'"],
             frameAncestors: ["'none'"],
             baseUri: ["'self'"],
@@ -99,7 +101,7 @@ app.get('/brand-logo', (req, res, next) => {
 });
 
 // ---------------------------------------------------------------
-// 3. Rate limits
+// 3. Rate limits (before the session, so floods never reach the database)
 // ---------------------------------------------------------------
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -107,14 +109,30 @@ const limiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this network, please try again later.',
-    skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/') || req.path.startsWith('/api/pos/mpesa/callback/')
+    skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
 });
 const statusLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 400, standardHeaders: true, legacyHeaders: false, message: { status: 'unknown' } });
-const payLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many payment attempts from this network. Please try again later.' });
-const registerLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many sign-up attempts from this network. Please try again later.' });
-const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, skipSuccessfulRequests: true, message: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
-const forgotLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 8, standardHeaders: true, legacyHeaders: false, message: 'Too many password reset requests from this network. Please try again later.' });
-const resetLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: 'Too many attempts. Please wait a few minutes and try again.' });
+const payLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many payment attempts from this network. Please try again later.'
+});
+const registerLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many sign-up attempts from this network. Please try again later.'
+});
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+    skipSuccessfulRequests: true,   // only failed logins count
+    message: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.'
+});
+const forgotLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, max: 8, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many password reset requests from this network. Please try again later.'
+});
+const resetLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+    message: 'Too many attempts. Please wait a few minutes and try again.'
+});
 const resendLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many email requests. Please try again later.' });
 app.use(limiter);
 
@@ -126,17 +144,20 @@ app.use(express.urlencoded({ extended: false, limit: '20kb' }));
 // ---------------------------------------------------------------
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const dbEnabled = Boolean(DATABASE_URL);
+// Tencent POS (point of sale service for shops) lives in pos.js. If that file is missing the rest of the site still works.
+let POS = null;
+try { POS = require('./pos'); } catch (e) { console.error('POS module not loaded:', e.message); }
 let pool = null;
 let dbReady = false;
 
 if (dbEnabled) {
     let host = '';
-    try { host = new URL(DATABASE_URL).hostname; } catch (_) {}
+    try { host = new URL(DATABASE_URL).hostname; } catch (_) { /* pg reports a bad URL itself */ }
     const sslMode = (process.env.DATABASE_SSL || '').toLowerCase();
     let ssl;
     if (sslMode === 'off') ssl = false;
-    else if (sslMode === 'insecure') ssl = { rejectUnauthorized: false };
-    else if (host === 'localhost' || host === '127.0.0.1' || (host && !host.includes('.'))) ssl = false;
+    else if (sslMode === 'insecure') ssl = { rejectUnauthorized: false };   // only if your provider's certificate cannot be verified
+    else if (host === 'localhost' || host === '127.0.0.1' || (host && !host.includes('.'))) ssl = false;   // local, or Render's internal address
     else ssl = { rejectUnauthorized: true };
     pool = new Pool({ connectionString: DATABASE_URL, ssl, max: 8, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 });
     pool.on('error', err => console.error('Database pool error:', err.message));
@@ -172,10 +193,12 @@ async function initDb() {
                 created_at BIGINT NOT NULL,
                 paid_at BIGINT
             )`);
+        // Added later: safe to run on a database that already has the older tables
         const had = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'receipt_sent'`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_sent BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS email_status VARCHAR(300)`);
+        // Price breakdown (older bookings keep these empty and show only the total)
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS base_amount INT`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_km INT`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_fee INT`);
@@ -183,8 +206,10 @@ async function initDb() {
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS urgency_fee INT`);
         await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS geo VARCHAR(40)`);
         if (!had.rowCount) {
+            // First run of this version: receipts for payments that were already made are not re-sent
             await pool.query(`UPDATE bookings SET receipt_sent = TRUE WHERE status = 'paid'`);
         }
+        // Email confirmation and password reset
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`);
         await pool.query(`
             CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -196,63 +221,17 @@ async function initDb() {
                 used_at BIGINT,
                 created_at BIGINT NOT NULL
             )`);
-        
-        // Multi-Tenant POS Tables
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS businesses (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(150) NOT NULL,
-                owner_id INT REFERENCES users(id) ON DELETE CASCADE,
-                mpesa_shortcode VARCHAR(20),
-                mpesa_passkey TEXT,
-                mpesa_consumer_key TEXT,
-                mpesa_consumer_secret TEXT,
-                mpesa_type VARCHAR(30) DEFAULT 'CustomerBuyGoodsOnline',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                business_id INT REFERENCES businesses(id) ON DELETE CASCADE,
-                barcode VARCHAR(50),
-                name VARCHAR(150) NOT NULL,
-                price DECIMAL(10, 2) NOT NULL,
-                stock_qty INT DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS pos_sales (
-                id SERIAL PRIMARY KEY,
-                business_id INT REFERENCES businesses(id) ON DELETE CASCADE,
-                receipt_number VARCHAR(50) UNIQUE NOT NULL,
-                total_amount DECIMAL(10, 2) NOT NULL,
-                payment_method VARCHAR(20) NOT NULL,
-                payment_status VARCHAR(20) DEFAULT 'PENDING',
-                mpesa_checkout_id VARCHAR(100),
-                mpesa_receipt_no VARCHAR(50),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS pos_sale_items (
-                id SERIAL PRIMARY KEY,
-                sale_id INT REFERENCES pos_sales(id) ON DELETE CASCADE,
-                product_id INT REFERENCES products(id),
-                quantity INT NOT NULL,
-                unit_price DECIMAL(10, 2) NOT NULL
-            )`);
-
         await pool.query('CREATE INDEX IF NOT EXISTS auth_tokens_user_idx ON auth_tokens (user_id, kind)');
         await pool.query('CREATE INDEX IF NOT EXISTS bookings_user_idx ON bookings (user_id, created_at DESC)');
         await pool.query('CREATE INDEX IF NOT EXISTS bookings_checkout_idx ON bookings (checkout_request_id)');
+        // Uniqueness: skipped (with a warning) only if old data already contains duplicates
         for (const sql of [
             'CREATE UNIQUE INDEX IF NOT EXISTS bookings_account_ref_uq ON bookings (account_ref)',
             'CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq ON users (lower(email))'
         ]) {
-            try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index:', e.message); }
+            try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
         }
+        if (POS) await POS.initSchema(pool);
         dbReady = true;
         console.log('PostgreSQL tables initialized successfully.');
     } catch (err) {
@@ -270,11 +249,11 @@ app.use(session({
     name: 'tc.sid',
     secret: SESSION_SECRET.length >= 32 ? SESSION_SECRET : crypto.randomBytes(32).toString('hex'),
     resave: false,
-    saveUninitialized: false,
+    saveUninitialized: false,   // visitors who never log in get no cookie
     cookie: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: 'auto',
+        secure: 'auto',   // secure whenever the request came over HTTPS (Render), without needing NODE_ENV
         maxAge: 14 * 24 * 60 * 60 * 1000
     }
 }));
@@ -284,16 +263,20 @@ app.use((req, res, next) => {
     next();
 });
 
+// Reject form posts that come from other websites (CSRF). Browsers always say where a form came from;
+// cookies are also SameSite=Lax. Safaricom's callback is a machine call and is exempt.
 app.use((req, res, next) => {
-    if (req.method !== 'POST' || req.path.startsWith('/payments/cb/') || req.path.startsWith('/api/pos/mpesa/callback/')) return next();
+    if (req.method !== 'POST' || req.path.startsWith('/payments/cb/')) return next();
     const fetchSite = req.get('sec-fetch-site');
     const origin = req.get('origin');
     let blocked = false;
     if (fetchSite) {
+        // Modern browsers say exactly how the request relates to this site, so trust that and skip host comparisons
         blocked = fetchSite === 'cross-site';
     } else if (origin) {
+        // Older browsers: compare the Origin with every name this site is reached by (Render, custom domain, proxy)
         const allowed = new Set([req.get('host'), req.get('x-forwarded-host')].filter(Boolean).map(h => h.split(',')[0].trim().toLowerCase()));
-        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) {}
+        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) { /* not set */ }
         try { blocked = !allowed.has(new URL(origin).host.toLowerCase()); } catch (_) { blocked = true; }
     }
     if (blocked) return errorPage(req, res, 403, 'Request blocked', 'This request came from another website, so it was blocked.');
@@ -301,10 +284,11 @@ app.use((req, res, next) => {
 });
 
 const BCRYPT_COST = 11;
-const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST);
+const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST);   // compared when the email is unknown, so timing does not reveal which emails exist
 const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
 
-const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos']);
+// Only go back to our own pages after login (stops //evil.com style redirects)
+const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos', '/pos/app', '/pos/terminal']);
 function safeNext(value) {
     const v = typeof value === 'string' ? value : '';
     if (!v.startsWith('/') || v.startsWith('//') || v.includes('\\')) return '/survey';
@@ -326,12 +310,13 @@ function requireDb(req, res, next) {
 const regenerateSession = req => new Promise((resolve, reject) => req.session.regenerate(err => (err ? reject(err) : resolve())));
 const saveSession = req => new Promise((resolve, reject) => req.session.save(err => (err ? reject(err) : resolve())));
 
+// Booking needs a confirmed email, so receipts can only ever go to an inbox the customer controls
 async function requireVerified(req, res, next) {
     try {
         const u = req.session && req.session.user;
         if (!u) return res.redirect('/login');
         if (u.verified) return next();
-        const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [u.id]);
+        const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [u.id]);   // may have been confirmed in another browser
         if (r.rows[0] && r.rows[0].email_verified) {
             u.verified = true;
             return next();
@@ -340,6 +325,7 @@ async function requireVerified(req, res, next) {
     } catch (err) { next(err); }
 }
 
+// Passwords
 const COMMON_PASSWORDS = new Set(['password', 'password1', 'password123', '12345678', '123456789', '1234567890', 'qwertyuiop', 'qwerty123', '11111111', '00000000', 'iloveyou1', 'tencent123']);
 function passwordProblem(password, confirm, email = '') {
     if (password.length < 8) return 'Your password must be at least 8 characters.';
@@ -349,8 +335,11 @@ function passwordProblem(password, confirm, email = '') {
     return '';
 }
 
+// Lockout: 6 wrong passwords for the same email within 15 minutes locks sign-in for that email for 15 minutes.
+// Unknown emails are counted the same way, so the lock message never reveals whether an account exists.
+// Resetting the password through the emailed link clears the lock.
 const LOCK_AFTER = 6, LOCK_MS = 15 * 60 * 1000;
-const loginFails = new Map();
+const loginFails = new Map();   // email -> { count, first, lockedUntil }
 function lockedMinutes(email) {
     const f = loginFails.get(email);
     return f && f.lockedUntil > Date.now() ? Math.ceil((f.lockedUntil - Date.now()) / 60000) : 0;
@@ -370,12 +359,13 @@ setInterval(() => {
     for (const [k, t] of emailCooldown) if (now - t > 10 * 60 * 1000) emailCooldown.delete(k);
 }, 10 * 60 * 1000).unref();
 
-const emailCooldown = new Map();
+// One-time links sent by email (confirm email, reset password). Only a hash is stored, so a database leak cannot be used to take over accounts.
+const emailCooldown = new Map();   // "kind:userId" -> last send time
 const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
 const TOKEN_FORMAT = /^[A-Za-z0-9_-]{43}$/;
 async function createAuthToken(userId, kind, ttlMs) {
     const raw = crypto.randomBytes(32).toString('base64url');
-    await pool.query('DELETE FROM auth_tokens WHERE user_id = $1 AND kind = $2', [userId, kind]);
+    await pool.query('DELETE FROM auth_tokens WHERE user_id = $1 AND kind = $2', [userId, kind]);   // only the newest link works
     await pool.query('INSERT INTO auth_tokens (user_id, kind, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)',
         [userId, kind, sha256(raw), Date.now() + ttlMs, Date.now()]);
     return raw;
@@ -385,7 +375,7 @@ async function peekAuthToken(raw, kind) {
     const r = await pool.query('SELECT user_id FROM auth_tokens WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3', [sha256(raw), kind, Date.now()]);
     return r.rows[0] ? r.rows[0].user_id : null;
 }
-async function useAuthToken(raw, kind) {
+async function useAuthToken(raw, kind) {   // atomic: a link can only be used once, even if clicked twice at the same moment
     if (!TOKEN_FORMAT.test(String(raw || ''))) return null;
     const r = await pool.query('UPDATE auth_tokens SET used_at = $3 WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3 RETURNING user_id', [sha256(raw), kind, Date.now()]);
     return r.rows[0] ? r.rows[0].user_id : null;
@@ -396,6 +386,7 @@ function cooldownOk(kind, userId, ms) {
     emailCooldown.set(key, now);
     return true;
 }
+// Links in emails always use your own address from PUBLIC_BASE_URL, never the Host header (that would let an attacker poison reset links)
 function emailLink(path) {
     if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL is not set, so account emails cannot be sent');
     return PUBLIC_BASE_URL + path;
@@ -432,11 +423,14 @@ async function sendPasswordChangedEmail(user) {
 const quietly = (label, promise) => promise.catch(err => console.error(label + ':', err.message));
 
 // ---------------------------------------------------------------
-// 6. Email and Telegram
+// 6. Email (receipts and alerts) and Telegram
 // ---------------------------------------------------------------
+// Render's free plan blocks normal email (SMTP), so the main route is Brevo, which works over HTTPS:
+//   BREVO_API_KEY, MAIL_FROM_EMAIL (verified sender in Brevo), MAIL_FROM_NAME (optional)
+// Gmail (GMAIL_USER + GMAIL_APP_PASSWORD) still works as a fallback on plans that allow SMTP.
 const MAIL = {
     brevoKey: process.env.BREVO_API_KEY || '',
-    brevoUrl: process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email',
+    brevoUrl: process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email',   // BREVO_API_URL exists so tests can use a mock
     fromEmail: process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || '',
     fromName: process.env.MAIL_FROM_NAME || 'Tencent Innovations',
     adminTo: process.env.NOTIFY_TO || process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || ''
@@ -453,6 +447,7 @@ function getSmtp() {
     return smtp;
 }
 
+// attachments: [{ filename, content: Buffer, contentType }]
 async function sendMail({ to, subject, html, text, attachments = [] }) {
     if (MAIL.brevoKey && MAIL.fromEmail) {
         const body = { sender: { name: MAIL.fromName, email: MAIL.fromEmail }, to: [{ email: to }], subject, htmlContent: html, textContent: text };
@@ -477,6 +472,7 @@ async function sendMail({ to, subject, html, text, attachments = [] }) {
     throw new Error('No email service is set up (add BREVO_API_KEY and MAIL_FROM_EMAIL in Render)');
 }
 
+// Alerts to YOU only (Telegram + email). Customers never receive these.
 async function notify(subject, fields) {
     const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
     const rows = Object.entries(fields).map(([label, val]) => {
@@ -487,6 +483,7 @@ async function notify(subject, fields) {
     }).join('');
     const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
 
+    // The log says what happened but not who, so customer details do not pile up in Render's logs
     console.log('LEAD:', cleanSubject.split(/[:-]/)[0].trim(), time);
 
     const sendTelegram = async () => {
@@ -538,6 +535,7 @@ function mpesaConfigured() {
     );
 }
 
+// Prices are set here on the server and never taken from the form
 const SERVICE_PRICES = {
     'Site Survey & Quotation': 3000,
     'WiFi Setup': 3000,
@@ -547,14 +545,25 @@ const SERVICE_PRICES = {
     'Solar Consultation': 4000
 };
 
+// ---------------------------------------------------------------
+// Location- and urgency-based pricing
+// The service price above is the base fee. A travel fare (by distance from Rangwe) and an
+// urgency fee are added on top. Everything is worked out here on the server, never in the browser.
+// Change the numbers in Render (Environment) without touching the code:
+//   TRAVEL_FREE_KM        km from Rangwe that carry no travel fare            (default 5)
+//   TRAVEL_RATE_PER_KM    KES charged for each km beyond the free distance    (default 40)
+//   TRAVEL_MAX_KM         furthest distance bookable online                   (default 80)
+//   URGENCY_NEXT_DAY_FEE  extra KES for next-day service                      (default 500)
+//   URGENCY_SAME_DAY_FEE  extra KES for same-day service                      (default 1000)
+// ---------------------------------------------------------------
 const envNum = (name, fallback) => {
     const v = Number(process.env[name]);
     return process.env[name] !== undefined && process.env[name] !== '' && Number.isFinite(v) && v >= 0 ? v : fallback;
 };
 const PRICING = {
-    base: { lat: -0.6003, lng: 34.5835 },
-    roadFactor: 1.3,
-    roundTo: 50,
+    base: { lat: -0.6003, lng: 34.5835 },   // Rangwe
+    roadFactor: 1.3,                          // roads are longer than the straight line
+    roundTo: 50,                              // travel fare is rounded up to the next KES 50
     freeKm: envNum('TRAVEL_FREE_KM', 5),
     ratePerKm: envNum('TRAVEL_RATE_PER_KM', 40),
     maxKm: envNum('TRAVEL_MAX_KM', 80),
@@ -564,6 +573,7 @@ const PRICING = {
         'same-day': { label: 'Same day', fee: envNum('URGENCY_SAME_DAY_FEE', 1000) }
     }
 };
+// For customers who do not want to share their phone location. Coordinates are approximate town centres.
 const PLACES = {
     rangwe: { label: 'Rangwe town', lat: -0.6003, lng: 34.5835 },
     'homa-bay': { label: 'Homa Bay town', lat: -0.5273, lng: 34.4571 },
@@ -579,6 +589,7 @@ function distanceKm(lat, lng) {
     const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(PRICING.base.lat)) * Math.cos(rad(lat)) * Math.sin(dLng / 2) ** 2;
     return Math.ceil(2 * 6371 * Math.asin(Math.sqrt(a)) * PRICING.roadFactor);
 }
+// input: { service, urgency, place, lat, lng } straight from the form. Returns { ok:true, ... } or { ok:false, error }.
 function computeQuote(input) {
     const service = String(input.service || '');
     if (!Object.hasOwn(SERVICE_PRICES, service)) return { ok: false, error: 'Please choose a valid service.' };
@@ -611,8 +622,8 @@ function normalizePhone(raw) {
     return /^254[17]\d{8}$/.test(p) ? p : null;
 }
 
-const phoneAttempts = new Map();
-const lastStatusQuery = new Map();
+const phoneAttempts = new Map();     // phone -> [timestamps]
+const lastStatusQuery = new Map();   // booking id -> when we last asked Safaricom
 function phoneAttemptAllowed(phone) {
     const now = Date.now();
     const recent = (phoneAttempts.get(phone) || []).filter(t => now - t < 60 * 60 * 1000);
@@ -621,7 +632,7 @@ function phoneAttemptAllowed(phone) {
     phoneAttempts.set(phone, recent);
     return true;
 }
-setInterval(() => {
+setInterval(() => {   // tidy the in-memory maps so they cannot grow forever
     const now = Date.now();
     for (const [p, arr] of phoneAttempts) {
         const recent = arr.filter(t => now - t < 60 * 60 * 1000);
@@ -655,7 +666,7 @@ async function darajaPost(apiPath, payload) {
         signal: AbortSignal.timeout(20000)
     });
     let data = {};
-    try { data = await resp.json(); } catch (_) {}
+    try { data = await resp.json(); } catch (_) { /* non-JSON body */ }
     if (!resp.ok) {
         if (resp.status === 401) tokenCache = { value: null, expiresAt: 0 };
         const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
@@ -677,7 +688,7 @@ async function stkPush(booking) {
         PartyB: MPESA.shortcode,
         PhoneNumber: booking.phone,
         CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: booking.accountRef,
+        AccountReference: booking.accountRef,   // max 12 characters
         TransactionDesc: 'Survey fee'
     });
     if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
@@ -695,203 +706,9 @@ async function stkQuery(checkoutRequestId) {
 }
 
 // ---------------------------------------------------------------
-// 7b. Multi-Tenant POS Backend Services & Routes
-// ---------------------------------------------------------------
-async function getTenantMpesaToken(businessId) {
-    const res = await pool.query(
-        'SELECT mpesa_consumer_key, mpesa_consumer_secret FROM businesses WHERE id = $1', 
-        [businessId]
-    );
-    if (!res.rows.length || !res.rows[0].mpesa_consumer_key) {
-        throw new Error('M-Pesa credentials not configured for this business.');
-    }
-    const { mpesa_consumer_key, mpesa_consumer_secret } = res.rows[0];
-    const auth = Buffer.from(`${mpesa_consumer_key}:${mpesa_consumer_secret}`).toString('base64');
-    
-    const baseUrl = process.env.MPESA_ENV === 'production' 
-        ? 'https://api.safaricom.co.ke' 
-        : 'https://sandbox.safaricom.co.ke';
-
-    const tokenRes = await axios.get(`${baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
-        headers: { Authorization: `Basic ${auth}` }
-    });
-    return { token: tokenRes.data.access_token, baseUrl };
-}
-
-app.get('/api/pos/products', requireAuth, ah(async (req, res) => {
-    const businessId = req.query.business_id || 1;
-    const result = await pool.query('SELECT * FROM products WHERE business_id = $1 ORDER BY name ASC', [businessId]);
-    res.json(result.rows);
-}));
-
-app.post('/api/pos/checkout/cash', requireAuth, ah(async (req, res) => {
-    const { business_id = 1, items, total_amount } = req.body;
-    const receiptNumber = 'POS-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const saleRes = await client.query(
-            `INSERT INTO pos_sales (business_id, receipt_number, total_amount, payment_method, payment_status)
-             VALUES ($1, $2, $3, 'CASH', 'COMPLETED') RETURNING id`,
-            [business_id, receiptNumber, total_amount]
-        );
-        const saleId = saleRes.rows[0].id;
-
-        for (const item of items) {
-            await client.query(
-                `INSERT INTO pos_sale_items (sale_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)`,
-                [saleId, item.product_id, item.quantity, item.unit_price]
-            );
-            await client.query(
-                `UPDATE products SET stock_qty = stock_qty - $1 WHERE id = $2`,
-                [item.quantity, item.product_id]
-            );
-        }
-
-        await client.query('COMMIT');
-        res.json({ success: true, receipt_number: receiptNumber });
-    } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-    } finally {
-        client.release();
-    }
-}));
-
-app.post('/api/pos/checkout/mpesa', requireAuth, ah(async (req, res) => {
-    const { business_id = 1, phone, items, total_amount } = req.body;
-    const receiptNumber = 'POS-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-
-    let bizRes = await pool.query('SELECT * FROM businesses WHERE id = $1', [business_id]);
-    if (!bizRes.rows.length) {
-        const newBiz = await pool.query(
-            `INSERT INTO businesses (name, mpesa_shortcode, mpesa_passkey, mpesa_consumer_key, mpesa_consumer_secret)
-             VALUES ('Demo Shop', '174379', 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919', $1, $2) RETURNING *`,
-            [process.env.MPESA_CONSUMER_KEY || 'demo', process.env.MPESA_SECRET || 'demo']
-        );
-        bizRes = newBiz;
-    }
-    const biz = bizRes.rows[0];
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const saleRes = await client.query(
-            `INSERT INTO pos_sales (business_id, receipt_number, total_amount, payment_method, payment_status)
-             VALUES ($1, $2, $3, 'MPESA', 'PENDING') RETURNING id`,
-            [business_id, receiptNumber, total_amount]
-        );
-        const saleId = saleRes.rows[0].id;
-
-        for (const item of items) {
-            await client.query(
-                `INSERT INTO pos_sale_items (sale_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, $4)`,
-                [saleId, item.product_id, item.quantity, item.unit_price]
-            );
-        }
-
-        const { token, baseUrl } = await getTenantMpesaToken(business_id);
-        const timestamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
-        const password = Buffer.from(`${biz.mpesa_shortcode}${biz.mpesa_passkey}${timestamp}`).toString('base64');
-        const formattedPhone = phone.startsWith('0') ? '254' + phone.slice(1) : phone;
-
-        const stkRes = await axios.post(`${baseUrl}/mpesa/stkpush/v1/processrequest`, {
-            BusinessShortCode: biz.mpesa_shortcode,
-            Password: password,
-            Timestamp: timestamp,
-            TransactionType: biz.mpesa_type || 'CustomerBuyGoodsOnline',
-            Amount: Math.ceil(total_amount),
-            PartyA: formattedPhone,
-            PartyB: biz.mpesa_shortcode,
-            PhoneNumber: formattedPhone,
-            CallBackURL: `${PUBLIC_BASE_URL}/api/pos/mpesa/callback/${saleId}`,
-            AccountReference: receiptNumber,
-            TransactionDesc: `POS Sale ${receiptNumber}`
-        }, {
-            headers: { Authorization: `Bearer ${token}` }
-        });
-
-        await client.query(
-            `UPDATE pos_sales SET mpesa_checkout_id = $1 WHERE id = $2`,
-            [stkRes.data.CheckoutRequestID, saleId]
-        );
-
-        await client.query('COMMIT');
-        res.json({ success: true, sale_id: saleId, checkout_request_id: stkRes.data.CheckoutRequestID });
-    } catch (e) {
-        await client.query('ROLLBACK');
-        throw e;
-    } finally {
-        client.release();
-    }
-}));
-
-app.post('/api/pos/mpesa/callback/:saleId', ah(async (req, res) => {
-    const { saleId } = req.params;
-    const body = req.body.Body.stkCallback;
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        if (body.ResultCode === 0) {
-            const metadata = body.CallbackMetadata.Item;
-            const mpesaReceipt = metadata.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
-
-            await client.query(
-                `UPDATE pos_sales SET payment_status = 'COMPLETED', mpesa_receipt_no = $1 WHERE id = $2`,
-                [mpesaReceipt, saleId]
-            );
-
-            const itemsRes = await client.query('SELECT product_id, quantity FROM pos_sale_items WHERE sale_id = $1', [saleId]);
-            for (const item of itemsRes.rows) {
-                await client.query('UPDATE products SET stock_qty = stock_qty - $1 WHERE id = $2', [item.quantity, item.product_id]);
-            }
-        } else {
-            await client.query(`UPDATE pos_sales SET payment_status = 'FAILED' WHERE id = $1`, [saleId]);
-        }
-        await client.query('COMMIT');
-        res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-    } catch (e) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: e.message });
-    } finally {
-        client.release();
-    }
-}));
-
-app.get('/api/pos/sales/:id/status', requireAuth, ah(async (req, res) => {
-    const result = await pool.query('SELECT payment_status, receipt_number, mpesa_receipt_no FROM pos_sales WHERE id = $1', [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Sale not found' });
-    res.json(result.rows[0]);
-}));
-
-app.get('/api/pos/seed', requireAuth, ah(async (req, res) => {
-    await pool.query(`
-        INSERT INTO businesses (id, name, mpesa_shortcode) 
-        VALUES (1, 'Demo Shop', '174379')
-        ON CONFLICT (id) DO NOTHING;
-    `);
-
-    const existing = await pool.query('SELECT COUNT(*) FROM products WHERE business_id = 1');
-    if (parseInt(existing.rows[0].count) === 0) {
-        await pool.query(`
-            INSERT INTO products (business_id, barcode, name, price, stock_qty) VALUES
-            (1, '071234567890', 'Smart Extension Cord (3-Way)', 1250.00, 45),
-            (1, '071234567891', 'CAT6 Ethernet Cable (10m)', 650.00, 120),
-            (1, '071234567892', 'Solar LED Bulb (12W)', 350.00, 80),
-            (1, '071234567893', '12V DC Cooling Fan', 900.00, 25),
-            (1, '071234567894', 'Digital Multimeter (DT-830B)', 750.00, 30),
-            (1, '071234567895', 'Type-C Fast Charging Cable', 400.00, 150);
-        `);
-        return res.json({ success: true, message: 'Sample products added successfully!' });
-    }
-    res.json({ success: true, message: 'Products already exist.' });
-}));
-
-// ---------------------------------------------------------------
 // 8. Bookings in the database
 // ---------------------------------------------------------------
+// One shape used everywhere (the database uses snake_case, the code uses camelCase)
 function rowToBooking(r) {
     if (!r) return null;
     return {
@@ -945,6 +762,7 @@ function bookingFields(b, extra = {}) {
     };
 }
 
+// Lines like "Base fee: KES 3,000" for receipts, emails and pages. Empty for bookings made before this feature.
 function breakdownLines(b) {
     if (b.baseAmount == null) return [];
     const kes = n => 'KES ' + Number(n).toLocaleString('en-KE');
@@ -956,7 +774,9 @@ function breakdownLines(b) {
 }
 
 // ---------------------------------------------------------------
-// 9. Booking links
+// 9. Booking links: they carry only the booking id and a signature.
+//    The page always reads the real details from the database,
+//    so a link can never be edited into a fake receipt.
 // ---------------------------------------------------------------
 const linksEnabled = () => LINK_SECRET.length >= 16 && PUBLIC_BASE_URL.startsWith('https://');
 const signId = id => crypto.createHmac('sha256', LINK_SECRET).update('booking:' + id).digest('base64url');
@@ -980,6 +800,7 @@ function readBookingLink(token) {
 // ---------------------------------------------------------------
 // 10. PDF receipt
 // ---------------------------------------------------------------
+// The built-in PDF fonts only cover Latin characters, so anything else becomes "?"
 const pdfText = v => String(v == null ? '' : v)
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/[^\x20-\x7E¡-ÿ]/g, '?');
@@ -1062,9 +883,10 @@ function receiptEmailText(b, link) {
         `\nAn engineer will call you on ${b.phone} to agree a time for the visit.\n\nTencent Innovations, Rangwe, Homa Bay County. Calls 0740 311 014\n`;
 }
 async function setEmailStatus(id, status) {
-    try { await pool.query('UPDATE bookings SET email_status = $2 WHERE id = $1', [id, String(status).slice(0, 300)]); } catch (_) {}
+    try { await pool.query('UPDATE bookings SET email_status = $2 WHERE id = $1', [id, String(status).slice(0, 300)]); } catch (_) { /* best effort */ }
 }
 
+// Sends the PDF receipt to the customer. Never throws; returns true/false.
 async function emailReceipt(b) {
     if (!b.email) { await setEmailStatus(b.id, 'no email address'); return false; }
     try {
@@ -1090,6 +912,8 @@ async function emailReceipt(b) {
 // ---------------------------------------------------------------
 // 12. Payment state changes
 // ---------------------------------------------------------------
+// The receipt email and your alert go out exactly once, and only when the M-Pesa receipt number is known
+// (or, as a fallback, a few minutes after payment was confirmed without one).
 async function finalizePaid(id, force = false) {
     const r = await pool.query(
         `UPDATE bookings SET receipt_sent = TRUE
@@ -1114,6 +938,7 @@ async function finalizePaid(id, force = false) {
 }
 
 async function markPaid(id, receipt, verified) {
+    // Only the first caller flips the booking to paid. Callback and status poll can arrive together.
     await pool.query(
         `UPDATE bookings
          SET status = 'paid',
@@ -1143,6 +968,7 @@ async function handleCallback(body) {
     const receipt = String(meta('MpesaReceiptNumber') || '').slice(0, 40);
 
     if (booking.status === 'paid') {
+        // Payment was already confirmed by the status check: add the receipt number, then send the receipt
         if (succeeded && receipt && !booking.receipt) {
             await pool.query(`UPDATE bookings SET receipt = $2 WHERE id = $1 AND COALESCE(receipt, '') = ''`, [booking.id, receipt]);
         }
@@ -1151,6 +977,7 @@ async function handleCallback(body) {
     }
     if (!succeeded) { await markFailed(booking.id, cb.ResultDesc); return; }
 
+    // The amount paid must match the price we asked for
     if (Number(meta('Amount')) !== booking.amount) {
         await markReview(booking.id);
         await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
@@ -1160,6 +987,7 @@ async function handleCallback(body) {
         return;
     }
 
+    // Do not trust the callback alone: ask Safaricom directly
     let verified = false;
     try {
         const q = await stkQuery(booking.checkoutRequestId);
@@ -1178,16 +1006,18 @@ async function handleCallback(body) {
     await markPaid(booking.id, receipt, verified);
 }
 
+// Safaricom calls this. The secret in the URL stops strangers from posting fake payments.
 app.post('/payments/cb/:secret', (req, res) => {
     const given = Buffer.from(String(req.params.secret));
     const expected = Buffer.from(String(MPESA.callbackSecret || ''));
     const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
     if (!ok) return res.sendStatus(404);
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
     if (!dbReady) return console.error('Callback received while the database was not ready');
     handleCallback(req.body).catch(err => console.error('Callback error:', err.message));
 });
 
+// The "check your phone" page polls this. Only the person who made the booking can see it.
 app.get('/payments/status/:id', statusLimiter, requireDb, ah(async (req, res) => {
     if (!(req.session && req.session.user)) return res.status(401).json({ status: 'unknown' });
     if (!validBookingId(req.params.id)) return res.status(404).json({ status: 'unknown' });
@@ -1201,7 +1031,7 @@ app.get('/payments/status/:id', statusLimiter, requireDb, ah(async (req, res) =>
             const q = await stkQuery(b.checkoutRequestId);
             if (String(q.ResultCode) === '0') await markPaid(b.id, '', true);
             else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') await markFailed(b.id, q.ResultDesc || 'Payment cancelled');
-        } catch (_) {}
+        } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
         b = (await getBookingForUser(b.id, req.session.user.id)) || b;
     }
     res.json({
@@ -1210,6 +1040,7 @@ app.get('/payments/status/:id', statusLimiter, requireDb, ah(async (req, res) =>
     });
 }));
 
+// Only the owner can download from here. (The shareable /booking/ link has its own PDF route.)
 app.get('/payments/receipt/:id/download.pdf', requireAuth, requireDb, ah(async (req, res) => {
     if (!PDFDocument) return errorPage(req, res, 501, 'Not available', 'Receipt download is not available right now.');
     if (!validBookingId(req.params.id)) return errorPage(req, res, 404, 'Not found', 'We could not find that receipt.', { href: '/requests', label: 'My requests' });
@@ -1218,6 +1049,8 @@ app.get('/payments/receipt/:id/download.pdf', requireAuth, requireDb, ah(async (
     sendPdf(res, await generatePdfBuffer(b), b.accountRef);
 }));
 
+// Safety net: if the callback never delivered the M-Pesa receipt number, send the receipt anyway after 3 minutes.
+// Also finishes any receipt that was waiting when the server restarted.
 setInterval(() => {
     if (!dbReady) return;
     pool.query(`SELECT id FROM bookings WHERE status = 'paid' AND receipt_sent = FALSE AND paid_at < $1 AND paid_at > $2`,
@@ -1227,7 +1060,7 @@ setInterval(() => {
 }, 60 * 1000).unref();
 
 // ---------------------------------------------------------------
-// 13. Layout
+// 13. Layout: left sidebar (drawer on phones), theme toggle, styled error pages
 // ---------------------------------------------------------------
 function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) {
     const user = req.session && req.session.user ? req.session.user : null;
@@ -1408,8 +1241,8 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
             <li><a href="/smart-locks" class="${activeNav === 'smart-locks' ? 'active' : ''}">🔐 Smart Locks</a></li>
             <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
             <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
+            <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">🧾 POS for Shops</a></li>
             <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
-            <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">⚡ POS Terminal</a></li>
             ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
             <li><a href="/contact" class="${activeNav === 'contact' ? 'active' : ''}">📞 Contact Us</a></li>
             <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
@@ -1451,7 +1284,6 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
                         <li><a href="/wifi">WiFi & Networking</a></li>
                         <li><a href="/survey">Site Surveys</a></li>
                         <li><a href="/solar">Solar Systems</a></li>
-                        <li><a href="/pos">POS Terminal</a></li>
                     </ul>
                 </div>
                 <div class="footer-col">
@@ -1566,11 +1398,13 @@ app.post('/register', registerLimiter, requireDb, ah(async (req, res) => {
         if (err.code === '23505') return fail('We could not create that account. If you already registered, please log in instead.');
         throw err;
     }
-    await regenerateSession(req);
+    await regenerateSession(req);   // a fresh session id at login prevents session fixation
     req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: false };
     await saveSession(req);
-    cooldownOk('verify', user.id, 60 * 1000);
-    await quietly('Verification email failed', sendVerificationEmail(user));
+    cooldownOk('verify', user.id, 60 * 1000);   // counts as the first send, so "send again" must wait a minute
+    try { await sendVerificationEmail(user); req.session.mailProblem = false; }
+    catch (err) { console.error('Verification email failed:', err.message); req.session.mailProblem = true; }
+    await saveSession(req);
     res.redirect('/verify-email/pending');
 }));
 
@@ -1611,6 +1445,7 @@ app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
     }
     const r = await pool.query('SELECT id, name, email, phone, password_hash, email_verified FROM users WHERE lower(email) = $1', [email]);
     const user = r.rows[0];
+    // Always run one bcrypt comparison, so unknown emails take as long as wrong passwords
     const match = await bcrypt.compare(password, user ? user.password_hash : DUMMY_HASH);
     if (!user || !match) {
         recordLoginFailure(email);
@@ -1623,6 +1458,9 @@ app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
     res.redirect(next);
 }));
 
+// ---------------------------------------------------------------
+// Email confirmation
+// ---------------------------------------------------------------
 const noStore = (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); };
 const simplePage = (req, res, status, title, bodyHtml) => res.status(status).send(renderPage(req, { title, activeNav: '', content: `<div class="general-container"><h2>${esc(title)}</h2>${bodyHtml}</div>` }));
 
@@ -1631,7 +1469,8 @@ app.get('/verify-email/pending', requireAuth, requireDb, noStore, ah(async (req,
     if (r.rows[0] && r.rows[0].email_verified) { req.session.user.verified = true; return res.redirect('/survey'); }
     const sent = req.query.sent === '1';
     simplePage(req, res, 200, 'Confirm your email', `
-        ${sent ? '<div class="alert ok" role="status">We sent a new confirmation link. Please check your inbox (and spam folder).</div>' : ''}
+        ${req.session.mailProblem ? '<div class="alert" role="alert">We could not send the confirmation email just now. Please wait a minute and press "Send the link again", or <a href="/contact">contact us</a> and we will confirm your account.</div>' : ''}
+        ${sent && !req.session.mailProblem ? '<div class="alert ok" role="status">We sent a new confirmation link. Please check your inbox (and spam folder).</div>' : ''}
         <p class="intro-text">We sent a confirmation link to <strong>${esc(req.session.user.email)}</strong>. Open it to finish setting up your account. You need this before you can book a service, because your receipts are emailed to this address.</p>
         <form action="/verify-email/resend" method="POST"><button type="submit" class="cta-btn">Send the link again</button></form>
         <p style="margin-top:18px; color:var(--muted);">Wrong email address? Please <a href="/contact">contact us</a> and we will fix it.</p>`);
@@ -1641,7 +1480,10 @@ app.post('/verify-email/resend', requireAuth, requireDb, resendLimiter, ah(async
     const u = req.session.user;
     if (cooldownOk('verify', u.id, 60 * 1000)) {
         const r = await pool.query('SELECT id, name, email, email_verified FROM users WHERE id = $1', [u.id]);
-        if (r.rows[0] && !r.rows[0].email_verified) await quietly('Verification email failed', sendVerificationEmail(r.rows[0]));
+        if (r.rows[0] && !r.rows[0].email_verified) {
+            try { await sendVerificationEmail(r.rows[0]); req.session.mailProblem = false; }
+            catch (err) { console.error('Verification email failed:', err.message); req.session.mailProblem = true; }
+        }
     }
     res.redirect('/verify-email/pending?sent=1');
 }));
@@ -1656,6 +1498,9 @@ app.get('/verify-email', requireDb, noStore, ah(async (req, res) => {
     simplePage(req, res, 200, 'Email confirmed', `<div class="alert ok" role="status">Thank you. Your email address is confirmed.</div><p class="intro-text">You can now book services and receive your receipts by email.</p><a href="${req.session.user ? '/survey' : '/login'}" class="cta-btn">${req.session.user ? 'Book a Survey' : 'Log in'}</a>`);
 }));
 
+// ---------------------------------------------------------------
+// Forgot / reset password
+// ---------------------------------------------------------------
 function forgotForm(error = '') {
     return `<div class="general-container">
         <h2>Forgot Your Password?</h2>
@@ -1676,6 +1521,7 @@ app.get('/forgot-password', noStore, (req, res) => {
 app.post('/forgot-password', forgotLimiter, requireDb, ah(async (req, res) => {
     const email = str(req.body.email).toLowerCase().slice(0, 254);
     if (!validEmail(email)) return res.status(400).send(renderPage(req, { title: 'Forgot Password', activeNav: 'login', content: forgotForm('Please enter a valid email address.') }));
+    // The same answer is given whether or not the account exists, and the work happens after replying so timing reveals nothing
     simplePage(req, res, 200, 'Check your email', `<p class="intro-text">If an account exists for <strong>${esc(email)}</strong>, we have sent a link to reset the password. It works for 1 hour. Please check your spam folder too.</p><a href="/login" class="cta-btn">Back to login</a>`);
     quietly('Password reset email failed', (async () => {
         const r = await pool.query('SELECT id, name, email FROM users WHERE lower(email) = $1', [email]);
@@ -1711,12 +1557,13 @@ app.post('/reset-password', resetLimiter, requireDb, noStore, ah(async (req, res
     const problem = passwordProblem(password, confirm);
     if (problem) return res.status(400).send(renderPage(req, { title: 'Reset Password', activeNav: 'login', content: resetForm(token, problem) }));
 
-    const userId = await useAuthToken(token, 'reset');
+    const userId = await useAuthToken(token, 'reset');   // consumed here, so the link cannot be used twice
     if (!userId) return badResetLink(req, res);
     const hash = await bcrypt.hash(password, BCRYPT_COST);
+    // Using the emailed link proves the customer controls the inbox, so the email counts as confirmed too
     const r = await pool.query('UPDATE users SET password_hash = $2, email_verified = TRUE WHERE id = $1 RETURNING id, name, email', [userId, hash]);
     const user = r.rows[0];
-    await pool.query(`DELETE FROM session WHERE (sess->'user'->>'id') = $1`, [String(userId)]);
+    await pool.query(`DELETE FROM session WHERE (sess->'user'->>'id') = $1`, [String(userId)]);   // sign the account out everywhere
     await pool.query(`DELETE FROM auth_tokens WHERE user_id = $1`, [userId]);
     if (user) {
         clearLoginFailures(user.email.toLowerCase());
@@ -1725,6 +1572,7 @@ app.post('/reset-password', resetLimiter, requireDb, noStore, ah(async (req, res
     res.redirect('/login?reset=1');
 }));
 
+// POST, so another website cannot log people out with a link or image
 app.post('/logout', (req, res) => {
     req.session.destroy(() => {
         res.clearCookie('tc.sid');
@@ -1819,9 +1667,10 @@ servicePage('/solar', 'solar', 'Solar Solutions',
     { text: 'Calculate your load requirements with our engineers.', label: 'Book Solar Consultation' });
 
 // ---------------------------------------------------------------
-// 16. Survey booking and payment
+// 16. Survey booking and payment (login required)
 // ---------------------------------------------------------------
 const quoteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { ok: false, error: 'Too many requests. Please wait a moment.' } });
+// Live price for the booking form. The same function prices the real booking, so the two can never disagree.
 app.get('/survey/quote', requireAuth, requireDb, requireVerified, quoteLimiter, (req, res) => {
     res.set('Cache-Control', 'no-store');
     const q = computeQuote({ service: str(req.query.service), urgency: str(req.query.urgency), place: str(req.query.place), lat: str(req.query.lat), lng: str(req.query.lng) });
@@ -1927,12 +1776,13 @@ app.post('/submit-survey-payment', requireAuth, requireDb, requireVerified, payL
     if (!phone) return errorPage(req, res, 400, 'We could not start your payment', 'Please enter a valid Safaricom number, for example 0712345678.', back);
     if (!phoneAttemptAllowed(phone)) return errorPage(req, res, 429, 'Too many attempts', 'Too many payment requests for this number. Please try again later.', back);
 
+    // Random, unique reference (max 12 characters for Daraja)
     let booking = null;
     for (let attempt = 0; attempt < 5 && !booking; attempt++) {
         const candidate = {
             id: crypto.randomBytes(16).toString('hex'),
             userId: user.id, name, phone, service, location,
-            amount: quote.total,
+            amount: quote.total,   // base fee + travel fare + urgency fee, all worked out on the server
             baseAmount: quote.base, travelKm: quote.km, travelFee: quote.travel, urgency: quote.urgency, urgencyFee: quote.urgencyFee,
             geo: `${quote.lat},${quote.lng}`,
             accountRef: 'TNC' + crypto.randomBytes(4).toString('hex').toUpperCase(),
@@ -1948,15 +1798,17 @@ app.post('/submit-survey-payment', requireAuth, requireDb, requireVerified, payL
             );
             booking = candidate;
         } catch (err) {
-            if (err.code !== '23505') throw err;
+            if (err.code !== '23505') throw err;   // 23505 = reference already used, try another
         }
     }
     if (!booking) return errorPage(req, res, 500, 'We could not save your booking', 'Please try again.', back);
 
+    // Tell you about the lead right away (alerts go to you only, never to the customer)
     notify(`📋 Survey booking (awaiting payment): ${name} - ${service}`, bookingFields(booking)).catch(() => {});
 
     if (!mpesaConfigured()) {
         await pool.query(`UPDATE bookings SET status = 'failed' WHERE id = $1 AND status = 'pending'`, [booking.id]);
+        console.error('M-Pesa is not fully configured (check MPESA_* variables and PUBLIC_BASE_URL).');
         return errorPage(req, res, 503, 'Online payment is unavailable', 'Online payment is not available right now. We have saved your request and will call you.', { href: '/requests', label: 'My requests' });
     }
 
@@ -2077,7 +1929,7 @@ app.post('/requests/:id/resend', requireAuth, resendLimiter, requireDb, ah(async
 }));
 
 // ---------------------------------------------------------------
-// 18. Shareable booking page
+// 18. Shareable booking page (signed link; details always come from the database)
 // ---------------------------------------------------------------
 const BOOKING_VIEWS = {
     paid: { h: 'Payment Receipt & Booking', sub: 'Payment received. Keep this page as your receipt.', badge: '<span class="badge paid">PAID & CONFIRMED</span>' },
@@ -2139,245 +1991,7 @@ app.get('/booking/:token/receipt.pdf', requireDb, ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------
-// 18b. POS Terminal UI Route (/pos)
-// ---------------------------------------------------------------
-app.get('/pos', requireAuth, (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>POS Terminal - Service</title>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-</head>
-<body class="bg-gray-100 h-screen flex flex-col">
-    <header class="bg-slate-900 text-white px-6 py-4 flex justify-between items-center shadow">
-        <h1 class="text-xl font-bold">⚡ Cloud POS Terminal</h1>
-        <div class="flex items-center gap-4">
-            <a href="/survey" class="text-sm bg-blue-600 px-3 py-1.5 rounded-lg text-white font-medium hover:bg-blue-700 transition">← Back to Site</a>
-            <div class="text-sm text-slate-300">Logged in as: ${esc(req.session.user.name)}</div>
-        </div>
-    </header>
-
-    <div class="flex-1 flex overflow-hidden">
-        <!-- Products Grid -->
-        <div class="flex-1 p-6 overflow-y-auto">
-            <div class="mb-4 flex gap-4">
-                <input type="text" id="search" placeholder="Search products or scan barcode..." class="flex-1 px-4 py-2 bg-white rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <button onclick="seedProducts()" class="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-slate-900 transition">📦 Load Sample Stock</button>
-            </div>
-            <div id="product-grid" class="grid grid-cols-3 gap-4">
-                <!-- Populated via JS -->
-            </div>
-        </div>
-
-        <!-- Cart & Checkout Sidebar -->
-        <div class="w-96 bg-white border-l border-gray-200 flex flex-col shadow-lg">
-            <div class="p-4 border-b border-gray-200 font-bold text-lg bg-gray-50">Current Sale</div>
-            <div id="cart-items" class="flex-1 p-4 overflow-y-auto space-y-3">
-                <p class="text-gray-400 text-center mt-10">Cart is empty</p>
-            </div>
-            <div class="p-4 border-t border-gray-200 bg-gray-50 space-y-3">
-                <div class="flex justify-between text-xl font-bold">
-                    <span>Total:</span>
-                    <span id="cart-total">KES 0.00</span>
-                </div>
-                <button onclick="checkoutCash()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-lg shadow transition">Pay with Cash</button>
-                <button onclick="openMpesaModal()" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg shadow transition">Pay with M-Pesa</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- M-Pesa Modal -->
-    <div id="mpesa-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center">
-        <div class="bg-white p-6 rounded-xl w-96 space-y-4 shadow-2xl">
-            <h3 class="text-lg font-bold">Enter M-Pesa Phone Number</h3>
-            <input type="text" id="mpesa-phone" placeholder="07XXXXXXXX" class="w-full px-4 py-2 border rounded-lg">
-            <div class="flex space-x-2">
-                <button onclick="closeMpesaModal()" class="flex-1 bg-gray-300 py-2 rounded-lg font-medium">Cancel</button>
-                <button onclick="checkoutMpesa()" class="flex-1 bg-green-600 text-white py-2 rounded-lg font-bold">Send STK Push</button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let products = [];
-        let cart = [];
-
-        async function loadProducts() {
-            const res = await fetch('/api/pos/products?business_id=1');
-            products = await res.json();
-            renderProducts(products);
-        }
-
-        async function seedProducts() {
-            const res = await fetch('/api/pos/seed');
-            const data = await res.json();
-            alert(data.message);
-            loadProducts();
-        }
-
-        function renderProducts(itemsToRender) {
-            const grid = document.getElementById('product-grid');
-            if (!itemsToRender.length) {
-                grid.innerHTML = '<p class="col-span-3 text-center text-gray-400 py-10">No products found. Click "Load Sample Stock" above!</p>';
-                return;
-            }
-            grid.innerHTML = itemsToRender.map(p => \`
-                <div onclick="addToCart(\${p.id})" class="bg-white p-4 rounded-xl shadow-sm border border-gray-200 cursor-pointer hover:border-blue-500 transition flex flex-col justify-between">
-                    <div>
-                        <h4 class="font-bold text-gray-800">\${p.name}</h4>
-                        <p class="text-xs text-gray-500">Barcode: \${p.barcode || 'N/A'}</p>
-                        <p class="text-xs text-gray-500">Stock: \${p.stock_qty}</p>
-                    </div>
-                    <p class="text-blue-600 font-extrabold mt-4">KES \${Number(p.price).toLocaleString()}</p>
-                </div>
-            \`).join('');
-        }
-
-        const searchInput = document.getElementById('search');
-        
-        searchInput.addEventListener('input', (e) => {
-            const query = e.target.value.toLowerCase();
-            const filtered = products.filter(p => 
-                p.name.toLowerCase().includes(query) || (p.barcode && p.barcode.toLowerCase().includes(query))
-            );
-            renderProducts(filtered);
-        });
-
-        searchInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                const query = searchInput.value.trim();
-                const matched = products.find(p => p.barcode === query || p.name.toLowerCase() === query.toLowerCase());
-                if (matched) {
-                    addToCart(matched.id);
-                    searchInput.value = '';
-                    renderProducts(products);
-                } else {
-                    const filtered = products.filter(p => p.name.toLowerCase().includes(query.toLowerCase()) || (p.barcode && p.barcode.includes(query)));
-                    if (filtered.length === 1) {
-                        addToCart(filtered[0].id);
-                        searchInput.value = '';
-                        renderProducts(products);
-                    } else {
-                        alert('Product not found for scan/search: ' + query);
-                    }
-                }
-            }
-        });
-
-        function addToCart(id) {
-            const product = products.find(p => p.id === id);
-            if (!product) return;
-            if (product.stock_qty <= 0) return alert('Out of stock!');
-
-            const existing = cart.find(item => item.product_id === id);
-            if (existing) {
-                if (existing.quantity >= product.stock_qty) return alert('Cannot exceed available stock.');
-                existing.quantity++;
-            } else {
-                cart.push({ product_id: product.id, name: product.name, unit_price: Number(product.price), quantity: 1 });
-            }
-            renderCart();
-            searchInput.focus();
-        }
-
-        function renderCart() {
-            const container = document.getElementById('cart-items');
-            if (!cart.length) {
-                container.innerHTML = '<p class="text-gray-400 text-center mt-10">Cart is empty</p>';
-                document.getElementById('cart-total').innerText = 'KES 0.00';
-                return;
-            }
-            container.innerHTML = cart.map((item, idx) => \`
-                <div class="flex justify-between items-center bg-gray-50 p-2 rounded border">
-                    <div>
-                        <h5 class="font-bold text-sm">\${item.name}</h5>
-                        <p class="text-xs text-gray-500">\${item.quantity} x KES \${item.unit_price.toLocaleString()}</p>
-                    </div>
-                    <button onclick="cart.splice(\${idx}, 1); renderCart();" class="text-red-500 font-bold text-sm px-2">✕</button>
-                </div>
-            \`).join('');
-            const total = cart.reduce((sum, i) => sum + (i.unit_price * i.quantity), 0);
-            document.getElementById('cart-total').innerText = 'KES ' + total.toLocaleString();
-        }
-
-        async function checkoutCash() {
-            if (!cart.length) return alert('Cart is empty');
-            const total = cart.reduce((sum, i) => sum + (i.unit_price * i.quantity), 0);
-            const res = await fetch('/api/pos/checkout/cash', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ business_id: 1, items: cart, total_amount: total })
-            });
-            const data = await res.json();
-            if (data.success) {
-                alert('Sale completed! Receipt: ' + data.receipt_number);
-                cart = [];
-                renderCart();
-                loadProducts();
-                searchInput.focus();
-            } else {
-                alert('Checkout failed');
-            }
-        }
-
-        function openMpesaModal() {
-            if (!cart.length) return alert('Cart is empty');
-            document.getElementById('mpesa-modal').classList.remove('hidden');
-        }
-        function closeMpesaModal() {
-            document.getElementById('mpesa-modal').classList.add('hidden');
-        }
-
-        async function checkoutMpesa() {
-            const phone = document.getElementById('mpesa-phone').value;
-            if (!phone) return alert('Enter phone number');
-            closeMpesaModal();
-
-            const total = cart.reduce((sum, i) => sum + (i.unit_price * i.quantity), 0);
-            const res = await fetch('/api/pos/checkout/mpesa', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ business_id: 1, phone, items: cart, total_amount: total })
-            });
-            const data = await res.json();
-            if (!data.success) return alert('STK Push failed to start');
-
-            const saleId = data.sale_id;
-            alert('STK Push sent! Waiting for customer PIN...');
-
-            let attempts = 0;
-            const interval = setInterval(async () => {
-                attempts++;
-                const statusRes = await fetch(\`/api/pos/sales/\${saleId}/status\`);
-                const statusData = await statusRes.json();
-
-                if (statusData.payment_status === 'COMPLETED') {
-                    clearInterval(interval);
-                    alert('Payment successful! M-Pesa Receipt: ' + statusData.mpesa_receipt_no);
-                    cart = [];
-                    renderCart();
-                    loadProducts();
-                    searchInput.focus();
-                } else if (statusData.payment_status === 'FAILED' || attempts > 20) {
-                    clearInterval(interval);
-                    if (statusData.payment_status === 'FAILED') alert('Payment failed or cancelled.');
-                }
-            }, 3000);
-        }
-
-        window.onload = () => {
-            loadProducts();
-            searchInput.focus();
-        };
-    </script>
-</body>
-</html>`);
-});
-
-// ---------------------------------------------------------------
-// 19. Contact page
+// Contact page: call, WhatsApp, email, and a callback request (alerts go to you by Telegram/email)
 // ---------------------------------------------------------------
 const contactLimiter = rateLimit({
     windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
@@ -2418,21 +2032,96 @@ app.post('/contact', contactLimiter, ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------
-// 20. Terms and Conditions
+// 19. Terms and Conditions
 // ---------------------------------------------------------------
 app.get('/terms', (req, res) => {
     const content = `
         <div class="general-container terms">
         <h2>Terms and Conditions of Service</h2>
         <p class="sub-title">Tencent Innovations &middot; Rangwe, Homa Bay County, Kenya<br>Calls: 0740 311 014 &middot; WhatsApp: 0769 306 917</p>
+
         <p class="intro-text">These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you"). By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms.</p>
+
+        <h3>1. Definitions</h3>
+        <p class="clause"><strong>1.1</strong> "Service" means any of the WiFi/internet access, CCTV installation, electric fence installation, solar standby system, or fingerprint door lock installation services offered by the Company.</p>
+        <p class="clause"><strong>1.2</strong> "Package" means a specific data, speed, or duration bundle purchased for internet access, as published by the Company from time to time.</p>
+        <p class="clause"><strong>1.3</strong> "Customer Premises Equipment" or "CPE" means routers, antennas, cameras, fence energisers, solar panels, batteries, fingerprint door locks, cabling, and any other hardware installed at the Customer's premises.</p>
+        <p class="clause"><strong>1.4</strong> "Hotspot" means the Company's WiFi network accessible via login portal and voucher, PIN, or M-Pesa payment.</p>
+
+        <h3>2. Account Registration</h3>
+        <p class="clause"><strong>2.1</strong> Customers must register using accurate name and phone number details. This information is used for billing, support, and network security, and will not be sold to third parties.</p>
+        <p class="clause"><strong>2.2</strong> A customer is responsible for keeping their account PIN, voucher codes, and WiFi password confidential. The Company is not liable for usage arising from a shared or leaked password.</p>
+        <p class="clause"><strong>2.3</strong> One account and connection are intended for a single household or business premises unless a business/enterprise package has been agreed in writing.</p>
+
+        <h3>3. WiFi and Internet Service</h3>
+        <p class="clause"><strong>3.1</strong> Internet access is sold in prepaid Packages (hourly, daily, weekly, or monthly) as displayed on the Hotspot login page or communicated by the Company. Prices may be revised from time to time; the price in effect at the moment of payment applies to that purchase.</p>
+        <p class="clause"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection.</p>
+        <p class="clause"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion.</p>
+        <p class="clause"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed.</p>
+        <p class="clause"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable.</p>
+        <p class="clause"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company.</p>
+        <p class="clause"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available.</p>
+
+        <h3>4. Acceptable Use</h3>
+        <p class="clause">The Service may not be used to:</p>
+        <ul>
+            <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred;</li>
+            <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system;</li>
+            <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users;</li>
+            <li>Impersonate another person or misrepresent your affiliation in connection with the Service.</li>
+        </ul>
+        <p class="clause">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities.</p>
+
+        <h3>5. Equipment (CPE)</h3>
+        <p class="clause"><strong>5.1</strong> Where the Company supplies and installs equipment (router, antenna, CCTV camera, fence energiser, solar panel, battery, or fingerprint door lock), ownership of that equipment remains with the Company until it has been fully paid for, unless otherwise agreed in writing.</p>
+        <p class="clause"><strong>5.2</strong> The Customer must provide a safe mounting location, stable power supply, and reasonable access for installation and future maintenance.</p>
+        <p class="clause"><strong>5.3</strong> The Customer is responsible for equipment once installed and accepted, and must promptly report any fault, damage, or tampering. Damage caused by the Customer, third parties, lightning, rodents, theft, or vandalism is not covered by any workmanship warranty and may attract a call-out and repair or replacement fee.</p>
+        <p class="clause"><strong>5.4</strong> Where a device remains the Company's property under an instalment or lease arrangement, the Customer may not relocate, resell, or allow a third party to tamper with it without the Company's written consent.</p>
+        <p class="clause"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service (for example, a Customer-owned router under a Commercial/Rental WiFi installation), that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company.</p>
+
+        <h3>6. Installation Services (CCTV, Electric Fence, Solar Standby, Fingerprint Door Locks)</h3>
+        <p class="clause"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding.</p>
+        <p class="clause"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms.</p>
+        <p class="clause"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss, and accepts no liability for such incidents.</p>
+        <p class="clause"><strong>6.4</strong> Solar standby systems are sized to the load and backup duration agreed with the Customer at the point of sale. Connecting additional appliances beyond the agreed load may reduce backup duration or damage the system, and is done at the Customer's own risk.</p>
+        <p class="clause"><strong>6.5</strong> CCTV, electric fence, solar standby, and fingerprint door lock installation services are offered nationwide across Kenya, subject to logistics and travel costs for sites outside the Company's normal service radius, communicated to the Customer at the point of quotation.</p>
+        <p class="clause"><strong>6.6</strong> Fingerprint door locks are powered by internal batteries. The Customer is responsible for replacing batteries as needed and for keeping any backup mechanical key or master code safe. Loss of access due to depleted batteries, lost backup keys or codes, or manufacturer firmware issues is not covered by the workmanship warranty.</p>
+
+        <h3>7. Service Availability</h3>
+        <p class="clause"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance.</p>
+        <p class="clause"><strong>7.2</strong> Where practical, the Company will give advance notice of planned maintenance that is expected to interrupt Service.</p>
+        <p class="clause"><strong>7.3</strong> The Company is not liable for losses arising from Service interruption, including business losses, except where caused by the Company's proven negligence.</p>
+
+        <h3>8. Suspension and Termination</h3>
+        <p class="clause"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or where continued connection poses a risk to the network or other customers.</p>
+        <p class="clause"><strong>8.2</strong> A Customer may discontinue Service at any time; Packages already paid for are consumed as described in Clause 3.3 and are not refunded on voluntary discontinuation.</p>
+        <p class="clause"><strong>8.3</strong> Where equipment remains the Company's property, the Company may retrieve it on termination of an instalment or lease arrangement, giving reasonable notice to the Customer.</p>
+        <p class="clause"><strong>8.4</strong> Upon termination of Service, any Customer-supplied equipment remains the property of the Customer, except the outdoor LiteBeam (LBE) CPE unit, which remains the property of the Company and will be retrieved regardless of who originally supplied or paid for it.</p>
+
+        <h3>9. Limitation of Liability</h3>
+        <p class="clause"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months.</p>
+        <p class="clause"><strong>9.2</strong> The Company is not liable for indirect, incidental, or consequential loss, including loss of income, data, or business opportunity.</p>
+
+        <h3>10. Privacy</h3>
+        <p class="clause"><strong>10.1</strong> Customer information collected at registration is used for billing, service delivery, and support, and is kept confidential save where disclosure is required by law or necessary to enforce these Terms.</p>
+
+        <h3>11. Amendments</h3>
+        <p class="clause"><strong>11.1</strong> The Company may update these Terms from time to time. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms.</p>
+
+        <h3>12. Governing Law</h3>
+        <p class="clause"><strong>12.1</strong> These Terms are governed by the laws of Kenya. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts.</p>
+
+        <h3>13. Contact</h3>
+        <p class="clause"><strong>13.1</strong> For billing, support, or installation enquiries, contact Tencent Innovations on Calls 0740 311 014, WhatsApp 0769 306 917, or visit the office in Rangwe, Homa Bay County.</p>
+
         <a href="/" class="cta-btn" style="margin-top:30px;">Back to Home</a>
         </div>
     `;
     res.send(renderPage(req, { title: 'Terms and Conditions', activeNav: 'terms', content }));
 });
 
-// USSD endpoint
+
+// USSD endpoint (the USSD gateway posts here; no login, no cookies)
 app.post('/ussd', (req, res) => {
     const { text, phoneNumber } = req.body;
     let response = '';
@@ -2480,11 +2169,27 @@ app.post('/ussd', (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// 21. Not found, errors, start
+// Point of sale service
+// ---------------------------------------------------------------
+if (POS) {
+    POS({
+        app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
+        // inside the POS router req.path is shortened, so the original URL is used for the "come back here after login" link
+        requireAuth: (req, res, next) => {
+            if (req.session && req.session.user) return next();
+            if (req.method === 'GET') return res.redirect('/login?next=' + encodeURIComponent(safeNext(req.originalUrl.split('?')[0])));
+            return res.redirect('/login');
+        }
+    });
+}
+
+// ---------------------------------------------------------------
+// 20. Not found, errors, start
 // ---------------------------------------------------------------
 app.use((req, res) => errorPage(req, res, 404, 'Page not found', 'We could not find that page.'));
 
-app.use((err, req, res, next) => {
+// One place that catches every error, so a database hiccup cannot crash the server
+app.use((err, req, res, next) => {   // eslint-disable-line no-unused-vars
     console.error('Request error:', err && err.message ? err.message : err);
     if (res.headersSent) return;
     const status = err && (err.status === 400 || err.type === 'entity.too.large') ? (err.status || 413) : 500;
@@ -2497,6 +2202,10 @@ app.use((err, req, res, next) => {
 });
 
 (async () => {
-    await initDb();
-    app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
+    await initDb();   // wait for the tables before taking traffic (it keeps retrying in the background if the database is down)
+    if (!(MAIL.brevoKey && MAIL.fromEmail) && !(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)) {
+    console.error('EMAIL IS NOT SET UP: confirmation links, password resets and receipts cannot be sent. Add BREVO_API_KEY and MAIL_FROM_EMAIL in Render.');
+}
+if (!PUBLIC_BASE_URL) console.error('PUBLIC_BASE_URL is not set: confirmation and reset emails cannot be sent. Add it in Render, for example https://your-site.onrender.com');
+app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
 })();
