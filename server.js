@@ -2173,7 +2173,8 @@ app.post('/ussd', (req, res) => {
 // ---------------------------------------------------------------
 if (POS) {
     POS({
-        app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage, bcrypt,
+       app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage, bcrypt,
+        sessionSecret: process.env.SESSION_SECRET || 'tencent-innovations-default-secret',
         // inside the POS router req.path is shortened, so the original URL is used for the "come back here after login" link
         requireAuth: (req, res, next) => {
             if (req.session && req.session.user) return next();
