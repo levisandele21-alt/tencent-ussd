@@ -327,11 +327,11 @@ input:focus,select:focus,textarea:focus,.btn:focus-visible,a:focus-visible{outli
 @media(max-width:860px){.side{transform:translateX(-100%);transition:transform .2s;width:260px}.side.open{transform:none}.main{margin-left:0;padding:14px 14px 60px}.top{display:flex;align-items:center;gap:12px;background:var(--side);color:#fff;margin:-14px -14px 14px;padding:10px 14px;position:sticky;top:0;z-index:20}.top button{background:none;border:1px solid #3b5878;color:#fff;border-radius:7px;padding:6px 12px;font-size:1.1rem;cursor:pointer}}
 @media print{.side,.top,.noprint{display:none!important}.main{margin:0;padding:0}body{background:#fff}.panel{border:0;padding:0}}
 </style></head><body>
-<div class="top noprint"><button type="button" id="side-btn" aria-label="Open menu" aria-expanded="false">&#9776;</button><strong>${esc(shop ? shop.name : 'Tencent POS')}</strong></div>
+<div class="top noprint"><button type="button" id="side-btn" aria-label="Open menu" aria-expanded="false">&#9776;</button><strong>${esc(shop ? shop.name : 'Tencent POS')}</strong><a href="/pos/install" id="install-top" class="btn small" style="margin-left:auto;text-decoration:none">Install app</a></div>
 <nav class="side" id="side" aria-label="POS menu">
 ${brand}<div class="shopname">${esc(shop ? shop.name + (shop.branch ? ' · ' + shop.branch : '') : 'Platform admin')}${role ? ` <span class="tag gray" style="margin-left:4px">${esc(role)}</span>` : ''}</div>
 ${switcher}${links}
-<div class="nav-group">Account</div><a href="#" id="install-btn" style="display:none">Install this app</a><a href="/">Back to website</a>
+<div class="nav-group">Account</div><a href="/pos/install" id="install-btn">&#11015; Install this app</a><a href="/">Back to website</a>
 <form action="/logout" method="POST"><button class="linkbtn" type="submit">Log out</button></form>
 </nav>
 <main class="main">${banner}${body}</main>
@@ -339,10 +339,13 @@ ${switcher}${links}
 (function(){var b=document.getElementById('side-btn'),s=document.getElementById('side');if(b)b.addEventListener('click',function(){var o=s.classList.toggle('open');b.setAttribute('aria-expanded',o?'true':'false');});
 var sw=document.getElementById('bsw');if(sw)sw.addEventListener('change',function(){sw.form.submit();});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{scope:'/pos/'}).catch(function(){});
-var dp=null;window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;var i=document.getElementById('install-btn');if(i)i.style.display='block';var j=document.getElementById('install-main');if(j)j.style.display='inline-block';});
-function go(ev){ev.preventDefault();if(dp){dp.prompt();dp=null;}}
-['install-btn','install-main'].forEach(function(id){var e=document.getElementById(id);if(e)e.addEventListener('click',go);});
-window.addEventListener('appinstalled',function(){var i=document.getElementById('install-btn');if(i)i.style.display='none';});})();
+var dp=null,standalone=(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches)||window.navigator.standalone===true;
+if(standalone){['install-btn','install-top'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});}
+window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;});
+function go(ev){if(dp){ev.preventDefault();dp.prompt();dp=null;}}
+['install-btn','install-top','install-main'].forEach(function(id){var e=document.getElementById(id);if(e)e.addEventListener('click',go);});
+window.__tposInstall=function(){return !!dp;};
+window.addEventListener('appinstalled',function(){['install-btn','install-top'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});});})();
 </script>
 </body></html>`;
     }
@@ -1519,11 +1522,21 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
     // ----- install as an app -----
     router.get('/install', (req, res) => send(req, res, { title: 'Install the app', nav: 'install', body: `<h1>Install Tencent POS as an app</h1>
         <div class="panel" style="max-width:680px"><p>The POS installs on your phone, tablet or computer and opens in its own window, like any other app. It needs the internet to save sales.</p>
-            <p><button class="btn ok" id="install-main" type="button" style="display:none">Install now</button><span class="muted" id="install-hint"> If there is no Install button, follow the steps below for your device.</span></p>
+            <p><button class="btn ok" id="install-main" type="button" style="padding:12px 20px;font-size:1rem">Install now</button></p>
+            <div id="install-msg" class="alert" role="status" style="display:none"></div>
+            <div id="install-ua" class="alert ok" style="display:none"></div>
             <h2>Android (Chrome)</h2><p>Open the menu (three dots) and tap <b>Install app</b> or <b>Add to Home screen</b>.</p>
-            <h2>iPhone and iPad (Safari)</h2><p>Tap the <b>Share</b> button, then <b>Add to Home Screen</b>.</p>
-            <h2>Windows or Mac (Chrome or Edge)</h2><p>Click the install icon at the right of the address bar, or open the menu and choose <b>Install Tencent POS</b>.</p>
-            <p class="muted">Cashiers can install it too: log in on their device and follow the same steps.</p></div>` }));
+            <h2>iPhone and iPad (Safari only)</h2><p>Tap the <b>Share</b> button, then <b>Add to Home Screen</b>. This only works in Safari, not in Chrome on iPhone.</p>
+            <h2>Windows or Mac (Chrome or Edge)</h2><p>Click the install icon at the right of the address bar, or open the menu and choose <b>Install Tencent POS</b> (in Chrome: Cast, save and share, then Install page as app).</p>
+            <h2>No install option showing?</h2><p class="muted">Open the website in Chrome or Edge directly. Links opened inside WhatsApp, Facebook or other apps can't install it. Private windows and Firefox on computers don't offer it either. If it is already installed, open it from your home screen or app list.</p>
+            <p class="muted">Cashiers can install it too: log in on their device and follow the same steps.</p></div>
+        <script nonce="${req.nonce || ''}">(function(){var ua=navigator.userAgent||'',m=document.getElementById('install-msg'),u=document.getElementById('install-ua'),b=document.getElementById('install-main');
+        var ios=/iPhone|iPad|iPod/.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1),inapp=/FBAN|FBAV|Instagram|WhatsApp/.test(ua);
+        var standalone=(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches)||window.navigator.standalone===true;
+        if(standalone){b.style.display='none';u.textContent='You are already using the installed app.';u.style.display='block';return;}
+        if(ios){u.textContent='On this iPhone/iPad: tap the Share button in Safari, then "Add to Home Screen".';u.style.display='block';}
+        else if(inapp){u.textContent='You opened this inside another app. Open the website in Chrome or Edge to install.';u.style.display='block';}
+        b.addEventListener('click',function(){if(!window.__tposInstall()){m.textContent=ios?'Use Share, then Add to Home Screen in Safari.':'Your browser has not offered the install prompt yet. Use the browser menu as shown below (Install app, or Add to Home screen), or open this site in Chrome or Edge.';m.style.display='block';}});})();</script>` }));
 
     // ======================= EXTRA PAGES =======================
     const delBtn = action => `<form action="${action}" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form>`;
