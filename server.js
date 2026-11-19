@@ -109,7 +109,7 @@ const limiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this network, please try again later.',
-    skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/')
+    skip: req => (req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/')) || req.path.startsWith('/payments/status/') || req.path.startsWith('/pos/')   // POS pages need a login, and a busy shop shares one IP address
 });
 const statusLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 400, standardHeaders: true, legacyHeaders: false, message: { status: 'unknown' } });
 const payLimiter = rateLimit({
@@ -266,7 +266,7 @@ app.use((req, res, next) => {
 // Reject form posts that come from other websites (CSRF). Browsers always say where a form came from;
 // cookies are also SameSite=Lax. Safaricom's callback is a machine call and is exempt.
 app.use((req, res, next) => {
-    if (req.method !== 'POST' || req.path.startsWith('/payments/cb/')) return next();
+    if (req.method !== 'POST' || (req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/'))) return next();
     const fetchSite = req.get('sec-fetch-site');
     const origin = req.get('origin');
     let blocked = false;
@@ -288,7 +288,7 @@ const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST); 
 const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
 
 // Only go back to our own pages after login (stops //evil.com style redirects)
-const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos', '/pos/app', '/pos/terminal']);
+const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos', '/pos/app', '/pos/terminal', '/pos/subscribe']);
 function safeNext(value) {
     const v = typeof value === 'string' ? value : '';
     if (!v.startsWith('/') || v.startsWith('//') || v.includes('\\')) return '/survey';
@@ -695,6 +695,26 @@ async function stkPush(booking) {
     return data;
 }
 
+// Same push, for payments that are not survey bookings (POS monthly subscriptions)
+async function stkPushGeneric({ amount, phone, ref, desc }) {
+    const timestamp = darajaTimestamp();
+    const data = await darajaPost('/mpesa/stkpush/v1/processrequest', {
+        BusinessShortCode: MPESA.shortcode,
+        Password: darajaPassword(timestamp),
+        Timestamp: timestamp,
+        TransactionType: 'CustomerPayBillOnline',
+        Amount: amount,
+        PartyA: phone,
+        PartyB: MPESA.shortcode,
+        PhoneNumber: phone,
+        CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
+        AccountReference: String(ref).slice(0, 12),
+        TransactionDesc: String(desc || 'Payment').slice(0, 20)
+    });
+    if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
+    return data;
+}
+
 async function stkQuery(checkoutRequestId) {
     const timestamp = darajaTimestamp();
     return darajaPost('/mpesa/stkpushquery/v1/query', {
@@ -960,7 +980,13 @@ async function handleCallback(body) {
     const cb = body && body.Body && body.Body.stkCallback;
     if (!cb) return;
     const booking = await getBookingByCheckout(String(cb.CheckoutRequestID || ''));
-    if (!booking) { console.log('Callback for an unknown CheckoutRequestID'); return; }
+    if (!booking) {
+        // not a survey booking: it may be a POS subscription payment
+        let handled = false;
+        if (POS && POS.handlePlatformCallback) handled = await POS.handlePlatformCallback(cb);
+        if (!handled) console.log('Callback for an unknown CheckoutRequestID');
+        return;
+    }
 
     const succeeded = Number(cb.ResultCode) === 0;
     const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
@@ -1455,6 +1481,13 @@ app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
     await regenerateSession(req);
     req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: Boolean(user.email_verified) };
     await saveSession(req);
+    // shop cashiers and branch managers have no use for the survey page, so they go straight to their POS
+    if (next === '/survey') {
+        try {
+            const st = await pool.query(`SELECT 1 FROM pos_members WHERE user_id = $1 AND role <> 'owner' AND active`, [user.id]);
+            if (st.rowCount) return res.redirect('/pos/app');
+        } catch (_) { /* POS tables not there */ }
+    }
     res.redirect(next);
 }));
 
@@ -2173,8 +2206,13 @@ app.post('/ussd', (req, res) => {
 // ---------------------------------------------------------------
 if (POS) {
     POS({
-       app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage, bcrypt,
-        sessionSecret: process.env.SESSION_SECRET || 'tencent-innovations-default-secret',
+        app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
+        platform: {
+            mpesaConfigured, stkPush: stkPushGeneric, stkQuery, notify, normalizePhone,
+            hashPassword: pw => bcrypt.hash(pw, BCRYPT_COST), publicBaseUrl: PUBLIC_BASE_URL,
+            adminEmails: (process.env.ADMIN_EMAILS || '').toLowerCase().split(',').map(x => x.trim()).filter(Boolean),
+            darajaBase: MPESA.baseUrl
+        },
         // inside the POS router req.path is shortened, so the original URL is used for the "come back here after login" link
         requireAuth: (req, res, next) => {
             if (req.session && req.session.user) return next();
