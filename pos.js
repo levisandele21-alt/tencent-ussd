@@ -38,6 +38,21 @@ async function initSchema(pool) {
             active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )`);
+    // Upgrade from the first POS version (one shop per owner): each old shop becomes a business with one branch, with a free month
+    const oldShops = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'owner_id'`);
+    if (oldShops.rowCount) {
+        await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS business_id INT REFERENCES pos_businesses(id) ON DELETE CASCADE');
+        const old = (await pool.query('SELECT id, owner_id, name, tax_pin, receipt_footer FROM pos_shops WHERE business_id IS NULL')).rows;
+        for (const sh of old) {
+            const b = (await pool.query(`INSERT INTO pos_businesses (owner_id, name, tax_pin, receipt_footer, cb_token, active_until) VALUES ($1,$2,$3,$4,$5, now() + interval '30 days') ON CONFLICT (owner_id) DO UPDATE SET name = pos_businesses.name RETURNING id`,
+                [sh.owner_id, sh.name, sh.tax_pin || '', sh.receipt_footer || 'Thank you for shopping with us!', crypto.randomBytes(24).toString('hex')])).rows[0];
+            await pool.query(`UPDATE pos_shops SET business_id = $2, name = 'Main Branch' WHERE id = $1`, [sh.id, b.id]);
+        }
+        await pool.query('ALTER TABLE pos_shops ALTER COLUMN business_id SET NOT NULL');
+        await pool.query(`CREATE TABLE IF NOT EXISTS pos_members (id SERIAL PRIMARY KEY, user_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, business_id INT NOT NULL REFERENCES pos_businesses(id) ON DELETE CASCADE, branch_id INT REFERENCES pos_shops(id) ON DELETE CASCADE, role VARCHAR(10) NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+        await pool.query(`INSERT INTO pos_members (user_id, business_id, branch_id, role) SELECT owner_id, id, NULL, 'owner' FROM pos_businesses ON CONFLICT (user_id) DO NOTHING`);
+        for (const col of ['owner_id', 'tax_pin', 'receipt_footer']) await pool.query(`ALTER TABLE pos_shops DROP COLUMN IF EXISTS ${col}`);
+    }
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pos_members (
             id SERIAL PRIMARY KEY,
@@ -163,6 +178,8 @@ async function initSchema(pool) {
     ];
     for (const sql of T) await pool.query(sql);
     for (const sql of [
+        `ALTER TABLE pos_sales ALTER COLUMN method TYPE VARCHAR(40)`,
+        `ALTER TABLE pos_sales ALTER COLUMN mpesa_ref TYPE VARCHAR(40)`,
         `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_cents BIGINT NOT NULL DEFAULT 0`,
         `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(4,1) NOT NULL DEFAULT 0`,
         `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS user_id INT`,
