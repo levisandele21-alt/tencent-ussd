@@ -231,7 +231,10 @@ async function initDb() {
         ]) {
             try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
         }
-        if (POS) await POS.initSchema(pool);
+        if (POS) {
+            // a problem in the POS tables must never take the whole website (logins, bookings) down with it
+            try { await POS.initSchema(pool); } catch (e) { console.error('POS database setup failed (the rest of the site keeps working):', e.message); }
+        }
         dbReady = true;
         console.log('PostgreSQL tables initialized successfully.');
     } catch (err) {
