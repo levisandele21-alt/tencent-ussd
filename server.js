@@ -167,6 +167,15 @@ if (dbEnabled) {
     console.error('DATABASE_URL is not set: sign-in, bookings and receipts are switched off until you add it.');
 }
 
+let posReady = false, posInitRunning = false;
+async function initPosSchema() {
+    if (posInitRunning || posReady) return;
+    posInitRunning = true;
+    try { await POS.initSchema(pool); posReady = true; console.log('POS tables ready.'); }
+    catch (err) { console.error('POS database setup failed, trying again in 30 seconds:', err.message); setTimeout(initPosSchema, 30000).unref(); }
+    finally { posInitRunning = false; }
+}
+
 async function initDb() {
     if (!dbEnabled) return;
     try {
@@ -233,7 +242,7 @@ async function initDb() {
         ]) {
             try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
         }
-        if (POS) await POS.initSchema(pool);
+        if (POS) initPosSchema();   // the POS sets up its own tables separately, so a POS problem can never take bookings and login offline
         dbReady = true;
         console.log('PostgreSQL tables initialized successfully.');
     } catch (err) {
@@ -2179,6 +2188,8 @@ app.post('/ussd', (req, res) => {
 // Point of sale service
 // ---------------------------------------------------------------
 if (POS) {
+    // until the POS tables are ready, /pos says so instead of failing in strange ways
+    app.use('/pos', (req, res, next) => posReady ? next() : errorPage(req, res, 503, 'POS is starting up', 'The POS is getting ready. Please try again in a minute.'));
     posHooks = POS({
         app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
         publicBaseUrl: PUBLIC_BASE_URL,
@@ -2191,6 +2202,9 @@ if (POS) {
             return res.redirect('/login');
         }
     });
+} else {
+    // the POS files did not load (the reason is in the server log under "POS module not loaded"): say so instead of a confusing 404
+    app.use('/pos', (req, res) => errorPage(req, res, 503, 'POS unavailable', 'The POS service did not start. Please try again shortly.'));
 }
 
 // ---------------------------------------------------------------
