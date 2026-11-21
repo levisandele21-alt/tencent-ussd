@@ -109,7 +109,8 @@ const limiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: 'Too many requests from this network, please try again later.',
-    skip: req => (req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/')) || req.path.startsWith('/payments/status/') || req.path.startsWith('/pos/')   // POS pages need a login, and a busy shop shares one IP address
+    skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/') ||
+        req.path.startsWith('/pos/mpesa/cb/') || req.path.startsWith('/pos/paystack/hook/') || req.path.startsWith('/pos/api/')   // payment-company callbacks and the till's own calls have their own limits in pos.js
 });
 const statusLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 400, standardHeaders: true, legacyHeaders: false, message: { status: 'unknown' } });
 const payLimiter = rateLimit({
@@ -146,6 +147,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 const dbEnabled = Boolean(DATABASE_URL);
 // Tencent POS (point of sale service for shops) lives in pos.js. If that file is missing the rest of the site still works.
 let POS = null;
+let posHooks = null;   // set when the POS is mounted: lets the POS claim M-Pesa callbacks for its subscription payments
 try { POS = require('./pos'); } catch (e) { console.error('POS module not loaded:', e.message); }
 let pool = null;
 let dbReady = false;
@@ -231,10 +233,7 @@ async function initDb() {
         ]) {
             try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
         }
-        if (POS) {
-            // a problem in the POS tables must never take the whole website (logins, bookings) down with it
-            try { await POS.initSchema(pool); } catch (e) { console.error('POS database setup failed (the rest of the site keeps working):', e.message); }
-        }
+        if (POS) await POS.initSchema(pool);
         dbReady = true;
         console.log('PostgreSQL tables initialized successfully.');
     } catch (err) {
@@ -269,7 +268,7 @@ app.use((req, res, next) => {
 // Reject form posts that come from other websites (CSRF). Browsers always say where a form came from;
 // cookies are also SameSite=Lax. Safaricom's callback is a machine call and is exempt.
 app.use((req, res, next) => {
-    if (req.method !== 'POST' || (req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/'))) return next();
+    if (req.method !== 'POST' || req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/') || req.path.startsWith('/pos/paystack/hook/')) return next();
     const fetchSite = req.get('sec-fetch-site');
     const origin = req.get('origin');
     let blocked = false;
@@ -331,7 +330,7 @@ async function requireVerified(req, res, next) {
 // Passwords
 const COMMON_PASSWORDS = new Set(['password', 'password1', 'password123', '12345678', '123456789', '1234567890', 'qwertyuiop', 'qwerty123', '11111111', '00000000', 'iloveyou1', 'tencent123']);
 function passwordProblem(password, confirm, email = '') {
-    if (password.length < 8) return 'Your password must be at least 8 characters.';
+    if (password.length < 10) return 'Your password must be at least 10 characters.';
     if (Buffer.byteLength(password) > 72) return 'Your password is too long. Please use 72 characters or fewer.';
     if (COMMON_PASSWORDS.has(password.toLowerCase()) || (email && password.toLowerCase() === email.toLowerCase())) return 'That password is too easy to guess. Please choose a different one.';
     if (password !== confirm) return 'The two passwords do not match.';
@@ -692,27 +691,7 @@ async function stkPush(booking) {
         PhoneNumber: booking.phone,
         CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
         AccountReference: booking.accountRef,   // max 12 characters
-        TransactionDesc: 'Survey fee'
-    });
-    if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
-    return data;
-}
-
-// Same push, for payments that are not survey bookings (POS monthly subscriptions)
-async function stkPushGeneric({ amount, phone, ref, desc }) {
-    const timestamp = darajaTimestamp();
-    const data = await darajaPost('/mpesa/stkpush/v1/processrequest', {
-        BusinessShortCode: MPESA.shortcode,
-        Password: darajaPassword(timestamp),
-        Timestamp: timestamp,
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: amount,
-        PartyA: phone,
-        PartyB: MPESA.shortcode,
-        PhoneNumber: phone,
-        CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: String(ref).slice(0, 12),
-        TransactionDesc: String(desc || 'Payment').slice(0, 20)
+        TransactionDesc: booking.desc || 'Survey fee'
     });
     if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
     return data;
@@ -985,9 +964,8 @@ async function handleCallback(body) {
     const booking = await getBookingByCheckout(String(cb.CheckoutRequestID || ''));
     if (!booking) {
         // not a survey booking: it may be a POS subscription payment
-        let handled = false;
-        if (POS && POS.handlePlatformCallback) handled = await POS.handlePlatformCallback(cb);
-        if (!handled) console.log('Callback for an unknown CheckoutRequestID');
+        if (posHooks && await posHooks.handlePlatformCallback(cb)) return;
+        console.log('Callback for an unknown CheckoutRequestID');
         return;
     }
 
@@ -1484,13 +1462,6 @@ app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
     await regenerateSession(req);
     req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: Boolean(user.email_verified) };
     await saveSession(req);
-    // shop cashiers and branch managers have no use for the survey page, so they go straight to their POS
-    if (next === '/survey') {
-        try {
-            const st = await pool.query(`SELECT 1 FROM pos_members WHERE user_id = $1 AND role <> 'owner' AND active`, [user.id]);
-            if (st.rowCount) return res.redirect('/pos/app');
-        } catch (_) { /* POS tables not there */ }
-    }
     res.redirect(next);
 }));
 
@@ -2208,14 +2179,11 @@ app.post('/ussd', (req, res) => {
 // Point of sale service
 // ---------------------------------------------------------------
 if (POS) {
-    POS({
+    posHooks = POS({
         app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
-        platform: {
-            mpesaConfigured, stkPush: stkPushGeneric, stkQuery, notify, normalizePhone,
-            hashPassword: pw => bcrypt.hash(pw, BCRYPT_COST), publicBaseUrl: PUBLIC_BASE_URL,
-            adminEmails: (process.env.ADMIN_EMAILS || '').toLowerCase().split(',').map(x => x.trim()).filter(Boolean),
-            darajaBase: MPESA.baseUrl
-        },
+        publicBaseUrl: PUBLIC_BASE_URL,
+        // the platform's own M-Pesa account (MPESA_* variables) receives the monthly POS subscription
+        platform: { mpesaConfigured, stkPush, stkQuery, normalizePhone },
         // inside the POS router req.path is shortened, so the original URL is used for the "come back here after login" link
         requireAuth: (req, res, next) => {
             if (req.session && req.session.user) return next();
