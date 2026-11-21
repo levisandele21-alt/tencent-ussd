@@ -5,80 +5,44 @@
 // limited to the signed-in owner's shop, so one shop can never see another shop's data.
 // ---------------------------------------------------------------------------
 const express = require('express');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const GW = require('./pos-gateways');
+const SEC = require('./pos-security');
+const PAYSTACK_ON = process.env.POS_ENABLE_PAYSTACK === '1';   // Paystack code is not verified against their live service, so it stays off unless you switch it on
+const COMMON_PW = new Set(['password', 'password1', '12345678', '123456789', '1234567890', 'qwerty123', '11111111', '00000000', 'abcd1234', 'tencent123', 'welcome123']);
 
 const TZ = 'Africa/Nairobi';
+const VAT_RATE = 16;   // percent. Selling prices already include this VAT.
+const vatOf = gross => Math.round(Number(gross) * VAT_RATE / (100 + VAT_RATE));   // VAT inside a VAT-inclusive amount, in cents
+const envInt = (name, fallback) => { const n = Number(process.env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
+const SUB_FEE_KES = envInt('POS_MONTHLY_FEE', 3000);   // monthly subscription, paid to the platform M-Pesa account in server.js
+const GRACE_DAYS = envInt('POS_GRACE_DAYS', 30);       // shops that already existed before subscriptions started get this many free days
+const LOGO_OK = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/;
+const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const newCode = () => Array.from(crypto.randomBytes(6), b => CODE_CHARS[b % CODE_CHARS.length]).join('');
+async function assignCode(db, shopId) {   // short business code that staff type when they sign in
+    for (let i = 0; i < 12; i++) {
+        try { const r = await db.query('UPDATE pos_shops SET code=$2 WHERE id=$1 AND code IS NULL', [shopId, newCode()]); return r.rowCount; }
+        catch (e) { if (e.code !== '23505') throw e; }
+    }
+    throw new Error('Could not create a business code');
+}
 
 async function initSchema(pool) {
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS pos_businesses (
+        CREATE TABLE IF NOT EXISTS pos_shops (
             id SERIAL PRIMARY KEY,
             owner_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
             name VARCHAR(120) NOT NULL,
-            tax_pin VARCHAR(40) NOT NULL DEFAULT '',
-            receipt_footer VARCHAR(200) NOT NULL DEFAULT 'Thank you for shopping with us!',
-            vat_rate NUMERIC(4,1) NOT NULL DEFAULT 16,
-            logo BYTEA,
-            logo_mime VARCHAR(20),
-            logo_ver INT NOT NULL DEFAULT 0,
-            active_until TIMESTAMPTZ,
-            suspended BOOLEAN NOT NULL DEFAULT FALSE,
-            mpesa_enc TEXT,
-            mpesa_type VARCHAR(12),
-            cb_token VARCHAR(64) UNIQUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )`);
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS pos_shops (
-            id SERIAL PRIMARY KEY,
-            business_id INT NOT NULL REFERENCES pos_businesses(id) ON DELETE CASCADE,
-            name VARCHAR(120) NOT NULL,
             phone VARCHAR(40) NOT NULL DEFAULT '',
             address VARCHAR(200) NOT NULL DEFAULT '',
+            tax_pin VARCHAR(40) NOT NULL DEFAULT '',
+            receipt_footer VARCHAR(200) NOT NULL DEFAULT 'Thank you for shopping with us!',
             next_receipt INT NOT NULL DEFAULT 1,
             active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )`);
-    // Upgrade from the first POS version (one shop per owner): each old shop becomes a business with one branch, with a free month
-    const oldShops = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'owner_id'`);
-    if (oldShops.rowCount) {
-        await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS business_id INT REFERENCES pos_businesses(id) ON DELETE CASCADE');
-        const old = (await pool.query('SELECT id, owner_id, name, tax_pin, receipt_footer FROM pos_shops WHERE business_id IS NULL')).rows;
-        for (const sh of old) {
-            const b = (await pool.query(`INSERT INTO pos_businesses (owner_id, name, tax_pin, receipt_footer, cb_token, active_until) VALUES ($1,$2,$3,$4,$5, now() + interval '30 days') ON CONFLICT (owner_id) DO UPDATE SET name = pos_businesses.name RETURNING id`,
-                [sh.owner_id, sh.name, sh.tax_pin || '', sh.receipt_footer || 'Thank you for shopping with us!', crypto.randomBytes(24).toString('hex')])).rows[0];
-            await pool.query(`UPDATE pos_shops SET business_id = $2, name = 'Main Branch' WHERE id = $1`, [sh.id, b.id]);
-        }
-        await pool.query('ALTER TABLE pos_shops ALTER COLUMN business_id SET NOT NULL');
-        await pool.query(`CREATE TABLE IF NOT EXISTS pos_members (id SERIAL PRIMARY KEY, user_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, business_id INT NOT NULL REFERENCES pos_businesses(id) ON DELETE CASCADE, branch_id INT REFERENCES pos_shops(id) ON DELETE CASCADE, role VARCHAR(10) NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
-        await pool.query(`INSERT INTO pos_members (user_id, business_id, branch_id, role) SELECT owner_id, id, NULL, 'owner' FROM pos_businesses ON CONFLICT (user_id) DO NOTHING`);
-        for (const col of ['owner_id', 'tax_pin', 'receipt_footer']) await pool.query(`ALTER TABLE pos_shops DROP COLUMN IF EXISTS ${col}`);
-    }
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS pos_members (
-            id SERIAL PRIMARY KEY,
-            user_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-            business_id INT NOT NULL REFERENCES pos_businesses(id) ON DELETE CASCADE,
-            branch_id INT REFERENCES pos_shops(id) ON DELETE CASCADE,
-            role VARCHAR(10) NOT NULL,
-            active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )`);
-    await pool.query('CREATE INDEX IF NOT EXISTS pos_members_branch_idx ON pos_members (branch_id)');
-    await pool.query('CREATE INDEX IF NOT EXISTS pos_shops_business_idx ON pos_shops (business_id)');
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS pos_sub_payments (
-            id SERIAL PRIMARY KEY,
-            business_id INT NOT NULL REFERENCES pos_businesses(id) ON DELETE CASCADE,
-            months INT NOT NULL,
-            amount INT NOT NULL,
-            phone VARCHAR(20) NOT NULL,
-            checkout_id VARCHAR(80),
-            status VARCHAR(10) NOT NULL DEFAULT 'pending',
-            receipt VARCHAR(40) NOT NULL DEFAULT '',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            last_query TIMESTAMPTZ
-        )`);
-    await pool.query('CREATE INDEX IF NOT EXISTS pos_sub_checkout_idx ON pos_sub_payments (checkout_id)');
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pos_categories (
             id SERIAL PRIMARY KEY,
@@ -113,8 +77,8 @@ async function initSchema(pool) {
             total_cents BIGINT NOT NULL,
             paid_cents BIGINT NOT NULL,
             change_cents BIGINT NOT NULL DEFAULT 0,
-            method VARCHAR(40) NOT NULL,
-            mpesa_ref VARCHAR(40),
+            method VARCHAR(10) NOT NULL,
+            mpesa_ref VARCHAR(20),
             customer_name VARCHAR(80) NOT NULL DEFAULT '',
             customer_phone VARCHAR(30) NOT NULL DEFAULT '',
             status VARCHAR(10) NOT NULL DEFAULT 'completed',
@@ -177,17 +141,46 @@ async function initSchema(pool) {
         `CREATE TABLE IF NOT EXISTS pos_notes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, title VARCHAR(120) NOT NULL, body VARCHAR(4000) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`
     ];
     for (const sql of T) await pool.query(sql);
+
+    // ---- businesses, branches, staff, payment gateways, subscription and VAT ----
+    const hadSub = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'sub_until'`);
     for (const sql of [
-        `ALTER TABLE pos_sales ALTER COLUMN method TYPE VARCHAR(40)`,
-        `ALTER TABLE pos_sales ALTER COLUMN mpesa_ref TYPE VARCHAR(40)`,
-        `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_cents BIGINT NOT NULL DEFAULT 0`,
-        `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(4,1) NOT NULL DEFAULT 0`,
-        `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS user_id INT`,
-        `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS user_name VARCHAR(80) NOT NULL DEFAULT ''`,
-        `CREATE TABLE IF NOT EXISTS pos_pay_methods (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_businesses(id) ON DELETE CASCADE, name VARCHAR(30) NOT NULL, needs_ref BOOLEAN NOT NULL DEFAULT TRUE, UNIQUE (business_id, name))`,
-        `CREATE TABLE IF NOT EXISTS pos_mpesa_requests (id VARCHAR(40) PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, user_id INT, user_name VARCHAR(80) NOT NULL DEFAULT '', lines JSONB NOT NULL, discount_cents BIGINT NOT NULL DEFAULT 0, total_cents BIGINT NOT NULL, phone VARCHAR(20) NOT NULL, checkout_id VARCHAR(80), status VARCHAR(10) NOT NULL DEFAULT 'pending', mpesa_receipt VARCHAR(20), sale_id INT, note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_query TIMESTAMPTZ)`,
-        `CREATE INDEX IF NOT EXISTS pos_mpesa_checkout_idx ON pos_mpesa_requests (checkout_id)`
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES pos_shops(id) ON DELETE CASCADE',   // set on branches: points at the head office
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS code VARCHAR(10)',                                          // business code used by staff to sign in
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS logo TEXT',
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS vat_enabled BOOLEAN NOT NULL DEFAULT TRUE',
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS sub_until TIMESTAMPTZ',
+        'ALTER TABLE pos_shops DROP CONSTRAINT IF EXISTS pos_shops_owner_id_key',                                   // one business per owner now means one HEAD OFFICE per owner
+        'ALTER TABLE pos_shops ALTER COLUMN owner_id DROP NOT NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_shops_owner_root_uq ON pos_shops (owner_id) WHERE parent_id IS NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_shops_code_uq ON pos_shops (code) WHERE code IS NOT NULL',
+        'CREATE INDEX IF NOT EXISTS pos_shops_parent_idx ON pos_shops (parent_id)',
+        'ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_cents BIGINT NOT NULL DEFAULT 0',
+        'ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS staff_id INT',
+        `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS cashier_name VARCHAR(80) NOT NULL DEFAULT ''`,
+        `CREATE TABLE IF NOT EXISTS pos_staff (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, role VARCHAR(10) NOT NULL, name VARCHAR(80) NOT NULL, username VARCHAR(40) NOT NULL, password_hash VARCHAR(100) NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, failed INT NOT NULL DEFAULT 0, locked_until TIMESTAMPTZ, last_login TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_staff_user_uq ON pos_staff (business_id, lower(username))',
+        'CREATE INDEX IF NOT EXISTS pos_staff_shop_idx ON pos_staff (shop_id)',
+        `CREATE TABLE IF NOT EXISTS pos_gateways (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, provider VARCHAR(20) NOT NULL, cfg JSONB NOT NULL DEFAULT '{}', secrets TEXT NOT NULL, callback_token CHAR(48) NOT NULL UNIQUE, active BOOLEAN NOT NULL DEFAULT TRUE, is_default BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (business_id, provider))`,
+        `CREATE TABLE IF NOT EXISTS pos_payments (id VARCHAR(32) PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, gateway_id INT REFERENCES pos_gateways(id) ON DELETE SET NULL, staff_id INT, cashier_name VARCHAR(80) NOT NULL DEFAULT '', amount_kes INT NOT NULL, phone VARCHAR(20) NOT NULL, provider_ref VARCHAR(120), status VARCHAR(10) NOT NULL DEFAULT 'pending', receipt VARCHAR(40) NOT NULL DEFAULT '', cart JSONB NOT NULL, sale_id INT REFERENCES pos_sales(id) ON DELETE SET NULL, fail_reason VARCHAR(160) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE INDEX IF NOT EXISTS pos_payments_ref_idx ON pos_payments (provider_ref)',
+        'CREATE INDEX IF NOT EXISTS pos_payments_shop_idx ON pos_payments (shop_id, created_at DESC)',
+        `CREATE TABLE IF NOT EXISTS pos_sub_payments (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, amount_kes INT NOT NULL, phone VARCHAR(20) NOT NULL, account_ref VARCHAR(20) NOT NULL UNIQUE, checkout_request_id VARCHAR(100), status VARCHAR(10) NOT NULL DEFAULT 'pending', receipt VARCHAR(40) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), paid_at TIMESTAMPTZ)`,
+        'CREATE INDEX IF NOT EXISTS pos_sub_checkout_idx ON pos_sub_payments (checkout_request_id)',
+        'ALTER TABLE pos_staff ADD COLUMN IF NOT EXISTS session_ver INT NOT NULL DEFAULT 0',   // bumped on password change or switch-off: ends that person's sessions
+        `CREATE TABLE IF NOT EXISTS pos_auth_fails (key TEXT PRIMARY KEY, count INT NOT NULL DEFAULT 0, first_at TIMESTAMPTZ NOT NULL DEFAULT now(), locked_until TIMESTAMPTZ)`,
+        `CREATE TABLE IF NOT EXISTS pos_audit (id BIGSERIAL PRIMARY KEY, business_id INT NOT NULL, shop_id INT, actor_kind VARCHAR(10) NOT NULL, actor_id INT, actor_name VARCHAR(80) NOT NULL DEFAULT '', action VARCHAR(40) NOT NULL, detail VARCHAR(300) NOT NULL DEFAULT '', ip VARCHAR(60) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE INDEX IF NOT EXISTS pos_audit_biz_idx ON pos_audit (business_id, id DESC)',
+        `CREATE OR REPLACE FUNCTION pos_audit_immutable() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'the audit log cannot be changed'; END; $$ LANGUAGE plpgsql`,
+        'DROP TRIGGER IF EXISTS pos_audit_no_change ON pos_audit',
+        'CREATE TRIGGER pos_audit_no_change BEFORE UPDATE OR DELETE ON pos_audit FOR EACH ROW EXECUTE FUNCTION pos_audit_immutable()',
+        `CREATE TABLE IF NOT EXISTS pos_owner_security (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE, last_counter BIGINT NOT NULL DEFAULT 0, recovery JSONB NOT NULL DEFAULT '[]', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_void_requests (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE, reason VARCHAR(200) NOT NULL, requested_by VARCHAR(80) NOT NULL DEFAULT '', staff_id INT, status VARCHAR(10) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), decided_at TIMESTAMPTZ, decided_by VARCHAR(80) NOT NULL DEFAULT '')`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS pos_void_one_pending ON pos_void_requests (sale_id) WHERE status = 'pending'`
     ]) await pool.query(sql);
+    // shops that were already using the POS before subscriptions existed keep working for a grace period
+    if (!hadSub.rowCount) await pool.query(`UPDATE pos_shops SET sub_until = now() + ($1 || ' days')::interval WHERE parent_id IS NULL`, [String(GRACE_DAYS)]);
+    for (const s of (await pool.query('SELECT id FROM pos_shops WHERE parent_id IS NULL AND code IS NULL')).rows) await assignCode(pool, s.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,72 +223,48 @@ function assetBookValue(a, todayIso) {   // straight-line depreciation by whole 
 // ---------------------------------------------------------------------------
 // Mount
 // ---------------------------------------------------------------------------
-const crypto = require('crypto');
-// Payment credentials are stored encrypted. POS_SECRET_KEY is best (so changing SESSION_SECRET cannot lock them out).
-const encKey = () => crypto.createHash('sha256').update('tencent-pos|' + (process.env.POS_SECRET_KEY || process.env.SESSION_SECRET || '')).digest();
-function encrypt(obj) {
-    const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', encKey(), iv);
-    const ct = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
-    return [iv, c.getAuthTag(), ct].map(b => b.toString('base64')).join('.');
-}
-function decrypt(text) {
-    try {
-        const [iv, tag, ct] = String(text).split('.').map(x => Buffer.from(x, 'base64'));
-        const d = crypto.createDecipheriv('aes-256-gcm', encKey(), iv); d.setAuthTag(tag);
-        return JSON.parse(Buffer.concat([d.update(ct), d.final()]).toString('utf8'));
-    } catch (_) { return null; }
-}
-const vatOf = (netCents, rate) => (rate > 0 ? Math.round(Number(netCents) * rate / 100) : 0);   // item prices are before VAT; VAT is added to the sale
-const subFee = () => { const n = parseInt(process.env.POS_MONTHLY_FEE || '3000', 10); return n > 0 ? n : 3000; };
-const branchFee = () => { const n = parseInt(process.env.POS_BRANCH_FEE || '2000', 10); return n > 0 ? n : 2000; };
-const monthlyTotal = branches => subFee() + branchFee() * Math.max(0, branches - 1);   // main shop + each extra branch
-const methodLabel = m => (m === 'mpesa' ? 'M-Pesa' : m === 'cash' ? 'Cash' : m);
-const jsonForHtml = o => JSON.stringify(o).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
-let _ctx = { getPool: null, platform: null };   // set by mountPos, used by the subscription callback hook
-
-function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, platform }) {
-    _ctx = { getPool, platform };
+function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, platform = null, publicBaseUrl = '' }) {
     const pool = () => getPool();
     const router = express.Router();
     const q = (text, params) => pool().query(text, params);
 
     // ----- layout -----
+    const BASE_NAV = [
+        ['Main', [['app', '/pos/app', 'Dashboard'], ['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'Sales History'], ['daily', '/pos/daily', 'Daily Sales (Z-Report)'], ['drawer', '/pos/drawer', 'Cash Drawer'], ['quotes', '/pos/quotes', 'Quotes']]],
+        ['Inventory', [['items', '/pos/items', 'Items'], ['categories', '/pos/categories', 'Categories'], ['stock', '/pos/stock', 'Stock In / Out & Adjustment'], ['history', '/pos/stock/history', 'Stock History'], ['low', '/pos/stock/low', 'Low Stock Alerts'], ['suppliers', '/pos/suppliers', 'Suppliers'], ['po', '/pos/purchase-orders', 'Purchase Orders']]],
+        ['Money', [['expenses', '/pos/expenses', 'Expenses'], ['ecats', '/pos/expense-categories', 'Expense Categories'], ['recurring', '/pos/recurring', 'Recurring Expenses'], ['budgets', '/pos/budgets', 'Budgets'], ['assets', '/pos/assets', 'Assets'], ['reports', '/pos/reports', 'Reports'], ['notebook', '/pos/notebook', 'Notebook']]]
+    ];
     function navFor(role) {
-        if (role === 'cashier') return [['Main', [['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'My Sales'], ['drawer', '/pos/drawer', 'Cash Drawer']]], ['App', [['install', '/pos/install', 'Install App']]]];
-        if (!role) return [['Admin', [['admin', '/pos/admin', 'All businesses']]]];
-        const nav = [
-            ['Main', [['app', '/pos/app', 'Dashboard'], ['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'Sales History'], ['daily', '/pos/daily', 'Daily Sales (Z-Report)'], ['drawer', '/pos/drawer', 'Cash Drawer'], ['quotes', '/pos/quotes', 'Quotes']]],
-            ['Inventory', [['items', '/pos/items', 'Items'], ['categories', '/pos/categories', 'Categories'], ['stock', '/pos/stock', 'Stock In / Out & Adjustment'], ['history', '/pos/stock/history', 'Stock History'], ['low', '/pos/stock/low', 'Low Stock Alerts'], ['suppliers', '/pos/suppliers', 'Suppliers'], ['po', '/pos/purchase-orders', 'Purchase Orders']]],
-            ['Money', [['expenses', '/pos/expenses', 'Expenses'], ['ecats', '/pos/expense-categories', 'Expense Categories'], ['recurring', '/pos/recurring', 'Recurring Expenses'], ['budgets', '/pos/budgets', 'Budgets'], ['assets', '/pos/assets', 'Assets'], ['reports', '/pos/reports', 'Reports'], ['notebook', '/pos/notebook', 'Notebook']]],
-            ['This branch', [['staff', '/pos/staff', 'Cashiers & Staff'], ['settings', '/pos/settings', 'Branch Settings']]]
-        ];
-        if (role === 'owner') nav.push(['Business', [['branches', '/pos/branches', 'Branches'], ['bizreport', '/pos/business-report', 'All-branch Report'], ['payments', '/pos/payments', 'Payment Methods'], ['biz', '/pos/business', 'Business & Receipts'], ['sub', '/pos/subscribe', 'Subscription']]]);
-        nav.push(['App', [['install', '/pos/install', 'Install App']]]);
-        return nav;
+        if (role === 'cashier') return [['Sell', [['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'My Sales'], ['account', '/pos/account', 'My Account']]], ['App', [['install', '/pos/install', 'Install App']]]];
+        const shop = [];
+        if (role === 'owner') shop.push(['branches', '/pos/branches', 'Branches']);
+        shop.push(['staff', '/pos/staff', role === 'owner' ? 'Staff & Cashiers' : 'Cashiers']);
+        if (role === 'owner') shop.push(['gateways', '/pos/gateways', 'Payment Gateways'], ['voids', '/pos/voids', 'Void Requests'], ['audit', '/pos/audit', 'Audit Log'], ['security', '/pos/security', 'Security (2-step login)'], ['subscription', '/pos/subscribe', 'Subscription'], ['settings', '/pos/settings', 'Shop Settings & Logo']);
+        else shop.push(['account', '/pos/account', 'My Account']);
+        shop.push(['install', '/pos/install', 'Install App']);
+        return [...BASE_NAV, ['Shop', shop]];
     }
-    function layout(req, { title, nav = '', body }) {
-        const shop = req.shop, role = req.role;
+    function layout(req, { title, nav = '', body, bare = false }) {
+        const shop = req.shop;
+        const role = (req.actor && req.actor.role) || 'owner', biz = req.biz || shop, isStaff = Boolean(req.actor && req.actor.kind === 'staff');
+        const logoImg = biz && biz.logo && LOGO_OK.test(biz.logo) ? `<img src="${biz.logo}" alt="" style="max-height:36px;max-width:130px;display:block;margin-bottom:6px;background:#fff;border-radius:5px;padding:2px">` : '';
+        const switcher = role === 'owner' && req.branches && req.branches.length > 1 ? `<form action="/pos/branches/switch" method="POST" style="margin:0 0 6px"><label for="sw" style="color:#6b87a6;font-size:.7rem;padding:0 10px;text-transform:uppercase;letter-spacing:.06em">Branch</label><select id="sw" name="shop_id" style="margin:2px 8px 0;width:calc(100% - 16px);font-size:.85rem">${req.branches.map(b => `<option value="${b.id}"${shop && b.id === shop.id ? ' selected' : ''}>${esc(biz && b.id === biz.id ? b.name + ' (head office)' : b.name)}</option>`).join('')}</select></form>` : '';
+        const daysLeft = biz && biz.sub_until ? Math.ceil((new Date(biz.sub_until) - Date.now()) / 86400000) : null;
+        const voidBanner = role === 'owner' && req.pendingVoids ? `<div class="alert noprint" role="status">${req.pendingVoids} void request${req.pendingVoids === 1 ? '' : 's'} waiting for your approval. <a href="/pos/voids">Review</a></div>` : '';
+        const banner = voidBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
         const links = navFor(role).map(([group, items]) => `<div class="nav-group">${esc(group)}</div>` +
             items.map(([key, href, label]) => `<a href="${href}" class="${nav === key ? 'active' : ''}">${esc(label)}</a>`).join('')).join('');
-        const brand = shop && shop.has_logo ? `<a class="brand" href="/pos/app"><img src="/pos/logo?v=${shop.logo_ver}" alt="" style="max-height:44px;max-width:180px;display:block"></a>` : '<a class="brand" href="/pos/app">Tencent POS</a>';
-        const switcher = role === 'owner' && req.branches && req.branches.length > 1 ? `<form action="/pos/branch/switch" method="POST" style="margin:0 0 6px"><label for="bsw" style="color:#7dd3fc;font-size:.72rem;padding:0 10px">Branch</label><select id="bsw" name="branch_id" style="margin:2px 10px 0;width:calc(100% - 20px);font-size:.85rem;padding:6px">${req.branches.map(b => `<option value="${b.id}" ${b.id === shop.id ? 'selected' : ''}>${esc(b.name)}</option>`).join('')}</select><noscript><button class="btn small" type="submit" style="margin:4px 10px">Go</button></noscript></form>` : '';
-        let banner = '';
-        if (req.business && req.business.active_until) {
-            const days = Math.ceil((new Date(req.business.active_until) - Date.now()) / 86400000);
-            if (days >= 0 && days <= 5) banner = `<div class="alert noprint" role="status" style="background:#fffbeb;border-color:#fde68a;color:#92400e">Your subscription ends in ${days} day${days === 1 ? '' : 's'}.${role === 'owner' ? ' <a href="/pos/subscribe">Renew now</a>' : ' Please ask the owner to renew.'}</div>`;
-        }
         return `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} | ${esc(shop ? shop.name : 'Tencent POS')}</title>
-<meta name="robots" content="noindex"><meta name="theme-color" content="#0b1b2e">
-<link rel="manifest" href="/pos/manifest.webmanifest"><link rel="apple-touch-icon" href="/pos/icon-192.png">
-<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Tencent POS">
+<meta name="robots" content="noindex">
+<link rel="manifest" href="/pos/manifest.webmanifest"><meta name="theme-color" content="#0b1b2e"><link rel="icon" type="image/png" href="/pos/icon-192.png"><link rel="apple-touch-icon" href="/pos/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Tencent POS">
 <style>
 :root{--bg:#f1f5f9;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--side:#0b1b2e;--side2:#12304d;--accent:#0ea5e9;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--radius:10px}
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);font-size:15px;line-height:1.45}
 a{color:#0369a1}.side{position:fixed;inset:0 auto 0 0;width:236px;background:var(--side);color:#cbd5e1;overflow-y:auto;padding:14px 10px 24px;z-index:30}
-.side .brand{display:block;color:#fff;font-weight:800;font-size:1.05rem;padding:6px 10px 2px;text-decoration:none}.side .shopname{padding:0 10px 10px;font-size:.82rem;color:#7dd3fc;border-bottom:1px solid #1e3a56;margin-bottom:6px}
+.side .brand{display:block;color:#fff;font-weight:800;font-size:1.05rem;padding:6px 10px 2px;text-decoration:none}.side .shopname{padding:0 10px 12px;font-size:.82rem;color:#7dd3fc;border-bottom:1px solid #1e3a56;margin-bottom:6px}
 .nav-group{font-size:.7rem;letter-spacing:.06em;color:#6b87a6;padding:14px 10px 4px;text-transform:uppercase}
 .side a{display:block;color:#cbd5e1;text-decoration:none;padding:8px 10px;border-radius:7px;font-size:.92rem}.side a:hover{background:var(--side2)}.side a.active{background:var(--accent);color:#04223a;font-weight:700}
 .side form{margin:10px 0 0}.side .linkbtn{width:100%;text-align:left;background:none;border:0;color:#fca5a5;padding:8px 10px;cursor:pointer;font:inherit;font-size:.92rem;border-radius:7px}.side .linkbtn:hover{background:var(--side2)}
@@ -307,7 +276,7 @@ h1{font-size:1.5rem;margin:0 0 16px}h2{font-size:1.1rem;margin:0 0 10px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;margin-bottom:18px}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:.92rem;vertical-align:middle}th{font-size:.76rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}td.num,th.num{text-align:right;white-space:nowrap}
 .tablewrap{overflow-x:auto}
-.btn{display:inline-block;border:0;border-radius:8px;padding:9px 14px;background:var(--accent);color:#04223a;cursor:pointer;text-decoration:none;font:inherit;font-weight:700;font-size:.9rem}
+.btn{display:inline-block;border:0;border-radius:8px;padding:9px 14px;background:var(--accent);color:#04223a;font-weight:700;cursor:pointer;text-decoration:none;font:inherit;font-weight:700;font-size:.9rem}
 .btn.dark{background:#0f172a;color:#fff}.btn.ok{background:var(--ok);color:#fff}.btn.bad{background:var(--bad);color:#fff}.btn.ghost{background:#fff;border:1px solid var(--line);color:var(--ink)}.btn.small{padding:5px 10px;font-size:.8rem}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 label{display:block;font-weight:600;font-size:.85rem;margin:0 0 4px}input,select,textarea{width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;background:#fff;color:var(--ink)}
@@ -317,189 +286,297 @@ input:focus,select:focus,textarea:focus,.btn:focus-visible,a:focus-visible{outli
 .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:700}.tag.ok{background:#dcfce7;color:#166534}.tag.bad{background:#fee2e2;color:#991b1b}.tag.warn{background:#fef3c7;color:#92400e}.tag.gray{background:#e2e8f0;color:#334155}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.row>*{flex:1 1 150px}.row>.btn{flex:0 0 auto}
 .muted{color:var(--muted)}.right{text-align:right}.nowrap{white-space:nowrap}
+@media(max-width:860px){.side{transform:translateX(-100%);transition:transform .2s;width:260px}.side.open{transform:none}.main{margin-left:0;padding:14px 14px 60px}.top{display:flex;align-items:center;gap:12px;background:var(--side);color:#fff;margin:-14px -14px 14px;padding:10px 14px;position:sticky;top:0;z-index:20}.top button{background:none;border:1px solid #3b5878;color:#fff;border-radius:7px;padding:6px 12px;font-size:1.1rem;cursor:pointer}}
+@media print{.side,.top,.noprint{display:none!important}.main{margin:0;padding:0}body{background:#fff}.panel{border:0;padding:0}}
+${bare ? '.side,.top{display:none!important}.main{margin:0 auto;max-width:480px;padding-top:7vh}' : ''}
 .pos-wrap{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:16px;align-items:start}
 .pos-items{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px}
 .pos-item{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px;text-align:left;cursor:pointer;font:inherit;display:flex;flex-direction:column;gap:4px;min-height:84px}.pos-item:hover{border-color:var(--accent);box-shadow:0 0 0 2px #bae6fd}.pos-item b{font-size:.92rem}.pos-item .p{color:#0369a1;font-weight:800}.pos-item .s{font-size:.75rem;color:var(--muted)}.pos-item.out{opacity:.45}
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 12px;cursor:pointer;font:inherit;font-size:.85rem}.chip.on{background:#0f172a;color:#fff;border-color:#0f172a}
-.cart{position:sticky;top:12px}.cart .lines{max-height:34vh;overflow:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:10px 0}.cline{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}.cline:last-child{border:0}.cline .qty{display:flex;align-items:center;gap:4px}.cline .qty button{width:28px;height:28px;border-radius:6px;border:1px solid var(--line);background:#fff;cursor:pointer;font-size:1rem}
+.cart{position:sticky;top:12px}.cart .lines{max-height:38vh;overflow:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:10px 0}.cline{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}.cline:last-child{border:0}.cline .qty{display:flex;align-items:center;gap:4px}.cline .qty button{width:28px;height:28px;border-radius:6px;border:1px solid var(--line);background:#fff;cursor:pointer;font-size:1rem}
 .tot{display:flex;justify-content:space-between;padding:3px 0}.tot.big{font-size:1.35rem;font-weight:800;border-top:2px solid var(--ink);margin-top:6px;padding-top:8px}
 .pay{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.pay button{padding:10px;border:2px solid var(--line);background:#fff;border-radius:8px;cursor:pointer;font:inherit;font-weight:700}.pay button.on{border-color:var(--accent);background:#e0f2fe}
 .modal{position:fixed;inset:0;background:rgba(2,6,23,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}.modal.show{display:flex}.modal .box{background:#fff;border-radius:14px;padding:22px;max-width:420px;width:100%;text-align:center}
 @media(max-width:1000px){.pos-wrap{grid-template-columns:1fr}.cart{position:static}}
-@media(max-width:860px){.side{transform:translateX(-100%);transition:transform .2s;width:260px}.side.open{transform:none}.main{margin-left:0;padding:14px 14px 60px}.top{display:flex;align-items:center;gap:12px;background:var(--side);color:#fff;margin:-14px -14px 14px;padding:10px 14px;position:sticky;top:0;z-index:20}.top button{background:none;border:1px solid #3b5878;color:#fff;border-radius:7px;padding:6px 12px;font-size:1.1rem;cursor:pointer}}
-@media print{.side,.top,.noprint{display:none!important}.main{margin:0;padding:0}body{background:#fff}.panel{border:0;padding:0}}
 </style></head><body>
-<div class="top noprint"><button type="button" id="side-btn" aria-label="Open menu" aria-expanded="false">&#9776;</button><strong>${esc(shop ? shop.name : 'Tencent POS')}</strong><a href="/pos/install" id="install-top" class="btn small" style="margin-left:auto;text-decoration:none">Install app</a></div>
+<div class="top noprint"><button type="button" id="side-btn" aria-label="Open menu" aria-expanded="false">&#9776;</button><strong>${esc(biz ? biz.name : 'Tencent POS')}</strong></div>
 <nav class="side" id="side" aria-label="POS menu">
-${brand}<div class="shopname">${esc(shop ? shop.name + (shop.branch ? ' · ' + shop.branch : '') : 'Platform admin')}${role ? ` <span class="tag gray" style="margin-left:4px">${esc(role)}</span>` : ''}</div>
+<a class="brand" href="/pos/start">Tencent POS</a><div class="shopname">${logoImg}${esc(biz ? biz.name : '')}${shop && biz && shop.id !== biz.id ? '<br>' + esc(shop.name) : ''}${isStaff ? '<br>' + esc(req.actor.name) + ' (' + esc(role) + ')' : ''}</div>
 ${switcher}${links}
-<div class="nav-group">Account</div><a href="/pos/install" id="install-btn">&#11015; Install this app</a><a href="/">Back to website</a>
-<form action="/logout" method="POST"><button class="linkbtn" type="submit">Log out</button></form>
+<div class="nav-group">Account</div>${isStaff ? '' : '<a href="/">Back to website</a>'}
+<form action="${isStaff ? '/pos/staff/logout' : '/logout'}" method="POST"><button class="linkbtn" type="submit">Log out</button></form>
 </nav>
 <main class="main">${banner}${body}</main>
 <script nonce="${req.nonce || ''}">
 (function(){var b=document.getElementById('side-btn'),s=document.getElementById('side');if(b)b.addEventListener('click',function(){var o=s.classList.toggle('open');b.setAttribute('aria-expanded',o?'true':'false');});
-var sw=document.getElementById('bsw');if(sw)sw.addEventListener('change',function(){sw.form.submit();});
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{scope:'/pos/'}).catch(function(){});
-var dp=null,standalone=(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches)||window.navigator.standalone===true;
-if(standalone){['install-btn','install-top'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});}
-window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;});
-function go(ev){if(dp){ev.preventDefault();dp.prompt();dp=null;}}
-['install-btn','install-top','install-main'].forEach(function(id){var e=document.getElementById(id);if(e)e.addEventListener('click',go);});
-window.__tposInstall=function(){return !!dp;};
-window.addEventListener('appinstalled',function(){['install-btn','install-top'].forEach(function(id){var e=document.getElementById(id);if(e)e.style.display='none';});});})();
+var sw=document.getElementById('sw');if(sw)sw.addEventListener('change',function(){sw.form.submit();});
+var ev=null,ib=document.getElementById('install-now');window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();ev=e;if(ib)ib.style.display='';var h=document.getElementById('install-help');if(h)h.style.display='none';});
+if(ib)ib.addEventListener('click',function(){if(!ev)return;ev.prompt();ev.userChoice.then(function(){ev=null;ib.style.display='none';});});
+if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{scope:'/pos/'}).catch(function(){});})();
 </script>
 </body></html>`;
     }
     const send = (req, res, opts, status = 200) => res.status(status).set('Cache-Control', 'no-store').send(layout(req, opts));
-    const notice = (req) => req.query.ok ? `<div class="alert ok" role="status">${esc(String(req.query.ok).slice(0, 160))}</div>` : '';
-    const errBox = req => req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 200))}</div>` : '';
-    const back = (res, path, ok, err) => res.redirect(path + '?' + (err ? 'err=' + encodeURIComponent(err) : 'ok=' + encodeURIComponent(ok)));
+    const notice = (req) => req.query.ok ? `<div class="alert ok" role="status">${esc(String(req.query.ok).slice(0, 120))}</div>` : '';
 
     // ----- public landing page for the service -----
     app.get('/pos', (req, res) => {
         const loggedIn = Boolean(req.session && req.session.user);
-        const fee = subFee().toLocaleString('en-KE'), subBranch = branchFee().toLocaleString('en-KE');
         const content = `
         <div class="general-container">
-            <h2>Tencent POS: a point of sale for your business</h2>
-            <p class="sub-title">Sell faster, know your stock, and see your profit every day. Installs on any phone, tablet or computer like an app.</p>
+            <h2>Tencent POS: a point of sale for your shop</h2>
+            <p class="sub-title">Sell faster, know your stock, and see your profit every day. Works on any phone, tablet or computer, and installs like an app. KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month.</p>
             <div class="form-container" style="border-left:4px solid var(--primary);">
-                <h3 style="margin-top:0;color:var(--primary);">What your business gets</h3>
+                <h3 style="margin-top:0;color:var(--primary);">What your shop gets</h3>
                 <ul style="line-height:1.8;padding-left:20px;margin-bottom:0;">
-                    <li><strong>Your own business account</strong>, with linked <strong>branch accounts</strong> and as many <strong>cashier logins</strong> as each branch needs.</li>
-                    <li><strong>Fast sales screen:</strong> tap items or scan barcodes. Take cash, M-Pesa STK push (using your own paybill or till), and other payment types you add.</li>
-                    <li><strong>Receipts with your logo and business name</strong>, with the 16% VAT added and shown. Print or save as PDF.</li>
-                    <li><strong>Stock control</strong> per branch: stock in and out, purchase orders, low-stock alerts, suppliers.</li>
-                    <li><strong>Reports:</strong> daily closing report, profit, expenses, budgets, cash drawer, and an all-branch report for the owner.</li>
-                    <li><strong>Private:</strong> each business only ever sees its own data.</li>
+                    <li><strong>Fast sales screen:</strong> tap items or scan barcodes, take cash or M-Pesa, give change, print or share the receipt.</li>
+                    <li><strong>Stock control:</strong> stock goes down with every sale, add or remove stock, and get low-stock alerts before you run out.</li>
+                    <li><strong>Daily and monthly reports:</strong> sales, profit, best sellers, cash versus M-Pesa, and a daily closing report.</li>
+                    <li><strong>Expenses:</strong> record rent, transport and other costs so you see real profit.</li>
+                    <li><strong>Your own private account:</strong> your products and sales are visible only to you.</li>
                 </ul>
             </div>
             <div class="form-container" style="margin-top:20px;">
-                <h3 style="margin-top:0;">Pricing</h3>
-                <p><strong>KES ${fee} per month for your main shop</strong>, plus <strong>KES ${subBranch} per month for each extra branch</strong>. Cashiers are unlimited. Pay by M-Pesa from inside the app. When your payment is confirmed, the POS is switched on and you can install it on your devices.</p>
-                <p>You enter prices before VAT. The POS adds 16% VAT at the sale, and the receipt shows the subtotal, the VAT and the total.</p>
+                <p style="margin-top:0;">${loggedIn ? 'You are logged in. Open your POS to start selling.' : 'Create a free account, confirm your email, and set up your shop in two minutes.'}</p>
                 <a href="/pos/app" class="cta-btn">${loggedIn ? 'Open my POS' : 'Get started'}</a>
                 <a href="/contact" class="cta-btn" style="margin-left:8px;">Ask us about setup & hardware</a>
             </div>
-            <p class="muted" style="margin-top:14px;">${loggedIn ? '' : 'You will create a free account first and confirm your email. '}We can also supply and install barcode scanners, receipt printers, tablets and shop WiFi.</p>
+            <p class="muted" style="margin-top:14px;">We can also supply and install barcode scanners, receipt printers, tablets and shop WiFi.</p>
         </div>`;
         res.send(renderPage(req, { title: 'POS System for Shops', activeNav: 'pos', content }));
     });
 
-    // ----- public files that make the app installable -----
-    const ICON192 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAAIK0lEQVR4nOzde3BU1R3A8ZPNZpOQ125emxAMJCQQCg0lJoZCLI1a8AF0tDiD7XQUO1U6UPuHpdjpA0qfA9OZ6lRRq20tdaatVRGtYEEsLWlRSBkyEjCJIYS8Q9i8Q14bD0QdnHFG4g+Sc3K/n9lhlp1lcu/my7n37rl71x2VlquAT8utAAECgggBQYSAIEJAECEgiBAQRAgIIgQEEQKCCAFBhIAgQkAQISCIEBBECAgiBAQRAoIIAUGEgCBCQBAhIIgQEEQICCIEBBECgggBQYSAIEJAECEgiBAQRAgIIgQEEQKCCAFBxI6A0lL931l7d0525qysjGlTU9TkVdfQVFF16mRl9SNP/EnfV8YLMf8im8uXFW//9RafN1Y5yblAxwMbt+x8dZ8yW6gn1q9M5Xa7t23Z+KtN342MCFcOExkZcceKZfE+7xsHDwWDQWUqlzLYksUF99+zWjnY2jV3fbGoUBnM3E2YNy7myP4XU/xJytkam1rmX7+it++8MpK5I9BXVt5MPVpqSvLty5cqU5kb0HV5XEL/fV9YVKBMZe5hfAEBfcDkl8LQESjeG5eVka5wkX4pEnxeZSRDR6Bz7R0ul9FHiONJvxRtgXZlJKYyIEJAECEgiBAQRAgIIgQEEesDCgyM/LO+v7p7WNkmMzp0aVq4zxOibGZ9QDe9dq6qy756RmXFhJauSFA2s/vNuorOYXvr0fTC61VQNrM7oOY+c8+0uky2rwI70RAhIIgQEETs3gcqSnb7IyxeheQIl14FZTO7lz4kJOT3RXF/OdVXbeGxWGZM6OqMSL0KymbWb8KKksP0TWGCsA8EEQKCCAFBhIAgQkAQISCIEBBECAgiBAQR6wOqqW8tr6rr7x9UEyQlyZubMz0q0nGXwBpld0ADA0O7DxwNBkfUxGloCeg/P79glnIku2fjTze0Tmw9o6rPNCunsnsEmmLGhiMqMkI5ld0jUKIvxuWa+NMh/IlxyqnsHoHCPWErb8xvam0fnrjrmEZPiZgxLVk5lfVHYWn+eH1TmCC8DwQRAoIIAUGEgCBCQBBhLuyqi42ekpuTnhQ/Ob9tiLmwq05PlgU6ulfdslBNRsyFjYfmto6eXkO/LUWIubBxEjVlcs6XMRc2HvwJk3ayjLmwq84T5k5PTVSTFHNhEOF9IIgQEEQICCIEBBECgghzYZcrPDxsdsbUmel+hUswFzYGp+tb711VrN98UvgAc2FjoH9WbcNZhUswF2b6TzQcc2FjoH9Wkm9yntbzqTEXdrlCXS5/YpzHw3HrRzAXBhH+P0GEgCBCQBAhIIgQEEQICCIEBBECgggBQYSAIDIZAmrr7zzQeLSmq3F4xI5vTg0NCZ0Rk7okdUFCuPVTs9YH9EZD6bcObgsMdCnb+Dwx24s2FE+9VtnM7tM5NEvr0fRi64VXlrM7oNqeZkvrGaUXXq+CspndAVV11CnL2b4Klp9QFmr9+e22r4KjD+MXJs/bdO29o/d7Bs+/2XL88RMvdg326r9mxEy9L+fLs73pPUPny9qqHi1/vnfo/Ojjd2be8Nn4mRGhnqbetp01/3694YhyMOt3oiV84dF5CbO7BnoPt5xo6Qusn7vq2eLN+vGCpDn7l/92VWZxQ+9Zj8v9YO5d+259ZIr7whWidhT/+GtZS1+vP7K37q2F/nmPFW0Idzn6Uz68kaj21R9+8uRL+s7vXA+tnH59cqTvRwvW6L/etufBio4z+s7d2bdsLVyv83qs/Pns2Gt2nf7PHyv+oR/f31A6NDLcHzT3+p7jwNEj0KX0AJMendI33K83VbkJWSVNx0br0Z6p3D0QHNLDUvdg3yu1JTqykpVP/HDBPbO90wP9Fh8DXhGMQOqn+ffpm74THAl+761HdSX6neLgyEc+rzgwPKh3evSdtQe3rp55U453+o1pBd+ee6c+CC9+ZZ3+J8qpCEjp7dG/Gv+vLhxR11d2Xhh13u2sn5+Qpcek0R3n3Pis6LBIPSCFudxzvDNerf3vjso9+nG9pdPbtcX+3Nfq3lROxSbsQi67zxzSt9F6tO3lL6REJry8bNvXs2++LX3x1sJ1etP29Dsv69mrvbc+/JP8b+odZ71FW5ySq598ptu533epGIE+1l+r9+nN2drP3P6z/Pv1lquup+UbB35RHjilb5tKn9KjTu1Xd+qn6QP+zaVPlbfXKAcLiUrLVUbqrjv2ic8paS67Y+/3lc1e+NIv9UbwE58WPW2+MhIjEETsDuiaaOsv92T7Kti9E50e5Z/ry1TW0guvV0HZzPqjsD8s+UFh8lxlIb3YeuGV5ezeif5Qc9+5mq7GIUtOaXVfPKXVHzmGi4qwE3116V/GmH4fuFI4CoMIAUGEgCBCQBAhIIgQEEQICCIEBBECgggBQYSAIEJAECEgiBAQRAgIIuaekdjQ1KJwUcW7NcpU5gb0v8NHFS4qO35SmcrcgI69be6rNs7Kjr+jTGVuQM8+tyvQ3qkcT78If/7bS8pU5gbU3HL2gY1blOOt37C5pbVNmSrUE2vu55JOVlb7kxLz5lv5qZ0r4ukdz/3m8WeUwcz9WM+H8j8378mHfz5r5gzlJFWnTq9Z99DRsnJlNgsC0sLDPSuW3bCoMG/RdXnz5mSryevtE5X68LPkUOnfd+1RNrAjIBiLd6IhQkAQISCIEBBECAgiBAQRAoIIAUGEgCBCQBAhIIgQEEQICCIEBBECgggBQYSAIEJAECEgiBAQRAgIIgQEEQKCCAFBhIAgQkAQISCIEBBECAgiBAQRAoIIAUGEgCBCQBAhIIi8BwAA//9qLrALAAAABklEQVQDAOzmUesT3G4ZAAAAAElFTkSuQmCC', 'base64'), ICON512 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAQAElEQVR4nOzdCZRV9Z3g8X+xFhQFsi9VyA7KUuwKEjfcjVvSxtgz2iZO1qMmHdslOd22iWNM0mOSsY2mu8c4Hc0Y0y5JjHEj7nEhiqAIyi5a7AWIBVhQQM21K76UGNHTBL3v/T6f806dd2+9Ks6p++d+313evW0qqmoSAPG0SQCEJAAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACUCL6V/U95YTpw4cMyp5UV/XJvlZ2qkjwl1C/ectrK1bVrlidfV24ZNld9z6UPUkUv7KKqppE0RozcsTppxx3wjGHjxwxNMGHZf6Cxfc88Mgdv3lg7vwFiaIlAMXqgGGD/+Gi80498aiysrIEH4WmpqZf/nbGFd/70eJlyxNFSACKT3W/PpdfesGnP3Fiq1atEnzUduzYcdOtv7rqh/+yes26RFERgCJz1OGH3PTjf+rSuTJBnmx6o/5vvnzJg48+mSgerdt17p0oEl/8zJk3/PO3O3QoT5Az5e3bn3HaCctrV744f2GiSAhA0bj6f3797//uy3b7kFvZ4Dzl+OmtW7d+7MlnEsVAAIrD/zj7U5dddF6C3PvYlImr1qybM/elRO45BlAEpkwad+9tP2nb1oc2KA6NjTtOPONzTz0zO5Fv9ifkXVXf3j//yQ+t/Ski2XC95YYfZEM3kW8CkHfX/a/Le3bvlqCoZIM2G7qJfBOAXDt06qSjj5iWoAhlQzcbwIkcE4Bcu/zSCxIUrcsuduZCrglAfp1+yvHZ4d8EReuQgyacdNyRibwSgPw66Xj/cyh6Jx8/PZFXzi3JqbZt2xx75McSFLnph05J5JUtgJzKdv50ruyUoMj17dNr8oQxiVwSgJw6xsk/lIqTj7MXKKfsAsqpmlEjEpQEgzm3BCCnevfqkaAkdOncOZFLApBTvXsKACWid6/uiVwSgJxyyxdKhnczuSUAOdW+fbsEJcFgzi0BAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAHjLrcsa7q7d9kxd4+o3dyVKV58OrSb3aHtSdfszB5UnwiurqKpJ5M/m2ufTh+LVLbu+OvONh1ZvT0QyvU+7aw7uvH9Fq/Sh6FQ9NpE/H9LiJ7c+98Qma/+AsoX++Sc3JWITgNB+trRhZl1jIqSn1zVmAyARmACEdudy//9DMwCCcxA4tBc27kgEZgAEJwChrWtwzk9oBkBwAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlGsBhdaz3AAIzQAIzuIPraarTcDQDIDgBCC0c4d1SARmAAQnAKGdVN3+qL7tEiGdWN0+GwCJwAQguu9OrGxnFMRT0abs6kmVidjsAYxueOfW687s5abwQbgpPC0JAG/JVgfWCBCNAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACQFq+sm7mnEWb6rdub9yR+Eto17ZNl8qOB48bNqBfjwR5VVZRVZPIn821z6d9r6mpaeacxbPmLU3sG5PGDD6oZmhZWVmKrVP12ET+tEoEtnLtRmv/ferZuUtrV29IkEsCENqsF63997nZ85clyCXHAEKr21if2Mf8kcktAQjtzYbtiX3MH5ncEgCAoAQAICgBAAjKWUChdShvl9jH/JHJLQEIrUfXysQ+5o9MbglAaONHDkrsYxNHD06QSwIQWv++3SeM0oB9aHLNkKre3RLkkoPA0U0dP3zE4H5z5r9Su3p9/ZaGxF9CZUV5dZ/u40YO7NalU4K8EgBStpKaPnV0AoIRAICgBAAgKAEACEoAAIISAICgBAAgKAEACEoAAIISAICgBAAgKAEACEoAAIISAICgBAAgKAEACEoAAIISAICgBIC0fGXdzDmLNtVv3d64I5Fv7dq26VLZ8eBxwwb065Fg75RVVNUk8mdz7fNp32tqapo5Z/GseUsTxWbSmMEH1QwtKytLxaBT9dhE/rRKBLZy7UZr/yL17Nyltas3JNgLAhDarBet/YvY7PnLEuwFxwBCq9tYnyhaFh97SQBCe7Nhe6JoWXzsJQEACEoAAIISAICgnAUUWofydomiZfGxlwQgtB5dKxNFy+JjLwlAaONHDkoUrYmjByfYCwIQWv++3SeM0oCiNLlmSFXvbgn2goPA0U0dP3zE4H5z5r9Su3p9/ZaGRL5VVpRX9+k+buTAbl06Jdg7AkDKViXTp45OQDACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQQkAQFACABCUAJCWr6ybOWfRpvqt2xt3JN7Wrm2bLpUdDx43bEC/HglKUVlFVU0ifzbXPp/2vaampplzFs+atzTx3iaNGXxQzdCysrLEf1Wn6rGJ/GmVCGzl2o3W/u/r2blLa1dvSFByBCC0WS9a+38gs+cvS1ByHAMIrW5jfeID8IeiJAlAaG82bE98AP5QlCQBAAhKAACCEgCAoJwFFFqH8naJD8AfipIkAKH16FqZ+AD8oShJAhDa+JGDEh/AxNGDE5QcAQitf9/uE0ZpwPuYXDOkqne3BCXHQeDopo4fPmJwvznzX6ldvb5+S0PibZUV5dV9uo8bObBbl04JSpEAkLIV3PSpoxMQjAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAsA7PLDiD8/VLXhh/eIXNixZ17AxUfx6deha021oTbch43uMOLbqoARvK6uoqknkz+ba59OHa/nm1ec9cfUz615KlK7JPQ+8btpFAzr1SR+uTtVjE/nTKkFKP1t8/xF3n2ftX/KyRZwt6FuWPJDALiAyP114zyV/uC4Rw9YdDV976prGnTvOGX5iIjZbANG9Ur/qm7NuSASTLfRs0SdiE4DQdjXtOv/J72/duS0RTLbQs0WfDYBEYAIQ2nPrF9rvH1a26LMBkAhMAEKbte7lRGAGQHAOAof25Jq5icBm1QlAaAIQmv//wc2qW5AITABCW9fweiKw2i1rE4EJAEBQAgAQlAAABCUAAEEJAEXgf0/92xH77f9nv7Vz164VW9cteWPFgteX3187s2Hn9j3/qiP7TTy87/gJ3Yf3rejRq7zrjl071zZsWF6/+tm6l+997el5G5em95P9+PHVUwZ37tevY88BlX12Nu16Y/vm17dvfvn15Te8fJcP1lFEXA46pz6cy0H3/tnHUzG494QfTOg+4n1ftnJr3fXz7/j3hfc07trx7u/+1aAjLqk5a2Bl3z38hplr513x3I3PvsfZsZ8cePhFNf99SOeqPfyGP6yb/9lHrqzbtikViTVn/Tbtey4HnU8+CUzp6Nexx5WTvvjPh1z47m9dOvbs66ddvOe1f+bgXqNuO/rbpw449N3fOrH/1Gun/d2e1/6Zg3qOvPPY73ZtV5kg9+wCosisa3j9tS1rCpMVbToMquzXrtWfRnL2Pv2xVbN/vmRGYc5nhn/8wjFntvwl2Z6iRZtem7dxWUXb8pH7DcrC0Lrsj2+GOrYpv27aRdm/0vJj0tl3rznka23KWjdPzt+47MaFd2f7fLJHVp1JPQ/87PCPj+k2pPm7I7rsf9aw46+dd1uCfBMAiszDK2dd8OQPWs5p36rtGUOOumLSFzq2bt885wsHnFoIwNDO1VdM+nzhxU2p6cYFd185+9+37mgozMwS8v0pF0zr/cfdoW1btbn2kAsP+fUXtu1qbJ4zttuwzm0rmp9nO/3PfeyqZfUrmycXbHo1e9y6ZMadx3xnSq/RzTNPGfAxASD/BICil62mb150X8/y/bL9PM1zBrfYUfPV0WdkhShMnv/E929f9vBuvyFbm39yxjeumfq1M4cc3TynuqLXOcNP/LeXf908Obb7sMKLl9avKKz9C7Iq/HDuL7504LZXt6xd9+bGltsokFsCQIl4eu28wvPy1u1Gdx384sal2a6bkwZ8rDD/hQ2L3732L7hy9v89af9pndp2aJ48deBhhQAUdhBlqjr27NKu06btm3f78UdWPZc9EhQPB4EpTR3avLU7aHLPkYX9Qpk9rP3Tfx5duGnRPYXJbJ9+YdNh7sYlhfnZQYKbjrjsyH4TExQ5AaBETOk1quXksjfe2ktzwH4DWs6cu2HJnn/JjBXPFJ5na/8Rb//4zLXzXmzxEYFsX/+t0694+tT/c/XBF3xq8PTsMEOCImQXEKXg6KrJXx396cJktqun+Uz87MBAYeaupl3Pvd/Vj19/546dXh26Fp5f+NQ1Nx95ee8O3QpzskPH2ePsYcc3/2D2jz66avadyx5ZubUuQTEQAIrM6G5Drpj4p7N6sl32w7r0P6jnyJav+dG82wvfLczM1svv+znhN3e84/bI+7XrVHj+/IbFx9zz1e9M/tJRVZOzYwy7/WD2ysP6jMsel4w967p5d3zv+ZsT5J4AUGRG7jcwe+zhBbcte+jXyx9vfr658c3C/B4ttgbeS/+KXi0n6xre8YHeNW9uOPexqyrbdsze9b91PYkeIwrnhhZkO44uHHNmq7Ky78y5KUG+CQClo3HXjn996Vf/9PzPCnM2bqsvPM/etldX9NrzLVB2+6jwn31xfePW6+ffmT3KUtmEHsOzjY/D+o4/rO+4wsfEMuePOv2WxQ8s37w6QY4JAEVmt08CN2tqeusiPD9deM9uZ+gv2LS85eSQzlV7DkD/Tn/aAmhKTUveWLGHF2cvmFW3IHv8+KVfZuX4+3HnnPL2NSSyGJy0/7Tr5t+RIMcEgCLz7k8C78GTa+Zu3bmtcCboJwceNjrfSQAAB2VJREFUkR2nfa8XZ+/oT97/Tx8aeK5uYbaKTx/MK/WrPv/4dw/Yb+DwLv2b52THhxPkm9NAKWU7m3bdvfz3hclPDZ4+uuvg93rxFw48teVa+xdvX0xiQKc+Xxl1xnXTLnrgxGte+tTPWx4Z3s2KFpsX9Y1bEuSbAFDirp13W+Hq0K3LWt0y/VuH9B7z7pf99ZBjvjHubwqT2Tv6Xyx9sDD59XFnnz7oyLHdhnZr37lwwYndZJ3IDgsXJmevX5Qg3+wCosQt3PRati/+b9/+lEDvDt3+46grf7LgN8+uezk7bNC9feea7kOP7DfxtAGHFX5k267G8564unDOaHYsd8aKPxxfPaV58twRJ03secDtSx+avX7hok2vdWrbMTu0cETfCdnmRZcWGwczW1yaAvJJACh9351z88QeBxza54/3JGnbqs2XDvxEOvDPv7i+cev5T3x/t3vCXD7rhpFdB+1f0bt5MtsUyB57+Bf/5aVfrnlzQ4J8swuI0pcdy/30g/9w06J73/eVr25Zc9oDl95X+/Ru87M9Qn/94D+u2ro+fQA/XXRvFowEuWcLgBCyo8EXz/zR7csevnTsWQf1HNm21e4jP3vL/x9LH7xt6UMt7xPQ0uI3ag/9zZc+PfjoTww6fGKPEWWpbLcXZLuM7lr++I9f+uX8jcsSFAP3BM4p9wTedzq2bn9w79Hlrd+60mf99q1r/vPy/e97lYiWylu3y44l9Cjv0rV95207t2/YVr++YdO6ho1ZZlKxcU/gyGwBEM7WndseXjkr7YWsFtmRYR/0pdgJAEBQAgAQlLOAQuv5AS6QSQkzAIITgNBGvfd1EYjAAAhOAEIb3c3//9AMgOAcAwhttDeAsRkAwdkCCO246oMPfOdt04ljRJf9j+s/JRGYAITWsU359R+75N0fi6XkZQv93w77euFOCcQkANGN3G/gZeM/mwgmW+gHdLHxF523fqQvHnhaeZv235x1w3tdBodS0rltxbcnf/GMwUclwrMFwFvOGXbCoydf/2fvlEIpyRbx46f82NqfZi4Gl1MfzsXg3m3JGyueWvvi02tezL7u+f7pFIuqjj2n9h49pdfo7OvQztXpo+BicPkkADn1UQUA9gUByCfHAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAIKhWiVza9EZ9gpJgMOeWAOTUmnXrE5QEgzm37ALKqZ07dyYoCWvW1iVyyRZATs17eVGCkrBmnQDklADk1AvzFiQoCQZzbglATs14+IkEJcFgzi0ByKm58xesWLUmQZFbtXptNpgTuSQA+fXI72cmKHL3zHg0kVcCkF82nCkBMx4xjPNLAPLr9rvus+1MUXv62Tl33/9wIq8EINcuu+qaBEXrW9+7NpFjApBrv3vkicefejZBETJ686+soqomkWNVfXv//r5be3bvlqB41G3YeMhxZ6xctTaRY7YA8m7FqjX/7XMXNjbuSFAksuF6xme+Yu2ff63bde6dyLfalauz91MnHH1YgmJw3sXfvPd3jyVyTwCKw+wX5vfu2WPC2FEJ8u0H1914zb/+NFEMBKBo3PfgY0uWvXrC0Ye3bt06Qf5s39547vnfuP4n/y9RJASgmMx7edEjv5957JHTKjtVJMiT1WvWnXb2l3/36JOJ4iEARSY7JnzzL37Vpm2b8WNG2hQgD7I3/tffeMs5X7546SuvJYqK00CL1f7V/b71ja+cfsrxZWVlCT4KTU1Nd/zm/n+86ppXa1cmipAAFLcxI0f81cnHnnjsESNHDE3wYZm/YPG9Mx69/a77Xa2kqAlAiehf1feUE6YPHzIoe1Jd1Sf76jgBfyn1m7e8tmJV7YrV2deXFi757QOPZE8SxU8AAIJyU3iAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAhKAACCEgCAoAQAICgBAAjq/wMAAP//mPnqzQAAAAZJREFUAwBUZZ4xAg1d/gAAAABJRU5ErkJggg==', 'base64');
-    router.get('/manifest.webmanifest', (req, res) => res.set({ 'Content-Type': 'application/manifest+json', 'Cache-Control': 'public, max-age=3600' }).send(JSON.stringify({
-        name: 'Tencent POS', short_name: 'Tencent POS', description: 'Point of sale for shops and branches', start_url: '/pos/app', scope: '/pos/', display: 'standalone',
-        background_color: '#0b1b2e', theme_color: '#0b1b2e',
-        icons: [{ src: '/pos/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' }, { src: '/pos/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }]
-    })));
-    router.get('/icon-192.png', (req, res) => res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }).send(ICON192));
-    router.get('/icon-512.png', (req, res) => res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }).send(ICON512));
-    router.get('/offline', (req, res) => res.set('Cache-Control', 'public, max-age=3600').send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline</title><style>body{font-family:system-ui,sans-serif;background:#0b1b2e;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center;padding:20px}button{padding:12px 20px;border:0;border-radius:8px;background:#0ea5e9;font-weight:700;font-size:1rem;cursor:pointer}</style></head><body><div><h1>You are offline</h1><p>Tencent POS needs the internet to save sales safely. Reconnect and try again.</p><button onclick="location.reload()">Try again</button></div></body></html>'));
-    router.get('/sw.js', (req, res) => res.set({ 'Content-Type': 'application/javascript', 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/pos/' }).send(
-`const V='tpos-1';
-self.addEventListener('install',e=>{e.waitUntil(caches.open(V).then(c=>c.add('/pos/offline')).then(()=>self.skipWaiting()));});
-self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==V).map(x=>caches.delete(x)))).then(()=>self.clients.claim()));});
-self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(fetch(e.request).catch(()=>caches.match('/pos/offline')));}});`));
+    const vault = SEC.makeVault(process.env.POS_CRED_KEY, String(process.env.POS_CRED_KEY_OLD || '').split(','));
+    const regen = req => new Promise((ok, no) => req.session.regenerate(e => (e ? no(e) : ok())));
+    const saveSess = req => new Promise((ok, no) => req.session.save(e => (e ? no(e) : ok())));
 
-    // ----- M-Pesa callback from a business's own paybill/till (public; the secret token in the URL identifies the business) -----
+    // ----- files that make the POS installable as an app (public, no sign-in needed) -----
+    const SW_JS = `const V='tpos-v1';
+self.addEventListener('install',function(e){e.waitUntil(caches.open(V).then(function(c){return c.addAll(['/pos/offline','/pos/icon-192.png']);}).then(function(){return self.skipWaiting();}));});
+self.addEventListener('activate',function(e){e.waitUntil(caches.keys().then(function(k){return Promise.all(k.filter(function(x){return x!==V;}).map(function(x){return caches.delete(x);}));}).then(function(){return self.clients.claim();}));});
+self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.respondWith(fetch(e.request).catch(function(){return caches.match('/pos/offline');}));}});`;
+    const MANIFEST = JSON.stringify({
+        name: 'Tencent POS', short_name: 'POS', description: 'Point of sale for shops', id: '/pos/start', start_url: '/pos/start', scope: '/pos/', display: 'standalone',
+        background_color: '#ffffff', theme_color: '#0b1b2e',
+        icons: [{ src: '/pos/icon-192.png', sizes: '192x192', type: 'image/png' }, { src: '/pos/icon-512.png', sizes: '512x512', type: 'image/png' }, { src: '/pos/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }]
+    });
+    router.get('/manifest.webmanifest', (req, res) => res.set({ 'Content-Type': 'application/manifest+json', 'Cache-Control': 'public, max-age=3600' }).send(MANIFEST));
+    router.get('/sw.js', (req, res) => res.set({ 'Content-Type': 'application/javascript; charset=utf-8', 'Service-Worker-Allowed': '/pos/', 'Cache-Control': 'no-cache' }).send(SW_JS));
+    for (const [name, size, maskable] of [['icon-192.png', 192, false], ['icon-512.png', 512, false], ['icon-maskable-512.png', 512, true]]) {
+        router.get('/' + name, (req, res) => res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }).send(GW.iconPng(size, maskable)));
+    }
+    router.get('/offline', (req, res) => res.set('Cache-Control', 'no-store').send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Offline</title></head><body style="font-family:system-ui,sans-serif;text-align:center;padding:12vh 20px;color:#0f172a"><h1>You are offline</h1><p>Tencent POS needs an internet connection to save sales and keep your stock correct.<br>Check your WiFi or mobile data, then reopen the app.</p></body></html>'));
+
+    // ----- M-Pesa / gateway callbacks (called by the payment company, so no sign-in; every one is checked in gatewayCallback) -----
     router.post('/mpesa/cb/:token', (req, res) => {
-        res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-        handleStkCallback(String(req.params.token || ''), req.body).catch(err => console.error('POS M-Pesa callback error:', err.message));
+        res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
+        gatewayCallback('mpesa', req.params.token, req.body).catch(e => console.error('POS M-Pesa callback error:', e.message));
+    });
+    router.post('/paystack/hook/:token', (req, res) => {
+        res.sendStatus(200);
+        gatewayCallback('paystack', req.params.token, req.body).catch(e => console.error('POS Paystack webhook error:', e.message));
     });
 
-    // ----- everything below needs a confirmed, signed-in account -----
-    router.use(requireAuth, requireDb, requireVerified);
+    // ----- staff (managers and cashiers) sign in with business code + username + password -----
+    const staffForm = (error = '', v = {}) => `<h1>Staff sign in</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+        <form action="/pos/staff/login" method="POST">
+            <div class="field"><label for="c">Business code</label><input id="c" name="code" required maxlength="10" autocapitalize="characters" autocomplete="off" value="${esc(v.code || '')}" placeholder="e.g. K7M2QX"><small>Your manager or the shop owner can give you this code.</small></div>
+            <div class="field"><label for="u">Username</label><input id="u" name="username" required maxlength="40" autocapitalize="none" autocomplete="username" value="${esc(v.username || '')}"></div>
+            <div class="field"><label for="p">Password</label><input id="p" name="password" type="password" required maxlength="100" autocomplete="current-password"></div>
+            <button class="btn" type="submit" style="width:100%">Sign in</button></form></div>
+        <p class="muted">Shop owner? <a href="/login?next=/pos/app">Sign in with your owner account</a>.</p>`;
+    const staffLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false, message: 'Too many sign-in attempts. Please wait a few minutes and try again.' });
+    const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', 10);   // compared when the username is unknown, so timing does not give it away
+    // ----- audit log: append-only (the database refuses UPDATE and DELETE on it) -----
+    async function auditRaw(bizId, shopId, kind, actorId, actorName, action, detail, ip) {
+        try { await q('INSERT INTO pos_audit (business_id, shop_id, actor_kind, actor_id, actor_name, action, detail, ip) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [bizId, shopId || null, kind, actorId || null, String(actorName || '').slice(0, 80), action, String(detail || '').slice(0, 300), String(ip || '').slice(0, 60)]); }
+        catch (e) { console.error('Audit write failed:', e.message); }
+    }
+    const audit = (req, action, detail) => auditRaw(req.biz ? req.biz.id : (req.actor && req.actor.businessId), req.shop ? req.shop.id : null, req.actor ? req.actor.kind : 'system', req.actor ? (req.actor.staffId || (req.session && req.session.user && req.session.user.id)) : null, req.actor ? req.actor.name : '', action, detail, req.ip);
 
-    const isAdmin = req => Boolean(platform && platform.adminEmails && req.session.user.email && platform.adminEmails.includes(String(req.session.user.email).toLowerCase()));
+    // ----- attack throttling kept in the database (survives restarts, shared by every server instance) -----
+    const failLocked = async keys => (await q('SELECT 1 FROM pos_auth_fails WHERE key = ANY($1::text[]) AND locked_until > now() LIMIT 1', [keys])).rowCount > 0;
+    async function failHit(key, max, windowSec, lockSec) {
+        const r = await q(`INSERT INTO pos_auth_fails (key, count, first_at) VALUES ($1, 1, now()) ON CONFLICT (key) DO UPDATE SET
+                count = CASE WHEN pos_auth_fails.first_at < now() - make_interval(secs => $2) THEN 1 ELSE pos_auth_fails.count + 1 END,
+                first_at = CASE WHEN pos_auth_fails.first_at < now() - make_interval(secs => $2) THEN now() ELSE pos_auth_fails.first_at END RETURNING count`, [key, windowSec]);
+        if (r.rows[0].count >= max) await q('UPDATE pos_auth_fails SET locked_until = now() + make_interval(secs => $2) WHERE key = $1', [key, lockSec]);
+    }
+    const failClear = keys => q('DELETE FROM pos_auth_fails WHERE key = ANY($1::text[])', [keys]);
+    const STAFF_IDLE_MS = 30 * 60 * 1000, STAFF_ABS_MS = 12 * 3600 * 1000;   // staff are signed out after 30 idle minutes, and always after 12 hours
 
-    // ----- platform admin (us): see businesses, grant months, suspend -----
-    router.get('/admin', ah(async (req, res) => {
-        if (!isAdmin(req)) return send(req, res, { title: 'Not allowed', body: '<h1>Not allowed</h1>' }, 403);
-        const r = await q(`SELECT b.id, b.name, b.active_until, b.suspended, b.created_at, u.name AS owner, u.email, u.phone, (SELECT count(*) FROM pos_shops s WHERE s.business_id=b.id)::int branches, (SELECT count(*) FROM pos_members m WHERE m.business_id=b.id AND m.role='cashier')::int cashiers FROM pos_businesses b JOIN users u ON u.id=b.owner_id ORDER BY b.created_at DESC LIMIT 500`);
-        send(req, res, { title: 'All businesses', nav: 'admin', body: `<h1>All POS businesses</h1>${notice(req)}${errBox(req)}<div class="panel tablewrap"><table><tr><th>Business</th><th>Owner</th><th>Branches / cashiers</th><th>Paid until</th><th></th></tr>${r.rows.map(b => { const live = b.active_until && new Date(b.active_until) > new Date(); return `<tr><td>${esc(b.name)}${b.suspended ? ' <span class="tag bad">suspended</span>' : ''}</td><td>${esc(b.owner)}<br><small class="muted">${esc(b.email)} ${esc(b.phone)}</small></td><td>${b.branches} / ${b.cashiers}</td><td>${b.active_until ? esc(dateFmt(b.active_until)) : '-'} <span class="tag ${live ? 'ok' : 'warn'}">${live ? 'active' : 'not active'}</span></td><td class="right nowrap"><form action="/pos/admin/${b.id}/grant" method="POST" style="display:inline"><select name="months" style="width:auto;display:inline-block"><option>1</option><option>3</option><option>6</option><option>12</option></select> <button class="btn small ok" type="submit">Add months</button></form> <form action="/pos/admin/${b.id}/suspend" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${b.suspended ? 'Unsuspend' : 'Suspend'}</button></form></td></tr>`; }).join('') || '<tr><td colspan="5" class="muted">No businesses yet.</td></tr>'}</table><p class="muted">Use "Add months" when a customer pays you by cash or another route.</p></div>` });
+    router.get('/staff/login', requireDb, (req, res) => {
+        if (req.session && req.session.posStaff) return res.redirect('/pos/app');
+        send(req, res, { title: 'Staff sign in', bare: true, body: staffForm(req.query.expired ? 'You were signed out to keep the shop safe. Please sign in again.' : '') });
+    });
+    router.post('/staff/login', staffLimiter, requireDb, ah(async (req, res) => {
+        const code = str(req.body.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10), username = str(req.body.username).slice(0, 40), password = String(req.body.password || '').slice(0, 100);
+        const fail = (m, status = 401) => send(req, res, { title: 'Staff sign in', bare: true, body: staffForm(m, { code, username }) }, status);
+        const GENERIC = 'The business code, username or password is not right.';
+        const ip = String(req.ip || '').slice(0, 60), uname = username.toLowerCase();
+        // three separate counters: this network, this account from this network, and this account from anywhere.
+        // So a stranger who guesses a cashier's username locks only their own network out, not the cashier.
+        const kIp = 'ip:' + ip, kPair = `u:${code}:${uname}:${ip}`, kAcct = `u:${code}:${uname}`;
+        if (await failLocked([kIp, kPair, kAcct])) return fail('Too many attempts. Please wait 15 minutes and try again.', 429);
+        const row = code && username ? (await q('SELECT s.* FROM pos_staff s JOIN pos_shops b ON b.id = s.business_id WHERE b.code = $1 AND lower(s.username) = lower($2)', [code, username])).rows[0] : null;
+        const ok = await bcrypt.compare(password, row ? row.password_hash : DUMMY_HASH);
+        if (!row || !row.active || !ok) {
+            await Promise.all([failHit(kIp, 30, 900, 900), failHit(kPair, 5, 900, 900), failHit(kAcct, 40, 3600, 900)]);
+            if (row) await auditRaw(row.business_id, row.shop_id, 'staff', row.id, row.name, 'staff.login_failed', '', ip);
+            return fail(GENERIC);
+        }
+        await failClear([kPair, kAcct]);
+        await q('UPDATE pos_staff SET last_login = now() WHERE id = $1', [row.id]);
+        await regen(req);
+        req.session.cookie.maxAge = STAFF_ABS_MS;   // the browser cookie also expires after 12 hours
+        req.session.posStaff = { id: row.id, ver: row.session_ver, at: Date.now(), last: Date.now() };
+        await saveSess(req);
+        await auditRaw(row.business_id, row.shop_id, 'staff', row.id, row.name, 'staff.login', '', ip);
+        res.redirect('/pos/app');
     }));
-    router.post('/admin/:id/grant', ah(async (req, res) => {
-        if (!isAdmin(req)) return res.sendStatus(403);
-        const id = parseCount(req.params.id, { min: 1 }), months = parseCount(req.body.months, { min: 1, max: 24 });
-        if (id && months) await q(`UPDATE pos_businesses SET active_until = GREATEST(COALESCE(active_until, now()), now()) + ($2 || ' months')::interval WHERE id=$1`, [id, String(months)]);
-        back(res, '/pos/admin', 'Months added.');
-    }));
-    router.post('/admin/:id/suspend', ah(async (req, res) => {
-        if (!isAdmin(req)) return res.sendStatus(403);
-        const id = parseCount(req.params.id, { min: 1 });
-        if (id) await q('UPDATE pos_businesses SET suspended = NOT suspended WHERE id=$1', [id]);
-        back(res, '/pos/admin', 'Updated.');
+    router.post('/staff/logout', (req, res) => {
+        const done = () => res.redirect('/pos/staff/login');
+        if (req.session) req.session.destroy(done); else done();
+    });
+    // where the installed app opens
+    router.get('/start', (req, res) => res.redirect(req.session && (req.session.posStaff || req.session.user) ? '/pos/app' : '/pos/staff/login'));
+
+    // ----- everything below needs a signed-in owner (confirmed email) or a staff member -----
+    router.use(requireDb);
+    const isApi = req => req.path.startsWith('/api/');
+    const OTP_VALID_MS = 12 * 3600 * 1000, STEP_VALID_MS = 10 * 60 * 1000;
+    router.use(ah(async (req, res, next) => {
+        const st = req.session && req.session.posStaff;
+        if (st) {
+            const now = Date.now();
+            const stale = () => { delete req.session.posStaff; return isApi(req) ? res.status(401).json({ error: 'Please sign in again.' }) : res.redirect('/pos/staff/login?expired=1'); };
+            if (!st.at || now - st.at > STAFF_ABS_MS || now - (st.last || st.at) > STAFF_IDLE_MS) return stale();
+            const r = (await q('SELECT id, role, name, username, business_id, shop_id, session_ver FROM pos_staff WHERE id = $1 AND active', [st.id])).rows[0];
+            if (!r || r.session_ver !== st.ver) return stale();   // switched off, deleted, or password changed: every old session ends
+            if (now - (st.last || 0) > 60000) st.last = now;
+            req.actor = { kind: 'staff', role: r.role, staffId: r.id, name: r.name, username: r.username, businessId: r.business_id, shopId: r.shop_id };
+            return next();
+        }
+        requireAuth(req, res, () => requireVerified(req, res, () => {
+            req.actor = { kind: 'owner', role: 'owner', name: req.session.user.name || 'Owner' };
+            ownerGate(req, res, next).catch(next);
+        }));
     }));
 
-    // ----- first-time setup: create the business and its first branch -----
-    const memberOf = async uid => (await q('SELECT 1 FROM pos_members WHERE user_id=$1', [uid])).rowCount > 0;
+    // ----- owners can turn on a two-step code (authenticator app); once on, every POS visit needs it -----
+    async function ownerGate(req, res, next) {
+        const sec = (await q('SELECT enabled FROM pos_owner_security WHERE user_id = $1', [req.session.user.id])).rows[0];
+        req.has2fa = Boolean(sec && sec.enabled);
+        if (!req.has2fa || (req.session.pos2faAt && Date.now() - req.session.pos2faAt < OTP_VALID_MS) || /^\/2fa(\/|$)/.test(req.path)) return next();
+        if (isApi(req)) return res.status(401).json({ error: 'Your two-step code is needed. Reload the page.' });
+        return res.redirect('/pos/2fa');
+    }
+    // checks a code from the authenticator app (or a one-time recovery code). Five wrong tries lock it for 15 minutes.
+    async function verifyOwnerOtp(req, input) {
+        const uid = req.session.user.id, kUser = '2fa:' + uid, kIp = '2fa-ip:' + String(req.ip || '');
+        if (await failLocked([kUser, kIp])) return { ok: false, locked: true };
+        const row = (await q('SELECT secret, last_counter, recovery, enabled FROM pos_owner_security WHERE user_id = $1', [uid])).rows[0];
+        let ok = false;
+        const code = String(input || '').trim();
+        if (row && row.enabled && vault.enabled) {
+            if (/^\d{3}\s?\d{3}$/.test(code)) {
+                const counter = SEC.checkTotp(vault.open(row.secret, '2fa:' + uid).s, code, row.last_counter);
+                if (counter) ok = (await q('UPDATE pos_owner_security SET last_counter = $2 WHERE user_id = $1 AND last_counter < $2 RETURNING 1', [uid, counter])).rowCount > 0;   // a code works once
+            } else if (code.length >= 10) {
+                const h = SEC.hashRecovery(code), list = Array.isArray(row.recovery) ? row.recovery : [];
+                if (list.includes(h)) ok = (await q('UPDATE pos_owner_security SET recovery = $2::jsonb WHERE user_id = $1 AND recovery = $3::jsonb RETURNING 1', [uid, JSON.stringify(list.filter(x => x !== h)), JSON.stringify(list)])).rowCount > 0;
+            }
+        }
+        if (!ok) { await Promise.all([failHit(kUser, 5, 900, 900), failHit(kIp, 20, 900, 900)]); await audit(req, '2fa.failed', ''); return { ok: false }; }
+        await failClear([kUser]);
+        req.session.posStepAt = Date.now();
+        return { ok: true };
+    }
+    const otpForm = (error = '') => `<h1>Two-step check</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}<form action="/pos/2fa" method="POST">
+        <div class="field"><label for="o">6-digit code from your authenticator app</label><input id="o" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" autofocus><small>Lost your phone? Type one of your recovery codes instead.</small></div>
+        <button class="btn" type="submit" style="width:100%">Continue</button></form></div>`;
+    router.get('/2fa', (req, res) => {
+        if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
+        send(req, res, { title: 'Two-step check', bare: true, body: otpForm() });
+    });
+    router.post('/2fa', ah(async (req, res) => {
+        if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
+        const r = await verifyOwnerOtp(req, req.body.otp);
+        if (!r.ok) return send(req, res, { title: 'Two-step check', bare: true, body: otpForm(r.locked ? 'Too many wrong codes. Please wait 15 minutes.' : 'That code is not right. Try the newest code.') }, r.locked ? 429 : 401);
+        req.session.pos2faAt = Date.now();
+        await saveSess(req);
+        res.redirect('/pos/app');
+    }));
+
+    async function loadShop(req) {   // the owner's head office
+        const r = await q('SELECT * FROM pos_shops WHERE owner_id = $1 AND parent_id IS NULL', [req.session.user.id]);
+        return r.rows[0] || null;
+    }
+
     const setupForm = (req, error = '', v = {}) => `
         <h1>Set up your business</h1>
         <div class="panel" style="max-width:560px;">
             ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
-            <p class="muted">This creates your business account and your first branch. You can add more branches and cashiers afterwards. The POS switches on once the monthly subscription (KES ${subFee().toLocaleString('en-KE')} for the main shop, KES ${branchFee().toLocaleString('en-KE')} for each extra branch) is paid.</p>
             <form action="/pos/setup" method="POST">
-                <div class="field"><label for="n">Business name</label><input id="n" name="name" required maxlength="120" value="${esc(v.name || '')}" placeholder="e.g. Mama Achieng Stores"><small>This is the name printed on your receipts.</small></div>
-                <div class="field"><label for="p">Phone</label><input id="p" name="phone" maxlength="40" value="${esc(v.phone || req.session.user.phone || '')}"></div>
-                <div class="field"><label for="a">Address / location of your first branch</label><input id="a" name="address" maxlength="200" value="${esc(v.address || '')}" placeholder="e.g. Rangwe Market"></div>
-                <button class="btn" type="submit">Create my business</button>
+                <div class="field"><label for="n">Business name</label><input id="n" name="name" required maxlength="120" value="${esc(v.name || '')}" placeholder="e.g. Mama Achieng Shop"></div>
+                <div class="field"><label for="p">Business phone</label><input id="p" name="phone" maxlength="40" value="${esc(v.phone || req.session.user.phone || '')}"></div>
+                <div class="field"><label for="a">Address / location</label><input id="a" name="address" maxlength="200" value="${esc(v.address || '')}" placeholder="e.g. Rangwe Market"></div>
+                <button class="btn" type="submit">Create my business account</button>
             </form>
         </div>`;
     router.get('/setup', ah(async (req, res) => {
-        if (await memberOf(req.session.user.id)) return res.redirect('/pos/app');
+        if (req.actor.kind === 'staff' || await loadShop(req)) return res.redirect('/pos/app');
         send(req, res, { title: 'Set up your business', body: setupForm(req) });
     }));
     router.post('/setup', ah(async (req, res) => {
-        if (await memberOf(req.session.user.id)) return res.redirect('/pos/app');
+        if (req.actor.kind === 'staff' || await loadShop(req)) return res.redirect('/pos/app');
         const v = { name: str(req.body.name).slice(0, 120), phone: str(req.body.phone).slice(0, 40), address: str(req.body.address).slice(0, 200) };
         if (v.name.length < 2) return send(req, res, { title: 'Set up your business', body: setupForm(req, 'Please enter your business name.', v) }, 400);
-        const client = await pool().connect();
-        try {
-            await client.query('BEGIN');
-            const b = (await client.query('INSERT INTO pos_businesses (owner_id, name, cb_token) VALUES ($1,$2,$3) RETURNING id', [req.session.user.id, v.name, crypto.randomBytes(24).toString('hex')])).rows[0];
-            await client.query('INSERT INTO pos_shops (business_id, name, phone, address) VALUES ($1,$2,$3,$4)', [b.id, 'Main Branch', v.phone, v.address]);
-            await client.query(`INSERT INTO pos_members (user_id, business_id, branch_id, role) VALUES ($1,$2,NULL,'owner')`, [req.session.user.id, b.id]);
-            await client.query('COMMIT');
-        } catch (err) { await client.query('ROLLBACK').catch(() => {}); if (err.code !== '23505') throw err; } finally { client.release(); }
-        res.redirect('/pos/subscribe');
+        const ins = await q('INSERT INTO pos_shops (owner_id, name, phone, address) VALUES ($1, $2, $3, $4) ON CONFLICT (owner_id) WHERE parent_id IS NULL DO NOTHING RETURNING id', [req.session.user.id, v.name, v.phone, v.address]);
+        if (ins.rows[0]) await assignCode(pool(), ins.rows[0].id);
+        res.redirect('/pos/app');
     }));
 
-    // ----- who is this, which business and branch, is it paid up, and are they allowed on this page -----
-    router.use(ah(async (req, res, next) => {
-        const me = (await q(`SELECT m.role, m.branch_id, m.active AS member_active, b.id AS business_id, b.name AS business_name, b.tax_pin, b.receipt_footer, b.vat_rate, b.logo_ver, (b.logo IS NOT NULL) AS has_logo, b.active_until, b.suspended, (b.mpesa_enc IS NOT NULL) AS has_mpesa FROM pos_members m JOIN pos_businesses b ON b.id = m.business_id WHERE m.user_id = $1`, [req.session.user.id])).rows[0];
-        if (!me) return res.redirect('/pos/setup');
-        req.role = me.role;
-        req.business = { id: me.business_id, name: me.business_name, active_until: me.active_until, has_mpesa: me.has_mpesa };
-        const blocked = (title, msg) => send(req, res, { title, body: `<h1>${esc(title)}</h1><div class="panel"><p>${msg}</p></div>` }, 403);
-        if (!me.member_active) return blocked('Your login is switched off', 'Please ask the business owner to switch your account back on.');
-        if (me.suspended) return blocked('Account paused', 'This POS account is paused. Please contact Tencent Innovations on 0740 311 014.');
-        const branches = me.role === 'owner'
-            ? (await q('SELECT * FROM pos_shops WHERE business_id=$1 AND active ORDER BY id', [me.business_id])).rows
-            : (await q('SELECT * FROM pos_shops WHERE id=$1 AND business_id=$2 AND active', [me.branch_id, me.business_id])).rows;
-        if (!branches.length) return blocked('Branch not available', 'Your branch is switched off. Please contact the business owner.');
-        req.branches = branches;
-        const branch = (me.role === 'owner' && branches.find(b => b.id === req.session.posBranch)) || branches[0];
-        req.me = { id: req.session.user.id, name: req.session.user.name };
-        req.shop = { id: branch.id, business_id: me.business_id, name: me.business_name, branch: branch.name, phone: branch.phone, address: branch.address, tax_pin: me.tax_pin, receipt_footer: me.receipt_footer, vat_rate: Number(me.vat_rate), has_logo: me.has_logo, logo_ver: me.logo_ver };
+    // ----- who may open what -----
+    const CASHIER_PAGES = [['GET', /^\/(app|terminal|sales|account|install|api\/items)$/], ['GET', /^\/sales\/\d+\/receipt$/], ['GET', /^\/api\/pay\/[a-f0-9]{24}$/], ['POST', /^\/(api\/sales|api\/pay\/start|account\/password)$/]];
+    const OWNER_ONLY = /^\/(branches|gateways|subscribe|settings|voids|audit|security|payments|2fa)(\/|$)/;
+    function roleAllows(role, method, p) {
+        if (role === 'owner') return true;
+        if (OWNER_ONLY.test(p)) return false;
+        if (role === 'manager') return true;
+        return CASHIER_PAGES.some(([m, re]) => m === method && re.test(p));
+    }
+    const deny = (req, res) => isApi(req) ? res.status(403).json({ error: 'Your account does not have access to that.' })
+        : send(req, res, { title: 'Not allowed', body: '<h1>Not allowed</h1><div class="panel"><p>Your account does not have access to this page.</p><a class="btn" href="/pos/start">Go back</a></div>' }, 403);
 
-        // subscription gate: until it is paid, only the payment page opens
-        const live = me.active_until && new Date(me.active_until) > new Date();
-        const p = req.path;
-        if (!live && !/^\/(subscribe|install|logo)(\/|$)/.test(p)) {
-            if (me.role === 'owner') return res.redirect('/pos/subscribe');
-            return blocked('Subscription ended', 'This business\'s POS subscription has ended. Please ask the owner to renew it.');
+    // every route after this has req.actor, req.biz (the business) and req.shop (the shop or branch being worked on)
+    router.use(ah(async (req, res, next) => {
+        const a = req.actor;
+        let biz, shop;
+        if (a.kind === 'owner') {
+            biz = await loadShop(req);
+            if (!biz) return res.redirect('/pos/setup');
+            req.branches = (await q('SELECT id, name, active FROM pos_shops WHERE id = $1 OR parent_id = $1 ORDER BY (parent_id IS NULL) DESC, name', [biz.id])).rows;
+            const want = Number(req.session.posShopId), pick = req.branches.find(b => b.id === want && b.active) || req.branches[0];
+            shop = pick.id === biz.id ? biz : (await q('SELECT * FROM pos_shops WHERE id = $1', [pick.id])).rows[0];
+        } else {
+            shop = (await q('SELECT * FROM pos_shops WHERE id = $1', [a.shopId])).rows[0];
+            biz = shop && shop.parent_id ? (await q('SELECT * FROM pos_shops WHERE id = $1', [shop.parent_id])).rows[0] : shop;
+            if (!shop || !biz || biz.id !== a.businessId) { delete req.session.posStaff; return res.redirect('/pos/staff/login'); }
         }
-        // what each role may open
-        if (me.role === 'cashier') {
-            const ok = /^\/(terminal|drawer|drawer\/(open|move|close)|sales|api\/items|api\/sales|api\/mpesa\/push|api\/mpesa\/status\/[A-Za-z0-9]+|logo|install)$/.test(p) || /^\/sales\/\d+\/receipt$/.test(p);
-            if (p === '/app') return res.redirect('/pos/terminal');
-            if (!ok) return blocked('Not allowed', 'Cashiers can use the POS Terminal, their own sales and the cash drawer. Please ask a manager.');
-        } else if (me.role === 'manager' && /^\/(business|branches|payments|subscribe|business-report|branch\/switch)/.test(p)) {
-            return blocked('Not allowed', 'Only the business owner can open this page.');
+        req.biz = biz; req.shop = shop;
+        if (!biz.active) return send(req, res, { title: 'Account paused', body: '<h1>Your POS account is paused</h1><div class="panel"><p>Please contact Tencent Innovations on 0740 311 014 to reactivate it.</p></div>' }, 403);
+        if (!shop.active) return send(req, res, { title: 'Branch paused', body: '<h1>This branch is paused</h1><div class="panel"><p>Please ask the business owner to switch it back on.</p></div>' }, 403);
+        if (!roleAllows(a.role, req.method, req.path)) return deny(req, res);
+        if (a.role === 'cashier' && req.path === '/app') return res.redirect('/pos/terminal');
+        req.subActive = Boolean(biz.sub_until && new Date(biz.sub_until) > new Date());
+        if (!req.subActive && !(a.role === 'owner' && /^\/subscribe(\/|$)/.test(req.path))) {
+            if (isApi(req)) return res.status(402).json({ error: 'The POS subscription has ended. The owner must renew it.' });
+            if (a.role === 'owner') return res.redirect('/pos/subscribe');
+            return send(req, res, { title: 'Subscription ended', body: '<h1>The POS subscription has ended</h1><div class="panel"><p>Please ask the business owner to renew it. Your sales are safe and will be here when it is back on.</p></div>' }, 402);
         }
-        if (me.role !== 'cashier') await runRecurring(branch.id).catch(e => console.error('Recurring expenses failed:', e.message));
+        if (a.role === 'owner' && req.method === 'GET' && !isApi(req)) req.pendingVoids = Number((await q(`SELECT count(*) n FROM pos_void_requests v JOIN pos_shops x ON x.id = v.shop_id WHERE v.status = 'pending' AND (x.id = $1 OR x.parent_id = $1)`, [biz.id])).rows[0].n);
+        if (req.subActive) await runRecurring(shop.id).catch(e => console.error('Recurring expenses failed:', e.message));
         next();
     }));
 
@@ -574,7 +651,7 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
             WHERE i.shop_id=$1 ${showAll ? '' : 'AND i.active'} AND ($2 = '' OR i.name ILIKE '%' || $2 || '%' OR i.barcode = $2) ORDER BY i.name LIMIT 500`, [req.shop.id, search.replace(/[%_\\]/g, ' ')]);
         const body = `<h1>Items</h1>${notice(req)}
         <div class="panel"><form method="GET" class="row"><div><label for="q">Search name or barcode</label><input id="q" name="q" value="${esc(search)}"></div><div style="flex:0 0 auto"><label><input type="checkbox" name="all" value="1" ${showAll ? 'checked' : ''} style="width:auto"> Show archived</label></div><button class="btn dark" type="submit">Search</button><a class="btn" href="/pos/items/new">Add item</a></form></div>
-        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Item</th><th>Category</th><th>Barcode</th><th class="num">Price (before VAT)</th><th class="num">Cost</th><th class="num">Stock</th><th></th></tr>${r.rows.map(i => `<tr><td>${esc(i.name)}${i.active ? '' : ' <span class="tag gray">archived</span>'}</td><td>${esc(i.cat || '')}</td><td>${esc(i.barcode || '')}</td><td class="num">${fmt(i.price_cents)}</td><td class="num">${fmt(i.cost_cents)}</td><td class="num">${i.track_stock ? `<span class="tag ${i.stock <= 0 ? 'bad' : i.stock <= i.reorder_level ? 'warn' : 'ok'}">${i.stock}</span>` : '<span class="muted">not tracked</span>'}</td><td class="right nowrap"><a class="btn small ghost" href="/pos/items/${i.id}/edit">Edit</a></td></tr>`).join('')}</table>` : '<p class="muted">No items found. <a href="/pos/items/new">Add your first item</a>.</p>'}</div>`;
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Item</th><th>Category</th><th>Barcode</th><th class="num">Price</th><th class="num">Cost</th><th class="num">Stock</th><th></th></tr>${r.rows.map(i => `<tr><td>${esc(i.name)}${i.active ? '' : ' <span class="tag gray">archived</span>'}</td><td>${esc(i.cat || '')}</td><td>${esc(i.barcode || '')}</td><td class="num">${fmt(i.price_cents)}</td><td class="num">${fmt(i.cost_cents)}</td><td class="num">${i.track_stock ? `<span class="tag ${i.stock <= 0 ? 'bad' : i.stock <= i.reorder_level ? 'warn' : 'ok'}">${i.stock}</span>` : '<span class="muted">not tracked</span>'}</td><td class="right nowrap"><a class="btn small ghost" href="/pos/items/${i.id}/edit">Edit</a></td></tr>`).join('')}</table>` : '<p class="muted">No items found. <a href="/pos/items/new">Add your first item</a>.</p>'}</div>`;
         send(req, res, { title: 'Items', nav: 'items', body });
     }));
 
@@ -589,7 +666,7 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
             <div class="grid2">
                 <div class="field"><label for="n">Item name</label><input id="n" name="name" required maxlength="120" value="${esc(item.name || '')}"></div>
                 <div class="field"><label for="c">Category</label><select id="c" name="category_id"><option value="">No category</option>${cats.map(c => `<option value="${c.id}" ${String(item.category_id) === String(c.id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select><small><a href="/pos/categories">Manage categories</a></small></div>
-                <div class="field"><label for="p">Selling price before VAT (KES)</label><input id="p" name="price" required inputmode="decimal" value="${esc(priceVal)}" placeholder="e.g. 150"></div>
+                <div class="field"><label for="p">Selling price (KES, includes ${VAT_RATE}% VAT)</label><input id="p" name="price" required inputmode="decimal" value="${esc(priceVal)}" placeholder="e.g. 150"></div>
                 <div class="field"><label for="k">Buying cost (KES)</label><input id="k" name="cost" inputmode="decimal" value="${esc(costVal)}" placeholder="e.g. 100"><small>Used to work out your profit.</small></div>
                 <div class="field"><label for="b">Barcode (optional)</label><input id="b" name="barcode" maxlength="60" value="${esc(item.barcode || '')}"><small>Scan it here, or leave blank.</small></div>
                 ${isNew ? `<div class="field"><label for="s">Opening stock</label><input id="s" name="stock" inputmode="numeric" value="${esc(item._stock != null ? item._stock : '0')}"></div>` : ''}
@@ -695,6 +772,7 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
             await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note) VALUES ($1,$2,$3,$4,$5,$6)`, [req.shop.id, it.id, change, balance, type === 'in' ? 'stock_in' : type === 'out' ? 'stock_out' : 'adjust', note]);
             await client.query('COMMIT');
         } catch (err) { await client.query('ROLLBACK').catch(() => {}); throw err; } finally { client.release(); }
+        await audit(req, 'stock.' + type, `item #${itemId} qty ${qty}${note ? ': ' + note : ''}`);
         res.redirect('/pos/stock?ok=' + encodeURIComponent('Stock updated.'));
     }));
     router.get('/stock/history', ah(async (req, res) => {
@@ -707,215 +785,16 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
         send(req, res, { title: 'Low Stock Alerts', nav: 'low', body: `<h1>Low Stock Alerts</h1><div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Item</th><th class="num">In stock</th><th class="num">Warning level</th><th></th></tr>${r.rows.map(i => `<tr><td>${esc(i.name)}</td><td class="num"><span class="tag ${i.stock <= 0 ? 'bad' : 'warn'}">${i.stock}</span></td><td class="num">${i.reorder_level}</td><td class="right"><a class="btn small" href="/pos/stock">Add stock</a></td></tr>`).join('')}</table>` : '<p class="muted">All good. Nothing is at or below its warning level.</p>'}</div>` });
     }));
 
-    // ----- payments: sale creation shared by cash/code/STK -----
-    const saleLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 1200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests. Please wait a moment.' } });
-    const payMethods = async bizId => (await q('SELECT id, name, needs_ref FROM pos_pay_methods WHERE business_id=$1 ORDER BY name', [bizId])).rows;
-
-    // shop = { id, name, vat_rate }; want = Map(itemId -> qty). Prices always come from the database.
-    async function createSale({ shop, user, want, discountIn, label, tendered, ref, phone, prepaid }) {
-        const client = await pool().connect();
-        try {
-            await client.query('BEGIN');
-            const ids = [...want.keys()];
-            const found = (await client.query('SELECT id, name, price_cents, cost_cents, stock, track_stock FROM pos_items WHERE shop_id=$1 AND active AND id = ANY($2::int[]) ORDER BY id FOR UPDATE', [shop.id, ids])).rows;
-            if (found.length !== ids.length) { await client.query('ROLLBACK'); return { error: 'An item in the cart is no longer available. Refresh and try again.', code: 409 }; }
-            let subtotal = 0;
-            for (const it of found) {
-                const qty = want.get(it.id);
-                if (it.track_stock && it.stock < qty) { await client.query('ROLLBACK'); return { error: `Not enough stock for "${it.name}": ${it.stock} left.`, code: 409 }; }
-                subtotal += Number(it.price_cents) * qty;
-            }
-            const discount = Math.min(discountIn, subtotal), net = subtotal - discount;
-            const rate = Number(shop.vat_rate) || 0, vat = vatOf(net, rate), total = net + vat;
-            let paid = total, change = 0;
-            if (label === 'cash') {
-                if (tendered === null || tendered < total) { await client.query('ROLLBACK'); return { error: 'The cash received is less than the total.', code: 400 }; }
-                paid = tendered; change = tendered - total;
-            }
-            const no = (await client.query('UPDATE pos_shops SET next_receipt = next_receipt + 1 WHERE id=$1 RETURNING next_receipt - 1 AS no', [shop.id])).rows[0].no;
-            const sale = (await client.query(`INSERT INTO pos_sales (shop_id, receipt_no, subtotal_cents, discount_cents, total_cents, paid_cents, change_cents, method, mpesa_ref, customer_phone, vat_cents, vat_rate, user_id, user_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-                [shop.id, no, subtotal, discount, total, paid, change, label, ref || null, phone || '', vat, rate, user.id, String(user.name || '').slice(0, 80)])).rows[0];
-            for (const it of found) {
-                const qty = want.get(it.id);
-                await client.query('INSERT INTO pos_sale_items (sale_id, item_id, name, qty, unit_price_cents, unit_cost_cents) VALUES ($1,$2,$3,$4,$5,$6)', [sale.id, it.id, it.name, qty, it.price_cents, it.cost_cents]);
-                if (it.track_stock) {
-                    const nb = it.stock - qty;
-                    await client.query('UPDATE pos_items SET stock=$2 WHERE id=$1', [it.id, nb]);
-                    await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note, sale_id) VALUES ($1,$2,$3,$4,'sale',$5,$6)`, [shop.id, it.id, -qty, nb, 'Receipt #' + no, sale.id]);
-                }
-            }
-            await client.query('COMMIT');
-            let whatsapp = '';
-            if (phone) whatsapp = `https://wa.me/${phone}?text=${encodeURIComponent(`Thank you for shopping at ${shop.name}. Receipt #${no}: KES ${fmt(total)} paid by ${methodLabel(label)}.`)}`;
-            return { ok: true, saleId: sale.id, receiptNo: no, total, change, receiptUrl: `/pos/sales/${sale.id}/receipt`, whatsapp };
-        } catch (err) { await client.query('ROLLBACK').catch(() => {}); throw err; } finally { client.release(); }
-    }
-    function readCart(b) {
-        if (!Array.isArray(b.lines) || !b.lines.length || b.lines.length > 100) return { error: 'The sale has no items.' };
-        const want = new Map();
-        for (const l of b.lines) {
-            const id = parseCount(l && l.id, { min: 1 }), qty = parseCount(l && l.qty, { min: 1, max: 100000 });
-            if (!id || !qty) return { error: 'One of the items is not valid.' };
-            want.set(id, (want.get(id) || 0) + qty);
-        }
-        const discountIn = String(b.discount || '').trim() === '' ? 0 : parseMoney(b.discount);
-        if (discountIn === null) return { error: 'The discount must be a number.' };
-        return { want, discountIn };
-    }
-    const cleanPhone = raw => { const p = platform.normalizePhone(String(raw || '')); return p || ''; };
-
-    router.post('/api/sales', saleLimiter, ah(async (req, res) => {
-        const bad = (m, code = 400) => res.status(code).json({ error: m });
-        const b = req.body || {};
-        const cart = readCart(b);
-        if (cart.error) return bad(cart.error);
-        const key = String(b.method || ''), ref = String(b.ref || b.mpesaRef || '').trim();
-        let label = '', refOut = '';
-        if (key === 'cash') label = 'cash';
-        else if (key === 'mpesa') {
-            if (!/^[A-Za-z0-9]{8,14}$/.test(ref)) return bad('Enter the M-Pesa code from the customer\'s SMS.');
-            label = 'mpesa'; refOut = ref.toUpperCase();
-        } else if (/^m:\d+$/.test(key)) {
-            const m = (await q('SELECT name, needs_ref FROM pos_pay_methods WHERE id=$1 AND business_id=$2', [Number(key.slice(2)), req.shop.business_id])).rows[0];
-            if (!m) return bad('That payment method is not available.');
-            if (m.needs_ref && !/^[A-Za-z0-9 _.\/-]{3,30}$/.test(ref)) return bad(`Enter the ${m.name} reference or transaction number.`);
-            label = m.name; refOut = m.needs_ref ? ref : '';
-        } else return bad('Choose how the customer is paying.');
-        const phoneRaw = String(b.customerPhone || '').trim();
-        const phone = phoneRaw ? cleanPhone(phoneRaw) : '';
-        if (phoneRaw && !phone) return bad('The customer phone number is not valid.');
-        const tendered = label === 'cash' ? (String(b.tendered || '').trim() === '' ? null : parseMoney(b.tendered)) : null;
-        const r = await createSale({ shop: req.shop, user: req.me, want: cart.want, discountIn: cart.discountIn, label, tendered, ref: refOut, phone });
-        if (r.error) return bad(r.error, r.code);
-        res.json(r);
-    }));
-
-    // ----- M-Pesa STK push with the business's own credentials -----
-    async function mpesaCreds(bizId) {
-        const r = (await q('SELECT mpesa_enc, mpesa_type, cb_token FROM pos_businesses WHERE id=$1', [bizId])).rows[0];
-        if (!r || !r.mpesa_enc) return null;
-        const c = decrypt(r.mpesa_enc);
-        return c ? { ...c, type: r.mpesa_type || 'paybill', cbToken: r.cb_token } : null;
-    }
-    const tokenCache = new Map();
-    async function darajaToken(bizId, c, fresh) {
-        const hit = tokenCache.get(bizId);
-        if (!fresh && hit && hit.exp > Date.now()) return hit.value;
-        const resp = await fetch(`${platform.darajaBase}/oauth/v1/generate?grant_type=client_credentials`, { headers: { Authorization: 'Basic ' + Buffer.from(`${c.key}:${c.secret}`).toString('base64') }, signal: AbortSignal.timeout(15000) });
-        if (!resp.ok) throw new Error(`Safaricom rejected the consumer key/secret (HTTP ${resp.status}). Check them in Payment Methods.`);
-        const d = await resp.json();
-        tokenCache.set(bizId, { value: d.access_token, exp: Date.now() + (Number(d.expires_in || 3599) - 60) * 1000 });
-        return d.access_token;
-    }
-    async function darajaCall(bizId, c, apiPath, payload) {
-        const go = async fresh => fetch(`${platform.darajaBase}${apiPath}`, { method: 'POST', headers: { Authorization: 'Bearer ' + await darajaToken(bizId, c, fresh), 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
-        let resp = await go(false);
-        if (resp.status === 401) resp = await go(true);
-        let d = {}; try { d = await resp.json(); } catch (_) { /* not JSON */ }
-        if (!resp.ok) throw new Error(d.errorMessage || d.ResultDesc || `Safaricom error (HTTP ${resp.status})`);
-        return d;
-    }
-    const darajaStamp = () => new Date(Date.now() + 3 * 3600 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
-    async function stkQueryFor(bizId, c, checkoutId) {
-        const ts = darajaStamp();
-        return darajaCall(bizId, c, '/mpesa/stkpushquery/v1/query', { BusinessShortCode: c.shortcode, Password: Buffer.from(c.shortcode + c.passkey + ts).toString('base64'), Timestamp: ts, CheckoutRequestID: checkoutId });
-    }
-
-    router.post('/api/mpesa/push', saleLimiter, ah(async (req, res) => {
-        const bad = (m, code = 400) => res.status(code).json({ error: m });
-        const b = req.body || {};
-        const c = await mpesaCreds(req.shop.business_id);
-        if (!c) return bad('M-Pesa STK push is not set up for this business yet. The owner can add it under Payment Methods.');
-        if (!String(platform.publicBaseUrl || '').startsWith('https://')) return bad('The website address (PUBLIC_BASE_URL) is not set, so M-Pesa cannot call back.');
-        const cart = readCart(b);
-        if (cart.error) return bad(cart.error);
-        const phone = platform.normalizePhone(String(b.phone || ''));
-        if (!phone) return bad('Enter the customer\'s M-Pesa number, for example 0712345678.');
-        const found = (await q('SELECT id, name, price_cents, stock, track_stock FROM pos_items WHERE shop_id=$1 AND active AND id = ANY($2::int[])', [req.shop.id, [...cart.want.keys()]])).rows;
-        if (found.length !== cart.want.size) return bad('An item in the cart is no longer available. Refresh and try again.', 409);
-        let subtotal = 0;
-        for (const it of found) {
-            const qty = cart.want.get(it.id);
-            if (it.track_stock && it.stock < qty) return bad(`Not enough stock for "${it.name}": ${it.stock} left.`, 409);
-            subtotal += Number(it.price_cents) * qty;
-        }
-        const net = subtotal - Math.min(cart.discountIn, subtotal), total = net + vatOf(net, req.shop.vat_rate);
-        if (total < 100 || total % 100 !== 0) return bad(`M-Pesa takes whole shillings only. The total is KES ${fmt(total)}: use the Discount box to round it.`);
-        const id = crypto.randomBytes(16).toString('hex');
-        await q('INSERT INTO pos_mpesa_requests (id, shop_id, user_id, user_name, lines, discount_cents, total_cents, phone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-            [id, req.shop.id, req.me.id, String(req.me.name || '').slice(0, 80), JSON.stringify([...cart.want].map(([i, n]) => ({ id: i, qty: n }))), Math.min(cart.discountIn, subtotal), total, phone]);
-        try {
-            const ts = darajaStamp();
-            const d = await darajaCall(req.shop.business_id, c, '/mpesa/stkpush/v1/processrequest', {
-                BusinessShortCode: c.shortcode, Password: Buffer.from(c.shortcode + c.passkey + ts).toString('base64'), Timestamp: ts,
-                TransactionType: c.type === 'till' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
-                Amount: total / 100, PartyA: phone, PartyB: c.till || c.shortcode, PhoneNumber: phone,
-                CallBackURL: `${platform.publicBaseUrl}/pos/mpesa/cb/${c.cbToken}`,
-                AccountReference: String(req.shop.name).replace(/[^A-Za-z0-9 ]/g, '').slice(0, 12) || 'Sale', TransactionDesc: 'Purchase'
-            });
-            if (String(d.ResponseCode) !== '0') throw new Error(d.ResponseDescription || 'The request was rejected.');
-            await q('UPDATE pos_mpesa_requests SET checkout_id=$2 WHERE id=$1', [id, String(d.CheckoutRequestID || '')]);
-            res.json({ ok: true, id });
-        } catch (err) {
-            await q(`UPDATE pos_mpesa_requests SET status='failed', note=$2 WHERE id=$1`, [id, String(err.message).slice(0, 190)]);
-            console.error('POS STK push failed:', err.message);
-            bad('Could not send the M-Pesa request: ' + String(err.message).slice(0, 150), 502);
-        }
-    }));
-
-    async function finalizeMpesa(id, receipt) {
-        const row = (await q(`UPDATE pos_mpesa_requests SET status='paid', mpesa_receipt=$2 WHERE id=$1 AND status='pending' RETURNING *`, [id, receipt || null])).rows[0];
-        if (!row) return;
-        const shop = (await q('SELECT s.id, b.name, b.vat_rate FROM pos_shops s JOIN pos_businesses b ON b.id = s.business_id WHERE s.id=$1', [row.shop_id])).rows[0];
-        const want = new Map(row.lines.map(l => [l.id, l.qty]));
-        const r = await createSale({ shop, user: { id: row.user_id, name: row.user_name }, want, discountIn: Number(row.discount_cents), label: 'mpesa', ref: receipt || null, phone: row.phone });
-        if (r.ok) await q('UPDATE pos_mpesa_requests SET sale_id=$2 WHERE id=$1', [id, r.saleId]);
-        else {
-            await q(`UPDATE pos_mpesa_requests SET status='review', note=$2 WHERE id=$1`, [id, ('Money received' + (receipt ? ` (${receipt})` : '') + ' but the sale could not be saved: ' + r.error).slice(0, 190)]);
-            if (platform.notify) platform.notify('⚠️ POS: M-Pesa paid but sale not saved', { Business: shop.name, 'M-Pesa receipt': receipt || '-', Reason: r.error }).catch(() => {});
-        }
-    }
-    async function handleStkCallback(token, body) {
-        const cb = body && body.Body && body.Body.stkCallback;
-        if (!cb || !token) return;
-        const r = (await q(`SELECT r.* FROM pos_mpesa_requests r JOIN pos_shops s ON s.id = r.shop_id JOIN pos_businesses b ON b.id = s.business_id WHERE r.checkout_id=$1 AND b.cb_token=$2`, [String(cb.CheckoutRequestID || ''), token])).rows[0];
-        if (!r || r.status !== 'pending') return;
-        if (Number(cb.ResultCode) !== 0) { await q(`UPDATE pos_mpesa_requests SET status='failed', note=$2 WHERE id=$1 AND status='pending'`, [r.id, String(cb.ResultDesc || 'Not completed').slice(0, 190)]); return; }
-        const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
-        const meta = n => { const it = items.find(i => i.Name === n); return it ? it.Value : undefined; };
-        if (Math.round(Number(meta('Amount')) * 100) !== Number(r.total_cents)) {
-            await q(`UPDATE pos_mpesa_requests SET status='review', note=$2 WHERE id=$1 AND status='pending'`, [r.id, `Amount mismatch: customer paid ${meta('Amount')}`]);
-            return;
-        }
-        await finalizeMpesa(r.id, String(meta('MpesaReceiptNumber') || '').slice(0, 20));
-    }
-    router.get('/api/mpesa/status/:id', ah(async (req, res) => {
-        const id = String(req.params.id || '');
-        const loadRow = async () => (await q(`SELECT r.*, s.receipt_no FROM pos_mpesa_requests r LEFT JOIN pos_sales s ON s.id = r.sale_id WHERE r.id=$1 AND r.shop_id=$2 ${req.role === 'cashier' ? 'AND r.user_id=$3' : ''}`, req.role === 'cashier' ? [id, req.shop.id, req.me.id] : [id, req.shop.id])).rows[0];
-        let r = await loadRow();
-        if (!r) return res.status(404).json({ status: 'unknown' });
-        if (r.status === 'pending' && r.checkout_id && Date.now() - new Date(r.created_at) > 20000 && (!r.last_query || Date.now() - new Date(r.last_query) > 10000)) {
-            await q('UPDATE pos_mpesa_requests SET last_query=now() WHERE id=$1', [id]);
-            try {
-                const c = await mpesaCreds(req.shop.business_id);
-                const d = c && await stkQueryFor(req.shop.business_id, c, r.checkout_id);
-                if (d && String(d.ResultCode) === '0') await finalizeMpesa(id, '');
-                else if (d && d.ResultCode !== undefined && String(d.ResultCode) !== '') await q(`UPDATE pos_mpesa_requests SET status='failed', note=$2 WHERE id=$1 AND status='pending'`, [id, String(d.ResultDesc || 'Not completed').slice(0, 190)]);
-            } catch (_) { /* still processing */ }
-            r = await loadRow();
-        }
-        if (r.status === 'paid' && !r.sale_id) return res.json({ status: 'pending' });
-        res.json({ status: r.status, error: r.note, receiptNo: r.receipt_no, total: Number(r.total_cents), receiptUrl: r.sale_id ? `/pos/sales/${r.sale_id}/receipt` : '' });
-    }));
-
     // ----- POS terminal -----
     router.get('/api/items', ah(async (req, res) => {
         const r = await q(`SELECT i.id, i.name, i.barcode, i.price_cents, i.stock, i.track_stock, c.name AS category FROM pos_items i LEFT JOIN pos_categories c ON c.id = i.category_id WHERE i.shop_id=$1 AND i.active ORDER BY i.name LIMIT 2000`, [req.shop.id]);
         res.set('Cache-Control', 'no-store').json(r.rows.map(i => ({ id: i.id, name: i.name, barcode: i.barcode || '', price: i.price_cents, stock: i.track_stock ? i.stock : null, category: i.category || '' })));
     }));
+    const LIVE_PROVIDERS = PAYSTACK_ON ? ['mpesa', 'paystack'] : ['mpesa'];
+    const hasGateway = async bizId => vault.enabled && (await q('SELECT 1 FROM pos_gateways WHERE business_id=$1 AND active AND provider = ANY($2::text[]) LIMIT 1', [bizId, LIVE_PROVIDERS])).rowCount > 0;
     router.get('/terminal', ah(async (req, res) => {
-        const cfg = { stk: Boolean(req.business.has_mpesa), vat: req.shop.vat_rate, methods: (await payMethods(req.shop.business_id)).map(m => ({ id: m.id, name: m.name, needsRef: m.needs_ref })) };
-        const body = `<h1 class="noprint">POS Terminal <small class="muted" style="font-size:.9rem">${esc(req.shop.branch)}</small></h1>
+        const stkOn = await hasGateway(req.biz.id), vatOn = Boolean(req.biz.vat_enabled);
+        const body = `<h1 class="noprint">POS Terminal</h1>
         <div class="pos-wrap">
             <div>
                 <div class="panel" style="margin-bottom:0"><label for="find">Search items, or scan a barcode and press Enter</label><input id="find" type="search" autocomplete="off" autofocus placeholder="Type a name or scan..."><div class="chips" id="chips"></div></div>
@@ -926,15 +805,14 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
                 <div class="lines" id="lines"><p class="muted" style="padding:10px 2px">Tap an item to add it.</p></div>
                 <div class="tot"><span>Subtotal</span><span id="sub">0.00</span></div>
                 <div class="tot"><span>Discount (KES)</span><input id="disc" inputmode="decimal" style="width:110px;text-align:right" placeholder="0"></div>
-                <div class="tot" id="vatrow"><span id="vatlbl">VAT</span><span id="vat">0.00</span></div>
                 <div class="tot big"><span>Total</span><span id="total">0.00</span></div>
-                <div class="pay" id="paybtns"></div>
+                ${vatOn ? `<div class="tot muted"><small>Includes VAT ${VAT_RATE}%</small><small id="vat">0.00</small></div>` : ''}
+                <div class="pay" style="grid-template-columns:repeat(${stkOn ? 3 : 2},1fr)"><button type="button" id="m-cash" class="on">Cash</button><button type="button" id="m-mpesa">M-Pesa code</button>${stkOn ? '<button type="button" id="m-stk">Phone prompt</button>' : ''}</div>
                 <div id="cashbox" class="field"><label for="tender">Cash received (KES)</label><input id="tender" inputmode="decimal" placeholder="0"><div class="tot" style="margin-top:6px"><span>Change</span><b id="change">0.00</b></div></div>
-                <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer's M-Pesa number</label><input id="sphone" type="tel" inputmode="tel" placeholder="0712345678"><small>The customer gets a prompt on their phone and enters their PIN.</small></div>
-                <div id="refbox" class="field" style="display:none"><label for="mref" id="reflbl">Reference</label><input id="mref" maxlength="30" autocapitalize="characters"></div>
+                <div id="mpesabox" class="field" style="display:none"><label for="mref">M-Pesa code (from the customer's SMS)</label><input id="mref" maxlength="14" autocapitalize="characters" placeholder="e.g. SHK4A1B2C3"></div>
+                <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer M-Pesa number</label><input id="sphone" type="tel" placeholder="0712345678"><small>The customer gets a prompt on their phone and types their PIN.</small></div>
                 <div class="field" id="cpbox"><label for="cphone">Customer phone (optional, to share the receipt)</label><input id="cphone" type="tel" placeholder="0712345678"></div>
                 <div id="err" class="alert" role="alert" style="display:none"></div>
-                <div id="wait" class="alert ok" role="status" style="display:none"></div>
                 <button class="btn ok" id="done" type="button" style="width:100%;padding:13px;font-size:1rem" disabled>Complete sale</button>
                 <button class="btn ghost" id="clear" type="button" style="width:100%;margin-top:8px">Clear sale</button>
             </div>
@@ -942,23 +820,17 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
         <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="mtitle"><div class="box"><h2 id="mtitle">Sale complete</h2><p id="mtext" style="font-size:1.1rem"></p>
             <div class="row" style="justify-content:center"><a class="btn" id="mprint" target="_blank" rel="noopener">Print receipt</a><a class="btn ghost" id="mwa" target="_blank" rel="noopener" style="display:none">Send on WhatsApp</a></div>
             <button class="btn ok" id="mnew" type="button" style="margin-top:14px;width:100%">New sale</button></div></div>
+        <div class="modal" id="wait" role="dialog" aria-modal="true" aria-labelledby="wtitle"><div class="box"><h2 id="wtitle">Waiting for payment</h2><p id="wtext" style="font-size:1.05rem">Ask the customer to check their phone and enter their M-Pesa PIN.</p>
+            <button class="btn ghost" id="wcancel" type="button" style="margin-top:10px;width:100%">Stop waiting</button></div></div>
         <script nonce="${req.nonce || ''}">
         (function () {
-            var CFG = ${jsonForHtml(cfg)};
-            var items = [], cart = [], cat = '', method = 'cash', busy = false, pollId = 0;
+            var VAT_ON = ${vatOn ? 'true' : 'false'}, VAT_RATE = ${VAT_RATE};
+            var items = [], cart = [], cat = '', method = 'cash', busy = false, timer = null;
             var $ = function (id) { return document.getElementById(id); };
             function fmt(c) { return (c / 100).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
-            function money(v) { var s = String(v || '').replace(/,/g, '').trim(); if (!/^\\d{1,9}(\\.\\d{1,2})?$/.test(s)) return 0; return Math.round(parseFloat(s) * 100); }
+            function money(v) { var s = String(v || '').replace(/,/g, '').trim(); if (!/^[0-9]{1,9}([.][0-9]{1,2})?$/.test(s)) return 0; return Math.round(parseFloat(s) * 100); }
             function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
             function showErr(m) { var e = $('err'); e.textContent = m || ''; e.style.display = m ? 'block' : 'none'; }
-            function showWait(m) { var e = $('wait'); e.textContent = m || ''; e.style.display = m ? 'block' : 'none'; }
-            var METHODS = [{ k: 'cash', n: 'Cash' }];
-            if (CFG.stk) { METHODS.push({ k: 'stk', n: 'M-Pesa (STK push)' }); METHODS.push({ k: 'mpesa', n: 'M-Pesa code' }); } else METHODS.push({ k: 'mpesa', n: 'M-Pesa' });
-            CFG.methods.forEach(function (m) { METHODS.push({ k: 'm:' + m.id, n: m.name, needsRef: m.needsRef }); });
-            function drawMethods() {
-                var box = $('paybtns'); box.textContent = '';
-                METHODS.forEach(function (m) { var b = el('button', m.k === method ? 'on' : '', m.n); b.type = 'button'; b.addEventListener('click', function () { setMethod(m.k); }); box.appendChild(b); });
-            }
             function load() {
                 fetch('/pos/api/items', { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) { items = d; chips(); draw(); }).catch(function () { showErr('Could not load your items. Check your connection and refresh.'); });
             }
@@ -985,7 +857,7 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
                 showErr(''); if (l) l.qty++; else cart.push({ id: i.id, name: i.name, price: i.price, qty: 1, stock: i.stock });
                 render();
             }
-            function totals() { var s = 0; cart.forEach(function (l) { s += l.price * l.qty; }); var d = Math.min(money($('disc').value), s); var net = s - d, v = CFG.vat > 0 ? Math.round(net * CFG.vat / 100) : 0; return { sub: s, disc: d, total: net + v, vat: v }; }
+            function totals() { var s = 0; cart.forEach(function (l) { s += l.price * l.qty; }); var d = Math.min(money($('disc').value), s); var t = s - d; return { sub: s, disc: d, total: t, vat: VAT_ON ? Math.round(t * VAT_RATE / (100 + VAT_RATE)) : 0 }; }
             function render() {
                 var box = $('lines'); box.textContent = '';
                 if (!cart.length) box.appendChild(el('p', 'muted', 'Tap an item to add it.'));
@@ -998,49 +870,43 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
                     q.appendChild(mi); q.appendChild(n); q.appendChild(pl);
                     r.appendChild(nm); r.appendChild(q); r.appendChild(el('b', '', fmt(l.price * l.qty))); box.appendChild(r);
                 });
-                var t = totals(); $('sub').textContent = fmt(t.sub); $('total').textContent = fmt(t.total);
-                $('vatrow').style.display = CFG.vat > 0 ? '' : 'none'; $('vatlbl').textContent = 'VAT (' + CFG.vat + '%)'; $('vat').textContent = fmt(t.vat);
+                var t = totals(); $('sub').textContent = fmt(t.sub); $('total').textContent = fmt(t.total); if ($('vat')) $('vat').textContent = fmt(t.vat);
                 var tend = money($('tender').value); $('change').textContent = fmt(Math.max(0, tend - t.total));
                 $('done').disabled = busy || !cart.length;
-                $('done').textContent = method === 'stk' ? 'Send M-Pesa request' : 'Complete sale';
             }
             function setMethod(m) {
-                method = m; pollId++; busy = false; showWait(''); showErr('');
-                var def = METHODS.filter(function (x) { return x.k === m; })[0] || {};
-                $('cashbox').style.display = m === 'cash' ? '' : 'none'; $('stkbox').style.display = m === 'stk' ? '' : 'none';
-                var needRef = m === 'mpesa' || (m.indexOf('m:') === 0 && def.needsRef); $('refbox').style.display = needRef ? '' : 'none';
-                $('reflbl').textContent = m === 'mpesa' ? 'M-Pesa code (from the customer\\'s SMS)' : (def.n || '') + ' reference / transaction number';
-                $('cpbox').style.display = m === 'stk' ? 'none' : '';
-                drawMethods(); render();
+                method = m; $('m-cash').className = m === 'cash' ? 'on' : ''; $('m-mpesa').className = m === 'mpesa' ? 'on' : ''; if ($('m-stk')) $('m-stk').className = m === 'stk' ? 'on' : '';
+                $('cashbox').style.display = m === 'cash' ? '' : 'none'; $('mpesabox').style.display = m === 'mpesa' ? '' : 'none'; $('stkbox').style.display = m === 'stk' ? '' : 'none'; $('cpbox').style.display = m === 'stk' ? 'none' : '';
+                $('done').textContent = m === 'stk' ? 'Send M-Pesa prompt' : 'Complete sale'; showErr('');
             }
-            function reset() { pollId++; busy = false; cart = []; $('disc').value = ''; $('tender').value = ''; $('mref').value = ''; $('cphone').value = ''; $('sphone').value = ''; showErr(''); showWait(''); setMethod('cash'); $('find').value = ''; draw(); load(); $('find').focus(); }
-            function success(d, phone) {
+            function reset() { cart = []; $('disc').value = ''; $('tender').value = ''; $('mref').value = ''; $('cphone').value = ''; if ($('sphone')) $('sphone').value = ''; showErr(''); setMethod('cash'); render(); $('find').value = ''; draw(); load(); $('find').focus(); }
+            function lines() { return cart.map(function (l) { return { id: l.id, qty: l.qty }; }); }
+            function finished(d) {
                 $('mtext').textContent = 'Receipt #' + d.receiptNo + ' - KES ' + fmt(d.total) + (d.change ? ' - Change KES ' + fmt(d.change) : '');
                 $('mprint').href = d.receiptUrl; var wa = $('mwa'); if (d.whatsapp) { wa.href = d.whatsapp; wa.style.display = ''; } else wa.style.display = 'none';
                 $('modal').classList.add('show'); $('mnew').focus();
             }
-            function post(url, body) { return fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); }); }
-            function linesBody() { return cart.map(function (l) { return { id: l.id, qty: l.qty }; }); }
+            function stopWait() { if (timer) { clearInterval(timer); timer = null; } $('wait').classList.remove('show'); busy = false; render(); }
+            function poll(id) {
+                var tries = 0;
+                timer = setInterval(function () {
+                    tries++;
+                    fetch('/pos/api/pay/' + id, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
+                        if (d.status === 'paid') { stopWait(); finished(d); }
+                        else if (d.status === 'failed' || d.status === 'review') { stopWait(); showErr(d.status === 'review' ? 'The payment needs checking by the owner (see Payment Gateways). Do not give goods until it is confirmed.' : (d.error || 'The customer did not complete the payment.')); }
+                        else if (tries >= 45) { $('wtext').textContent = 'No answer yet. If the customer already paid, the sale is saved automatically: check Sales History. You can keep waiting or stop.'; }
+                    }).catch(function () {});
+                }, 3000);
+            }
             function startStk() {
-                var t = totals();
-                if (t.total < 100 || t.total % 100 !== 0) { showErr('M-Pesa takes whole shillings only. Use the Discount box to round the total (now ' + fmt(t.total) + ').'); return; }
-                busy = true; render(); $('done').disabled = true; showErr(''); showWait('Sending the request to the customer\\'s phone...');
-                var my = ++pollId;
-                post('/pos/api/mpesa/push', { lines: linesBody(), discount: $('disc').value, phone: $('sphone').value.trim() }).then(function (x) {
-                    if (!x.ok) { busy = false; showWait(''); showErr(x.d.error || 'Could not send the request.'); render(); return; }
-                    showWait('Waiting for the customer to enter their M-Pesa PIN...');
-                    var tries = 0;
-                    (function poll() {
-                        if (my !== pollId) return;
-                        if (++tries > 60) { busy = false; showWait(''); showErr('No confirmation yet. If the customer paid, the sale will appear in Sales History. Do not charge them twice.'); render(); return; }
-                        fetch('/pos/api/mpesa/status/' + x.d.id, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (s) {
-                            if (my !== pollId) return;
-                            if (s.status === 'paid' && s.receiptUrl) { busy = false; showWait(''); success({ receiptNo: s.receiptNo, total: s.total, receiptUrl: s.receiptUrl }); return; }
-                            if (s.status === 'failed' || s.status === 'review') { busy = false; showWait(''); showErr(s.status === 'failed' ? 'The payment was not completed: ' + (s.error || 'cancelled or timed out.') : (s.error || 'Please check this payment with the owner.')); render(); return; }
-                            setTimeout(poll, 3000);
-                        }).catch(function () { setTimeout(poll, 4000); });
-                    })();
-                }).catch(function () { busy = false; showWait(''); showErr('Connection problem. Try again.'); render(); });
+                var phone = $('sphone').value.trim(); if (!phone) { showErr("Enter the customer's M-Pesa number."); return; }
+                busy = true; $('done').disabled = true; showErr('');
+                fetch('/pos/api/pay/start', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: lines(), discount: $('disc').value, phone: phone }) })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+                .then(function (x) {
+                    if (!x.ok) { busy = false; showErr(x.d.error || 'The prompt could not be sent.'); render(); return; }
+                    $('wtext').textContent = 'KES ' + x.d.amountKes.toLocaleString('en-KE') + ': ask the customer to check their phone and enter their M-Pesa PIN.'; $('wait').classList.add('show'); poll(x.d.id);
+                }).catch(function () { busy = false; showErr('Connection problem. The prompt may not have been sent.'); render(); });
             }
             $('find').addEventListener('input', draw);
             $('find').addEventListener('keydown', function (e) {
@@ -1049,108 +915,375 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
                 if (hit) { add(hit); $('find').value = ''; draw(); } else showErr('No item matches "' + $('find').value.trim() + '".');
             });
             ['disc', 'tender'].forEach(function (id) { $(id).addEventListener('input', render); });
+            $('m-cash').addEventListener('click', function () { setMethod('cash'); }); $('m-mpesa').addEventListener('click', function () { setMethod('mpesa'); }); if ($('m-stk')) $('m-stk').addEventListener('click', function () { setMethod('stk'); });
+            $('wcancel').addEventListener('click', stopWait);
             $('clear').addEventListener('click', reset); $('mnew').addEventListener('click', function () { $('modal').classList.remove('show'); reset(); });
             $('done').addEventListener('click', function () {
-                if (busy || !cart.length) return;
+                if (busy || !cart.length) return; var t = totals();
                 if (method === 'stk') { startStk(); return; }
-                var t = totals(), def = METHODS.filter(function (x) { return x.k === method; })[0] || {};
                 if (method === 'cash' && money($('tender').value) < t.total) { showErr('The cash received is less than the total.'); return; }
-                if (method === 'mpesa' && !/^[A-Za-z0-9]{8,14}$/.test($('mref').value.trim())) { showErr('Enter the M-Pesa code from the customer\\'s SMS.'); return; }
-                if (method.indexOf('m:') === 0 && def.needsRef && $('mref').value.trim().length < 3) { showErr('Enter the reference for ' + def.n + '.'); return; }
+                if (method === 'mpesa' && !/^[A-Za-z0-9]{8,14}$/.test($('mref').value.trim())) { showErr("Enter the M-Pesa code from the customer's SMS."); return; }
                 busy = true; $('done').disabled = true; $('done').textContent = 'Saving...'; showErr('');
-                post('/pos/api/sales', { lines: linesBody(), discount: $('disc').value, method: method, tendered: $('tender').value, ref: $('mref').value.trim(), customerPhone: $('cphone').value.trim() })
+                fetch('/pos/api/sales', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+                    lines: lines(), discount: $('disc').value, method: method, tendered: $('tender').value, mpesaRef: $('mref').value.trim(), customerPhone: $('cphone').value.trim() }) })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
                 .then(function (x) {
-                    busy = false;
+                    busy = false; $('done').textContent = 'Complete sale';
                     if (!x.ok) { showErr(x.d.error || 'The sale could not be saved.'); render(); return; }
-                    success(x.d);
-                }).catch(function () { busy = false; showErr('Connection problem. The sale may not have been saved: check Sales History before trying again.'); render(); });
+                    finished(x.d);
+                }).catch(function () { busy = false; $('done').textContent = 'Complete sale'; showErr('Connection problem. The sale may not have been saved: check Sales History before trying again.'); render(); });
             });
-            setMethod('cash'); load();
+            setMethod('cash'); render(); load();
         })();
         </script>`;
         send(req, res, { title: 'POS Terminal', nav: 'terminal', body });
     }));
 
+    // ----- saving a sale -----
+    const saleLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests. Please wait a moment.' } });
+    const pollLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 1500, standardHeaders: true, legacyHeaders: false, message: { status: 'pending' } });
+    const cashierOf = req => ({ staffId: req.actor.kind === 'staff' ? req.actor.staffId : null, name: String(req.actor.name || '').slice(0, 80) });
+    const kePhone = raw => { const m = String(raw || '').replace(/[\s-]/g, '').match(/^(?:\+?254|0)([17]\d{8})$/); return m ? '254' + m[1] : ''; };
+
+    // reads the cart from the request: { want: Map(itemId -> qty), discountIn } or { error }
+    function readCart(b) {
+        if (!Array.isArray(b.lines) || !b.lines.length || b.lines.length > 100) return { error: 'The sale has no items.' };
+        const want = new Map();
+        for (const l of b.lines) {
+            const id = parseCount(l && l.id, { min: 1 }), qty = parseCount(l && l.qty, { min: 1, max: 100000 });
+            if (!id || !qty) return { error: 'One of the items is not valid.' };
+            want.set(id, (want.get(id) || 0) + qty);
+        }
+        const discountIn = String(b.discount || '').trim() === '' ? 0 : parseMoney(b.discount);
+        if (discountIn === null) return { error: 'The discount must be a number.' };
+        return { want, discountIn };
+    }
+    // prices come from the database, never from the browser
+    async function priceCart(db, shopId, want, lock) {
+        const ids = [...want.keys()];
+        const found = (await db.query(`SELECT id, name, price_cents, cost_cents, stock, track_stock FROM pos_items WHERE shop_id=$1 AND active AND id = ANY($2::int[]) ORDER BY id${lock ? ' FOR UPDATE' : ''}`, [shopId, ids])).rows;
+        if (found.length !== ids.length) return { error: 'An item in the cart is no longer available. Refresh and try again.', code: 409 };
+        const lines = [];
+        for (const it of found) {
+            const qty = want.get(it.id);
+            if (it.track_stock && it.stock < qty) return { error: `Not enough stock for "${it.name}": ${it.stock} left.`, code: 409 };
+            lines.push({ id: it.id, name: it.name, qty, price: Number(it.price_cents), cost: Number(it.cost_cents) });
+        }
+        return { lines };
+    }
+    // writes the sale, its lines, VAT and stock movements inside the caller's transaction
+    async function insertSale(client, shop, biz, d) {
+        const subtotal = d.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(d.discount, subtotal), total = subtotal - discount;
+        const vat = biz.vat_enabled ? vatOf(total) : 0;   // prices already include VAT, so this is the VAT inside the total
+        const no = (await client.query('UPDATE pos_shops SET next_receipt = next_receipt + 1 WHERE id=$1 RETURNING next_receipt - 1 AS no', [shop.id])).rows[0].no;
+        const paid = d.paid == null ? total : d.paid;
+        const sale = (await client.query(`INSERT INTO pos_sales (shop_id, receipt_no, subtotal_cents, discount_cents, total_cents, vat_cents, paid_cents, change_cents, method, mpesa_ref, customer_phone, staff_id, cashier_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+            [shop.id, no, subtotal, discount, total, vat, paid, d.change || 0, d.method, d.mref || null, d.phone || '', d.staffId || null, d.cashierName || ''])).rows[0];
+        const oversold = [];
+        for (const l of d.lines) {
+            await client.query('INSERT INTO pos_sale_items (sale_id, item_id, name, qty, unit_price_cents, unit_cost_cents) VALUES ($1,$2,$3,$4,$5,$6)', [sale.id, l.id, l.name, l.qty, l.price, l.cost]);
+            const st = (await client.query('UPDATE pos_items SET stock = CASE WHEN track_stock THEN stock - $2 ELSE stock END WHERE id=$1 AND shop_id=$3 RETURNING stock, track_stock', [l.id, l.qty, shop.id])).rows[0];
+            if (st && st.track_stock && st.stock < 0) oversold.push(l.name);   // only possible for a payment that arrived after the stock was gone
+            if (st && st.track_stock) await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note, sale_id) VALUES ($1,$2,$3,$4,'sale',$5,$6)`, [shop.id, l.id, -l.qty, st.stock, 'Receipt #' + no, sale.id]);
+        }
+        return { id: sale.id, no, total, change: d.change || 0, oversold };
+    }
+    const whatsappLink = (shop, phone, no, total, method) => phone ? `https://wa.me/${phone}?text=${encodeURIComponent(`Thank you for shopping at ${shop.name}. Receipt #${no}: KES ${fmt(total)} paid by ${method === 'cash' ? 'cash' : 'M-Pesa'}.`)}` : '';
+
+    router.post('/api/sales', saleLimiter, ah(async (req, res) => {
+        const bad = (m, code = 400) => res.status(code).json({ error: m });
+        const b = req.body || {};
+        const method = b.method === 'mpesa' ? 'mpesa' : b.method === 'cash' ? 'cash' : '';
+        if (!method) return bad('Choose cash or M-Pesa.');
+        const cart = readCart(b);
+        if (cart.error) return bad(cart.error);
+        const mref = method === 'mpesa' ? String(b.mpesaRef || '').trim().toUpperCase() : '';
+        if (method === 'mpesa' && !/^[A-Z0-9]{8,14}$/.test(mref)) return bad("Enter the M-Pesa code from the customer's SMS.");
+        const phoneRaw = String(b.customerPhone || '').replace(/[\s-]/g, ''), phone = kePhone(phoneRaw);
+        if (phoneRaw && !phone) return bad('The customer phone number is not valid.');
+        const who = cashierOf(req);
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const priced = await priceCart(client, req.shop.id, cart.want, true);
+            if (priced.error) { await client.query('ROLLBACK'); return bad(priced.error, priced.code); }
+            const subtotal = priced.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(cart.discountIn, subtotal), total = subtotal - discount;
+            let paid = total, change = 0;
+            if (method === 'cash') {
+                const tendered = String(b.tendered || '').trim() === '' ? null : parseMoney(b.tendered);
+                if (tendered === null || tendered < total) { await client.query('ROLLBACK'); return bad('The cash received is less than the total.'); }
+                paid = tendered; change = tendered - total;
+            }
+            const sale = await insertSale(client, req.shop, req.biz, { lines: priced.lines, discount, method, mref, phone, paid, change, staffId: who.staffId, cashierName: who.name });
+            await client.query('COMMIT');
+            res.json({ ok: true, saleId: sale.id, receiptNo: sale.no, total: sale.total, change, receiptUrl: `/pos/sales/${sale.id}/receipt`, whatsapp: whatsappLink(req.shop, phone, sale.no, sale.total, method) });
+        } catch (err) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw err;
+        } finally { client.release(); }
+    }));
+
+    // ----- phone prompt (STK push) through the business's own gateway -----
+    async function loadGateway(where, params) {   // returns the gateway with its secrets decrypted, or null
+        const row = (await q(`SELECT * FROM pos_gateways WHERE ${where} LIMIT 1`, params)).rows[0];
+        if (!row || !vault.enabled) return null;
+        try { return { id: row.id, businessId: row.business_id, provider: row.provider, cfg: row.cfg || {}, secrets: vault.open(row.secrets, `${row.business_id}:${row.provider}`), token: String(row.callback_token).trim(), active: row.active, isDefault: row.is_default }; }
+        catch (e) { console.error('Could not read gateway', row.id + ':', e.message); return null; }
+    }
+    const callbackUrlFor = gw => `${publicBaseUrl}/pos/${gw.provider === 'mpesa' ? 'mpesa/cb' : 'paystack/hook'}/${gw.token}`;
+
+    router.post('/api/pay/start', saleLimiter, ah(async (req, res) => {
+        const bad = (m, code = 400) => res.status(code).json({ error: m });
+        const b = req.body || {};
+        const gw = await loadGateway('business_id=$1 AND active AND provider = ANY($2::text[]) ORDER BY is_default DESC, id', [req.biz.id, LIVE_PROVIDERS]);
+        if (!gw) return bad('Phone prompts are not set up. The owner can add payment credentials under Payment Gateways.');
+        if (!publicBaseUrl.startsWith('https://')) return bad('Phone prompts need the site address (PUBLIC_BASE_URL) to be set to an https address.', 503);
+        const phone = kePhone(b.phone);
+        if (!phone) return bad("The customer's phone number is not valid. Use a Safaricom number such as 0712345678.");
+        const cart = readCart(b);
+        if (cart.error) return bad(cart.error);
+        const priced = await priceCart({ query: q }, req.shop.id, cart.want, false);
+        if (priced.error) return bad(priced.error, priced.code);
+        const subtotal = priced.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(cart.discountIn, subtotal), total = subtotal - discount;
+        const amountKes = Math.ceil(total / 100);   // M-Pesa takes whole shillings
+        if (amountKes < 1) return bad('The total is too small to charge.');
+        const who = cashierOf(req), id = crypto.randomBytes(12).toString('hex');
+        await q('INSERT INTO pos_payments (id, shop_id, gateway_id, staff_id, cashier_name, amount_kes, phone, status, cart) VALUES ($1,$2,$3,$4,$5,$6,$7,\'pending\',$8::jsonb)',
+            [id, req.shop.id, gw.id, who.staffId, who.name, amountKes, phone, JSON.stringify({ lines: priced.lines, discount, customerPhone: phone })]);
+        try {
+            const r = await GW.PROVIDERS[gw.provider].charge(gw, { amountKes, phone, ref: gw.provider === 'mpesa' ? id.slice(0, 12).toUpperCase() : id, desc: 'Sale payment', callbackUrl: callbackUrlFor(gw), email: (req.session.user && req.session.user.email) || 'pos@tencent.invalid' });
+            await q('UPDATE pos_payments SET provider_ref=$2, updated_at=now() WHERE id=$1', [id, r.providerRef]);
+        } catch (e) {
+            console.error('POS prompt failed:', e.message);
+            await q(`UPDATE pos_payments SET status='failed', fail_reason=$2, updated_at=now() WHERE id=$1`, [id, String(e.message).slice(0, 160)]);
+            return bad('The prompt could not be sent: ' + String(e.message).slice(0, 120), 502);
+        }
+        res.json({ ok: true, id, amountKes });
+    }));
+
+    const lastCheck = new Map();   // payment id -> when we last asked the gateway
+    router.get('/api/pay/:id', pollLimiter, ah(async (req, res) => {
+        let p = (await q('SELECT * FROM pos_payments WHERE id=$1 AND shop_id=$2', [req.params.id, req.shop.id])).rows[0];
+        if (!p) return res.status(404).json({ status: 'unknown' });
+        if (p.status === 'pending' && p.provider_ref && Date.now() - new Date(p.created_at).getTime() > 20000 && Date.now() - (lastCheck.get(p.id) || 0) > 8000) {
+            lastCheck.set(p.id, Date.now());
+            const gw = await loadGateway('id=$1', [p.gateway_id]);
+            if (gw) {
+                const v = await GW.PROVIDERS[gw.provider].verify(gw, p.provider_ref).catch(() => ({ state: 'pending' }));
+                await applyVerdict(p, v);
+                p = (await q('SELECT * FROM pos_payments WHERE id=$1', [p.id])).rows[0];
+            }
+        }
+        const out = { status: p.status, error: p.fail_reason || '' };
+        if (p.status === 'paid' && p.sale_id) {
+            const s = (await q('SELECT id, receipt_no, total_cents, change_cents, customer_phone FROM pos_sales WHERE id=$1', [p.sale_id])).rows[0];
+            if (s) Object.assign(out, { saleId: s.id, receiptNo: s.receipt_no, total: Number(s.total_cents), change: Number(s.change_cents), receiptUrl: `/pos/sales/${s.id}/receipt`, whatsapp: whatsappLink(req.shop, s.customer_phone, s.receipt_no, Number(s.total_cents), 'mpesa') });
+        }
+        res.set('Cache-Control', 'no-store').json(out);
+    }));
+
+    // Turns a confirmed payment into a sale exactly once, from the cart saved when the prompt was sent
+    // (so the sale matches what the customer was charged, even if the cashier has left the screen).
+    async function finalizePayment(id, receipt) {
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const p = (await client.query('SELECT * FROM pos_payments WHERE id=$1 FOR UPDATE', [id])).rows[0];
+            if (!p || p.sale_id) { await client.query('ROLLBACK'); return; }
+            const shop = (await client.query('SELECT * FROM pos_shops WHERE id=$1', [p.shop_id])).rows[0];
+            const biz = shop.parent_id ? (await client.query('SELECT * FROM pos_shops WHERE id=$1', [shop.parent_id])).rows[0] : shop;
+            const cart = p.cart, mref = String(receipt || '').slice(0, 20) || null;
+            const sale = await insertSale(client, shop, biz, { lines: cart.lines, discount: cart.discount, method: 'mpesa', mref, phone: cart.customerPhone || '', paid: p.amount_kes * 100, change: 0, staffId: p.staff_id, cashierName: p.cashier_name });
+            await client.query(`UPDATE pos_payments SET status='paid', receipt=$2, sale_id=$3, updated_at=now() WHERE id=$1`, [id, String(receipt || '').slice(0, 40), sale.id]);
+            await client.query('COMMIT');
+            if (sale.oversold.length) await auditRaw(shop.parent_id || shop.id, shop.id, 'system', null, '', 'stock.negative', 'Paid sale after stock ran out: ' + sale.oversold.join(', '), '');
+            await auditRaw(shop.parent_id || shop.id, shop.id, 'system', null, '', 'payment.sale', `receipt #${sale.no} code ${mref || ''}`, '');
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+    }
+    const setPaymentState = (id, status, reason) => q(`UPDATE pos_payments SET status=$2, fail_reason=$3, updated_at=now() WHERE id=$1 AND status IN ('pending','review')`, [id, status, String(reason || '').slice(0, 160)]);
+    async function applyVerdict(p, v) {   // v comes from the gateway's own "check this payment" call
+        if (v.state === 'paid') {
+            if ((v.amountKes != null && v.amountKes !== p.amount_kes) || (v.currency && v.currency !== 'KES')) { await setPaymentState(p.id, 'review', 'Amount paid does not match the sale'); return; }
+            await finalizePayment(p.id, v.receipt || '');
+        } else if (v.state === 'failed') await setPaymentState(p.id, 'failed', v.reason || 'Payment not completed');
+    }
+    async function gatewayCallback(provider, token, body) {
+        if (!/^[a-f0-9]{48}$/.test(String(token))) return;
+        const gw = await loadGateway('callback_token=$1 AND provider=$2', [token, provider]);
+        if (!gw) return;
+        const prov = GW.PROVIDERS[provider], cb = prov.parseCallback(body);
+        if (!cb) return;
+        const p = (await q('SELECT * FROM pos_payments WHERE provider_ref=$1 AND gateway_id=$2', [cb.providerRef, gw.id])).rows[0];
+        if (!p || p.status === 'paid') return;
+        if (cb.hintOnly) return applyVerdict(p, await prov.verify(gw, p.provider_ref));   // webhook is only a nudge: ask the gateway for the truth
+        if (!cb.succeeded) return setPaymentState(p.id, 'failed', cb.reason || 'Payment not completed');
+        if (cb.amountKes !== null && cb.amountKes !== p.amount_kes) return setPaymentState(p.id, 'review', 'Amount paid does not match the sale');
+        // The callback address contains a secret, but a leaked secret must not be enough to fake a payment:
+        // a sale is only saved when the payment company itself confirms it. If it cannot confirm yet, the payment
+        // stays pending and the background check keeps asking (see sweep).
+        const v = await prov.verify(gw, p.provider_ref).catch(() => ({ state: 'pending' }));
+        if (v.state === 'failed') return setPaymentState(p.id, 'review', 'Callback and status check disagree');
+        if (v.state !== 'paid') return;
+        await finalizePayment(p.id, cb.receipt || v.receipt);
+    }
+
     // ----- sales history, receipts, void -----
     router.get('/sales', ah(async (req, res) => {
+        const mine = req.actor.role === 'cashier';
         const from = validDate(req.query.from) ? req.query.from : addDays(todayNairobi(), -6), to = validDate(req.query.to) ? req.query.to : todayNairobi();
-        const mine = req.role === 'cashier';
-        const r = await q(`SELECT id, receipt_no, total_cents, method, mpesa_ref, status, created_at, user_name FROM pos_sales WHERE shop_id=$1 AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 ${mine ? 'AND user_id=$4' : ''} ORDER BY created_at DESC LIMIT 500`, mine ? [req.shop.id, from, to, req.me.id] : [req.shop.id, from, to]);
+        const params = [req.shop.id, from, to]; if (mine) params.push(req.actor.staffId);
+        const r = await q(`SELECT id, receipt_no, total_cents, method, mpesa_ref, status, cashier_name, created_at FROM pos_sales WHERE shop_id=$1 AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3${mine ? ' AND staff_id=$4' : ''} ORDER BY created_at DESC LIMIT 500`, params);
         const sum = r.rows.filter(s => s.status === 'completed').reduce((a, s) => a + Number(s.total_cents), 0);
         send(req, res, { title: mine ? 'My Sales' : 'Sales History', nav: 'sales', body: `<h1>${mine ? 'My Sales' : 'Sales History'}</h1>${notice(req)}
         <div class="panel"><form method="GET" class="row"><div><label for="f">From</label><input id="f" type="date" name="from" value="${from}"></div><div><label for="t">To</label><input id="t" type="date" name="to" value="${to}"></div><button class="btn dark" type="submit">Show</button></form><p class="muted" style="margin:10px 0 0">${r.rows.length} sale${r.rows.length === 1 ? '' : 's'}, completed total <b>${kes(sum)}</b></p></div>
-        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Receipt</th><th>When</th><th>Method</th><th>Cashier</th><th class="num">Total</th><th>Status</th><th></th></tr>${r.rows.map(s => `<tr><td>#${s.receipt_no}</td><td class="nowrap">${esc(timeFmt(s.created_at))}</td><td>${esc(methodLabel(s.method))}${s.mpesa_ref ? ' ' + esc(s.mpesa_ref) : ''}</td><td>${esc(s.user_name)}</td><td class="num">${fmt(s.total_cents)}</td><td>${s.status === 'voided' ? '<span class="tag bad">voided</span>' : '<span class="tag ok">completed</span>'}</td><td class="right"><a class="btn small ghost" href="/pos/sales/${s.id}/receipt">Receipt</a></td></tr>`).join('')}</table>` : '<p class="muted">No sales in this period.</p>'}</div>` });
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Receipt</th><th>When</th><th>Method</th>${mine ? '' : '<th>Cashier</th>'}<th class="num">Total</th><th>Status</th><th></th></tr>${r.rows.map(s => `<tr><td>#${s.receipt_no}</td><td class="nowrap">${esc(timeFmt(s.created_at))}</td><td>${s.method === 'mpesa' ? 'M-Pesa ' + esc(s.mpesa_ref || '') : 'Cash'}</td>${mine ? '' : `<td>${esc(s.cashier_name || '')}</td>`}<td class="num">${fmt(s.total_cents)}</td><td>${s.status === 'voided' ? '<span class="tag bad">voided</span>' : '<span class="tag ok">completed</span>'}</td><td class="right"><a class="btn small ghost" href="/pos/sales/${s.id}/receipt">Receipt</a></td></tr>`).join('')}</table>` : '<p class="muted">No sales in this period.</p>'}</div>` });
     }));
     const getSale = async (req, idParam) => {
         const id = parseCount(idParam, { min: 1 });
         if (!id) return null;
-        const s = (await q('SELECT * FROM pos_sales WHERE id=$1 AND shop_id=$2', [id, req.shop.id])).rows[0];
-        if (!s || (req.role === 'cashier' && s.user_id !== req.me.id)) return null;
+        const s = (await q('SELECT * FROM pos_sales WHERE id=$1 AND shop_id=$2 AND ($3::int IS NULL OR staff_id = $3)', [id, req.shop.id, req.actor.role === 'cashier' ? req.actor.staffId : null])).rows[0];
+        if (!s) return null;
         s.lines = (await q('SELECT name, qty, unit_price_cents FROM pos_sale_items WHERE sale_id=$1 ORDER BY id', [s.id])).rows;
         return s;
     };
-    router.get('/logo', ah(async (req, res) => {
-        const r = (await q('SELECT logo, logo_mime FROM pos_businesses WHERE id=$1', [req.shop.business_id])).rows[0];
-        if (!r || !r.logo) return res.sendStatus(404);
-        res.set({ 'Content-Type': r.logo_mime === 'image/jpeg' ? 'image/jpeg' : 'image/png', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600', 'Content-Security-Policy': "default-src 'none'" }).send(r.logo);
-    }));
     router.get('/sales/:id/receipt', ah(async (req, res) => {
         const s = await getSale(req, req.params.id);
         if (!s) return send(req, res, { title: 'Not found', nav: 'sales', body: '<h1>Receipt not found</h1><a href="/pos/sales">Back to sales</a>' }, 404);
-        const sh = req.shop, canVoid = req.role !== 'cashier' && s.status === 'completed';
-        const body = `<div class="noprint" style="margin-bottom:14px"><button class="btn" id="prt" type="button">Print / Save as PDF</button> <a class="btn ghost" href="/pos/sales">Back to sales</a> ${canVoid ? `<form action="/pos/sales/${s.id}/void" method="POST" style="display:inline"><input name="reason" placeholder="Reason for voiding" maxlength="200" required style="width:220px;display:inline-block"> <button class="btn bad small" type="submit">Void sale</button></form>` : ''}</div>
+        const sh = req.shop, biz = req.biz, isBranch = sh.id !== biz.id, canVoid = req.actor.role !== 'cashier';
+        const logo = biz.logo && LOGO_OK.test(biz.logo) ? `<img src="${biz.logo}" alt="" style="max-height:72px;max-width:230px;margin-bottom:6px"><br>` : '';
+        const vat = Number(s.vat_cents), net = Number(s.total_cents) - vat, phone = sh.phone || biz.phone;
+        const body = `<div class="noprint" style="margin-bottom:14px"><button class="btn" id="prt" type="button">Print / Save as PDF</button> <a class="btn ghost" href="/pos/sales">Back to sales</a> ${canVoid && s.status === 'completed' ? `<form action="/pos/sales/${s.id}/void" method="POST" style="display:inline"><input name="reason" placeholder="Reason for voiding" maxlength="200" required style="width:220px;display:inline-block"> <button class="btn bad small" type="submit">Void sale</button></form>` : ''}</div>
         <div class="panel" style="max-width:380px;margin:0 auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.88rem">
-            <div style="text-align:center">${sh.has_logo ? `<img src="/pos/logo?v=${sh.logo_ver}" alt="" style="max-width:200px;max-height:90px;margin:0 auto 6px;display:block">` : ''}<b style="font-size:1.1rem">${esc(sh.name)}</b><br>${esc(sh.branch)}${sh.address ? '<br>' + esc(sh.address) : ''}${sh.phone ? '<br>Tel ' + esc(sh.phone) : ''}${sh.tax_pin ? '<br>PIN ' + esc(sh.tax_pin) : ''}</div>
-            <hr><div>Receipt #${s.receipt_no}${s.status === 'voided' ? ' <b>(VOIDED)</b>' : ''}<br>${esc(timeFmt(s.created_at))}${s.user_name ? '<br>Served by ' + esc(s.user_name) : ''}</div><hr>
+            <div style="text-align:center">${logo}<b style="font-size:1.1rem">${esc(biz.name)}</b>${isBranch ? '<br><b>' + esc(sh.name) + '</b>' : ''}<br>${esc(sh.address)}${phone ? '<br>Tel ' + esc(phone) : ''}${biz.tax_pin ? '<br>PIN ' + esc(biz.tax_pin) : ''}</div>
+            <hr><div>Receipt #${s.receipt_no}${s.status === 'voided' ? ' <b>(VOIDED)</b>' : ''}<br>${esc(timeFmt(s.created_at))}${s.cashier_name ? '<br>Served by: ' + esc(s.cashier_name) : ''}</div><hr>
             <table style="font-size:.88rem">${s.lines.map(l => `<tr><td style="border:0;padding:3px 0">${esc(l.name)}<br><span class="muted">${l.qty} x ${fmt(l.unit_price_cents)}</span></td><td class="num" style="border:0;padding:3px 0">${fmt(Number(l.unit_price_cents) * l.qty)}</td></tr>`).join('')}</table><hr>
-            <div class="tot"><span>Subtotal (before VAT)</span><span>${fmt(s.subtotal_cents)}</span></div>${Number(s.discount_cents) ? `<div class="tot"><span>Discount</span><span>-${fmt(s.discount_cents)}</span></div>` : ''}
-            ${Number(s.vat_rate) > 0 ? `<div class="tot"><span>VAT ${Number(s.vat_rate)}%</span><span>${fmt(s.vat_cents)}</span></div>` : ''}
+            <div class="tot"><span>Subtotal</span><span>${fmt(s.subtotal_cents)}</span></div>${Number(s.discount_cents) ? `<div class="tot"><span>Discount</span><span>-${fmt(s.discount_cents)}</span></div>` : ''}
             <div class="tot big"><span>TOTAL</span><span>KES ${fmt(s.total_cents)}</span></div>
-            <div class="tot"><span>Paid (${esc(methodLabel(s.method))})</span><span>${fmt(s.paid_cents)}</span></div>${s.mpesa_ref ? `<div class="tot"><span>Reference</span><span>${esc(s.mpesa_ref)}</span></div>` : ''}${Number(s.change_cents) ? `<div class="tot"><span>Change</span><span>${fmt(s.change_cents)}</span></div>` : ''}
+            ${vat > 0 ? `<div class="tot"><span>Amount excluding VAT</span><span>${fmt(net)}</span></div><div class="tot"><span>VAT ${VAT_RATE}% (included)</span><span>${fmt(vat)}</span></div>` : ''}
+            <div class="tot"><span>Paid (${s.method === 'mpesa' ? 'M-Pesa' : 'Cash'})</span><span>${fmt(s.paid_cents)}</span></div>${s.method === 'mpesa' ? `<div class="tot"><span>M-Pesa code</span><span>${esc(s.mpesa_ref || '')}</span></div>` : ''}${Number(s.change_cents) ? `<div class="tot"><span>Change</span><span>${fmt(s.change_cents)}</span></div>` : ''}
             ${s.status === 'voided' ? `<hr><div>Voided: ${esc(s.void_reason || '')}</div>` : ''}<hr><div style="text-align:center">${esc(sh.receipt_footer)}</div>
             <div style="text-align:center;margin-top:8px;font-size:.75rem" class="muted">Powered by Tencent POS</div>
         </div>
         <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>`;
         send(req, res, { title: 'Receipt #' + s.receipt_no, nav: 'sales', body });
     }));
+    // Voiding a sale puts the stock back. Managers can only ASK: the owner approves.
+    async function voidSale(shopId, id, reason) {
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const s = (await client.query(`UPDATE pos_sales SET status='voided', void_reason=$3, voided_at=now() WHERE id=$1 AND shop_id=$2 AND status='completed' RETURNING id, receipt_no`, [id, shopId, reason])).rows[0];
+            if (s) {
+                const lines = (await client.query(`SELECT si.item_id, si.qty FROM pos_sale_items si JOIN pos_items i ON i.id = si.item_id AND i.shop_id=$2 AND i.track_stock WHERE si.sale_id=$1 ORDER BY si.item_id`, [id, shopId])).rows;
+                for (const l of lines) {
+                    const nb = (await client.query('UPDATE pos_items SET stock = stock + $2 WHERE id=$1 AND shop_id=$3 RETURNING stock', [l.item_id, l.qty, shopId])).rows[0].stock;
+                    await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note, sale_id) VALUES ($1,$2,$3,$4,'void',$5,$6)`, [shopId, l.item_id, l.qty, nb, 'Voided receipt #' + s.receipt_no, id]);
+                }
+            }
+            await client.query('COMMIT');
+            return s || null;
+        } catch (err) { await client.query('ROLLBACK').catch(() => {}); throw err; } finally { client.release(); }
+    }
     router.post('/sales/:id/void', ah(async (req, res) => {
         const id = parseCount(req.params.id, { min: 1 });
         const reason = str(req.body.reason).slice(0, 200) || 'No reason given';
         if (!id) return res.redirect('/pos/sales');
-        const client = await pool().connect();
+        const sale = (await q(`SELECT id, receipt_no, status FROM pos_sales WHERE id=$1 AND shop_id=$2`, [id, req.shop.id])).rows[0];
+        if (!sale || sale.status !== 'completed') return res.redirect('/pos/sales');
+        if (req.actor.role === 'owner') {
+            await voidSale(req.shop.id, id, reason);
+            await audit(req, 'sale.void', `receipt #${sale.receipt_no}: ${reason}`);
+            return res.redirect(`/pos/sales/${id}/receipt`);
+        }
         try {
-            await client.query('BEGIN');
-            const s = (await client.query(`UPDATE pos_sales SET status='voided', void_reason=$3, voided_at=now() WHERE id=$1 AND shop_id=$2 AND status='completed' RETURNING id, receipt_no`, [id, req.shop.id, reason])).rows[0];
-            if (s) {
-                const lines = (await client.query(`SELECT si.item_id, si.qty FROM pos_sale_items si JOIN pos_items i ON i.id = si.item_id AND i.shop_id=$2 AND i.track_stock WHERE si.sale_id=$1 ORDER BY si.item_id`, [id, req.shop.id])).rows;
-                for (const l of lines) {
-                    const nb = (await client.query('UPDATE pos_items SET stock = stock + $2 WHERE id=$1 AND shop_id=$3 RETURNING stock', [l.item_id, l.qty, req.shop.id])).rows[0].stock;
-                    await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note, sale_id) VALUES ($1,$2,$3,$4,'void',$5,$6)`, [req.shop.id, l.item_id, l.qty, nb, 'Voided receipt #' + s.receipt_no, id]);
-                }
-            }
-            await client.query('COMMIT');
-        } catch (err) { await client.query('ROLLBACK').catch(() => {}); throw err; } finally { client.release(); }
-        res.redirect(`/pos/sales/${id}/receipt`);
+            await q(`INSERT INTO pos_void_requests (shop_id, sale_id, reason, requested_by, staff_id) VALUES ($1,$2,$3,$4,$5)`, [req.shop.id, id, reason, req.actor.name || '', req.actor.staffId]);
+            await audit(req, 'void.request', `receipt #${sale.receipt_no}: ${reason}`);
+        } catch (e) { if (e.code !== '23505') throw e; }   // already waiting for the owner
+        res.redirect(`/pos/sales/${id}/receipt?ok=` + encodeURIComponent('Sent to the owner for approval. The sale stays as it is until then.'));
+    }));
+    router.get('/voids', ah(async (req, res) => {
+        const rows = (await q(`SELECT v.id, v.reason, v.requested_by, v.status, v.created_at, v.decided_by, s.receipt_no, s.total_cents, sh.name AS shop FROM pos_void_requests v JOIN pos_sales s ON s.id = v.sale_id JOIN pos_shops sh ON sh.id = v.shop_id WHERE sh.id=$1 OR sh.parent_id=$1 ORDER BY (v.status='pending') DESC, v.id DESC LIMIT 60`, [req.biz.id])).rows;
+        send(req, res, { title: 'Void Requests', nav: 'voids', body: `<h1>Void Requests</h1>${notice(req)}<p class="muted">Managers cannot cancel a sale on their own: they ask here, and the stock goes back only after you approve.</p>
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>When</th><th>Branch</th><th>Receipt</th><th class="num">Total</th><th>Asked by</th><th>Reason</th><th></th></tr>${rows.map(v => `<tr><td class="nowrap">${esc(timeFmt(v.created_at))}</td><td>${esc(v.shop)}</td><td>#${v.receipt_no}</td><td class="num">${fmt(v.total_cents)}</td><td>${esc(v.requested_by)}</td><td>${esc(v.reason)}</td><td class="right nowrap">${v.status === 'pending' ? `<form action="/pos/voids/${v.id}/approve" method="POST" style="display:inline"><button class="btn small ok">Approve</button></form> <form action="/pos/voids/${v.id}/reject" method="POST" style="display:inline"><button class="btn small ghost">Reject</button></form>` : `<span class="tag ${v.status === 'approved' ? 'ok' : 'gray'}">${esc(v.status)}</span>`}</td></tr>`).join('')}</table>` : '<p class="muted">No requests.</p>'}</div>` });
+    }));
+    const decideVoid = (name, status) => router.post('/voids/:id/' + name, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const v = id && (await q(`UPDATE pos_void_requests SET status=$3, decided_at=now(), decided_by=$4 WHERE id=$1 AND status='pending' AND shop_id IN (SELECT id FROM pos_shops WHERE id=$2 OR parent_id=$2) RETURNING shop_id, sale_id, reason`, [id, req.biz.id, status, req.actor.name || 'Owner'])).rows[0];
+        if (v && status === 'approved') await voidSale(v.shop_id, v.sale_id, v.reason + ' (approved by owner)');
+        if (v) await audit(req, 'void.' + status, 'request #' + id);
+        res.redirect('/pos/voids?ok=' + encodeURIComponent(v ? 'Done.' : 'That request was already handled.'));
+    }));
+    decideVoid('approve', 'approved'); decideVoid('reject', 'rejected');
+
+    // ----- audit log page -----
+    router.get('/audit', ah(async (req, res) => {
+        const pageNo = Math.max(1, parseCount(req.query.page || '1', { min: 1, max: 100000 }) || 1), per = 100;
+        const pre = str(req.query.action).replace(/[^a-z0-9._]/g, '').slice(0, 30);
+        const rows = (await q(`SELECT created_at, actor_kind, actor_name, action, detail, ip, shop_id FROM pos_audit WHERE business_id=$1 AND ($2 = '' OR action LIKE $2 || '%') ORDER BY id DESC LIMIT $3 OFFSET $4`, [req.biz.id, pre, per + 1, (pageNo - 1) * per])).rows;
+        send(req, res, { title: 'Audit Log', nav: 'audit', body: `<h1>Audit Log</h1><p class="muted">A permanent record of sensitive actions. Nobody, including you, can edit or delete it.</p>
+        <div class="panel"><form method="GET" class="row"><div><label for="a">Show only</label><select id="a" name="action"><option value="">Everything</option>${['sale', 'void', 'staff', 'gateway', 'payment', '2fa', 'branch', 'settings', 'sub', 'stock'].map(x => `<option value="${x}" ${pre === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><button class="btn dark" type="submit">Filter</button></form></div>
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>When</th><th>Who</th><th>Action</th><th>Details</th><th>Network</th></tr>${rows.slice(0, per).map(r => `<tr><td class="nowrap">${esc(timeFmt(r.created_at))}</td><td>${esc(r.actor_name || r.actor_kind)}<br><small class="muted">${esc(r.actor_kind)}</small></td><td>${esc(r.action)}</td><td>${esc(r.detail)}</td><td><small>${esc(r.ip)}</small></td></tr>`).join('')}</table>` : '<p class="muted">Nothing recorded yet.</p>'}
+        <p>${pageNo > 1 ? `<a class="btn small ghost" href="/pos/audit?page=${pageNo - 1}&action=${esc(pre)}">Newer</a> ` : ''}${rows.length > per ? `<a class="btn small ghost" href="/pos/audit?page=${pageNo + 1}&action=${esc(pre)}">Older</a>` : ''}</p></div>` });
+    }));
+
+    // ----- two-step login: set-up page -----
+    router.get('/security', ah(async (req, res) => {
+        const uid = req.session.user.id, row = (await q('SELECT secret, enabled FROM pos_owner_security WHERE user_id=$1', [uid])).rows[0];
+        let body;
+        if (!vault.enabled) body = '<div class="alert" role="alert">Two-step login needs POS_CRED_KEY to be set on the server first.</div>';
+        else if (row && row.enabled) body = `<div class="panel" style="max-width:620px"><h2>Two-step login is ON <span class="tag ok">protected</span></h2><p>Every time you open the POS you type a code from your authenticator app. Payment settings need a fresh code.</p>
+            <form action="/pos/security/disable" method="POST" class="row"><div><label for="o">To turn it off, enter a current code</label><input id="o" name="otp" inputmode="numeric" required maxlength="20" autocomplete="one-time-code"></div><button class="btn bad" type="submit">Turn off</button></form></div>`;
+        else if (row) {
+            const sec = vault.open(row.secret, '2fa:' + uid).s;
+            body = `<div class="panel" style="max-width:620px"><h2>Finish setting up</h2><ol style="line-height:1.8"><li>Install an authenticator app (Google Authenticator, Microsoft Authenticator or Authy).</li><li>Add an account and choose <i>Enter a setup key</i>. Account: <b>${esc(req.session.user.email || 'Tencent POS')}</b>, key: <b style="letter-spacing:.08em;word-break:break-all">${esc(sec.match(/.{1,4}/g).join(' '))}</b>, type: time based.</li><li>Type the 6-digit code it shows below.</li></ol>
+            <form action="/pos/security/enable" method="POST" class="row"><div><label for="c">6-digit code</label><input id="c" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code"></div><button class="btn ok" type="submit">Turn on</button></form>
+            <p class="muted">Phone with the key? On the phone itself you can tap this link to add it: <a href="${esc(SEC.otpauthUri(req.session.user.email || 'owner', sec))}">open in authenticator</a>.</p></div>`;
+        } else body = '<div class="panel" style="max-width:620px"><h2>Two-step login is OFF</h2><p>A stolen or guessed password would give a stranger your whole business, including where your M-Pesa money is sent. Two-step login stops that. It is required to change payment settings.</p><form action="/pos/security/start" method="POST"><button class="btn ok" type="submit">Set up two-step login</button></form></div>';
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Security</h1>${notice(req)}${errBox(req)}${body}` });
+    }));
+    router.post('/security/start', ah(async (req, res) => {
+        if (!vault.enabled || req.has2fa) return back(res, '/pos/security', '', req.has2fa ? 'Already on.' : 'Two-step login needs POS_CRED_KEY to be set on the server.');
+        const uid = req.session.user.id;
+        await q(`INSERT INTO pos_owner_security (user_id, secret, enabled) VALUES ($1,$2,FALSE) ON CONFLICT (user_id) DO UPDATE SET secret=EXCLUDED.secret, enabled=FALSE, last_counter=0, recovery='[]'::jsonb`, [uid, vault.seal({ s: SEC.newTotpSecret() }, '2fa:' + uid)]);
+        res.redirect('/pos/security');
+    }));
+    router.post('/security/enable', ah(async (req, res) => {
+        const uid = req.session.user.id, kUser = '2fa:' + uid;
+        if (await failLocked([kUser])) return back(res, '/pos/security', '', 'Too many wrong codes. Wait 15 minutes.');
+        const row = (await q('SELECT secret, enabled FROM pos_owner_security WHERE user_id=$1', [uid])).rows[0];
+        const counter = row && !row.enabled ? SEC.checkTotp(vault.open(row.secret, '2fa:' + uid).s, req.body.otp, 0) : null;
+        if (!counter) { await failHit(kUser, 5, 900, 900); return back(res, '/pos/security', '', 'That code is not right. Check the phone clock is automatic and try the newest code.'); }
+        const codes = SEC.newRecoveryCodes(8);
+        await q('UPDATE pos_owner_security SET enabled=TRUE, last_counter=$2, recovery=$3::jsonb WHERE user_id=$1', [uid, counter, JSON.stringify(codes.map(SEC.hashRecovery))]);
+        req.session.pos2faAt = Date.now(); req.session.posStepAt = Date.now();
+        await saveSess(req);
+        await audit(req, '2fa.enabled', '');
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Two-step login is on</h1><div class="panel" style="max-width:620px"><h2>Save your recovery codes</h2><p>If you lose your phone, each of these codes works once instead of the app code. <b>They are shown only now.</b> Write them down and keep them somewhere safe.</p><pre style="font-size:1.1rem;line-height:1.8">${codes.map(esc).join('\n')}</pre><a class="btn" href="/pos/security">I have saved them</a></div>` });
+    }));
+    router.post('/security/disable', ah(async (req, res) => {
+        const r = await verifyOwnerOtp(req, req.body.otp);
+        if (!r.ok) return back(res, '/pos/security', '', r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.');
+        await q('DELETE FROM pos_owner_security WHERE user_id=$1', [req.session.user.id]);
+        await audit(req, '2fa.disabled', '');
+        back(res, '/pos/security', 'Two-step login turned off.');
     }));
 
     // ----- daily report (Z-report) -----
     async function periodSummary(shopId, from, to) {
         const f = `(created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3`;
-        const [s, v, p, e, top, cash] = await Promise.all([
+        const [s, v, p, e, top] = await Promise.all([
             q(`SELECT count(*)::int n, COALESCE(sum(subtotal_cents),0)::bigint gross, COALESCE(sum(discount_cents),0)::bigint disc, COALESCE(sum(total_cents),0)::bigint total, COALESCE(sum(vat_cents),0)::bigint vat,
                       COALESCE(sum(total_cents) FILTER (WHERE method='cash'),0)::bigint cash, COALESCE(sum(total_cents) FILTER (WHERE method='mpesa'),0)::bigint mpesa
                FROM pos_sales WHERE shop_id=$1 AND status='completed' AND ${f}`, [shopId, from, to]),
             q(`SELECT count(*)::int n, COALESCE(sum(total_cents),0)::bigint total FROM pos_sales WHERE shop_id=$1 AND status='voided' AND ${f}`, [shopId, from, to]),
             q(`SELECT COALESCE(sum((si.unit_price_cents - si.unit_cost_cents) * si.qty),0)::bigint profit, COALESCE(sum(si.qty),0)::int units FROM pos_sale_items si JOIN pos_sales s ON s.id = si.sale_id WHERE s.shop_id=$1 AND s.status='completed' AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3`, [shopId, from, to]),
             q(`SELECT COALESCE(sum(amount_cents),0)::bigint total FROM pos_expenses WHERE shop_id=$1 AND spent_on BETWEEN $2 AND $3`, [shopId, from, to]),
-            q(`SELECT si.name, sum(si.qty)::int qty, sum(si.qty * si.unit_price_cents)::bigint revenue FROM pos_sale_items si JOIN pos_sales s ON s.id = si.sale_id WHERE s.shop_id=$1 AND s.status='completed' AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 GROUP BY si.name ORDER BY qty DESC, revenue DESC LIMIT 10`, [shopId, from, to]),
-            q(`SELECT COALESCE(NULLIF(user_name,''),'-') AS who, count(*)::int n, sum(total_cents)::bigint total FROM pos_sales WHERE shop_id=$1 AND status='completed' AND ${f} GROUP BY 1 ORDER BY 3 DESC`, [shopId, from, to])
+            q(`SELECT si.name, sum(si.qty)::int qty, sum(si.qty * si.unit_price_cents)::bigint revenue FROM pos_sale_items si JOIN pos_sales s ON s.id = si.sale_id WHERE s.shop_id=$1 AND s.status='completed' AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 GROUP BY si.name ORDER BY qty DESC, revenue DESC LIMIT 10`, [shopId, from, to])
         ]);
         const S = s.rows[0], P = p.rows[0], E = e.rows[0];
-        S.other = Number(S.total) - Number(S.cash) - Number(S.mpesa);
-        // prices are before VAT, so profit is item margin after discounts; the VAT charged belongs to KRA and is shown separately
-        const gross = Number(P.profit) - Number(S.disc);
-        return { S, V: v.rows[0], units: P.units, gross, expenses: Number(E.total), net: gross - Number(E.total), top: top.rows, byCashier: cash.rows };
+        // profit is measured after discounts and without VAT (the VAT inside the prices belongs to KRA, not to the shop)
+        const gross = Number(P.profit) - Number(S.disc) - Number(S.vat);
+        return { S, V: v.rows[0], units: P.units, gross, expenses: Number(E.total), net: gross - Number(E.total), top: top.rows };
     }
     router.get('/daily', ah(async (req, res) => {
         const day = validDate(req.query.date) ? req.query.date : todayNairobi();
@@ -1158,12 +1291,11 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
         const row = (k, v, strong) => `<tr><td>${strong ? '<b>' + k + '</b>' : k}</td><td class="num">${strong ? '<b>' + v + '</b>' : v}</td></tr>`;
         send(req, res, { title: 'Daily Sales', nav: 'daily', body: `<h1>Daily Sales (Z-Report)</h1>
         <div class="panel noprint"><form method="GET" class="row"><div><label for="d">Date</label><input id="d" type="date" name="date" value="${day}"></div><button class="btn dark" type="submit">Show</button><button class="btn" type="button" id="prt">Print</button></form></div>
-        <div class="panel" style="max-width:560px"><h2>${esc(req.shop.name)} (${esc(req.shop.branch)}): ${esc(dateFmt(day + 'T12:00:00+03:00'))}</h2><table>
-            ${row('Number of sales', r.S.n)}${row('Items sold', r.units)}${row('Sales before VAT and discounts', kes(r.S.gross))}${row('Discounts given', '-' + kes(r.S.disc))}${row('Total sales', kes(r.S.total), true)}
-            ${row('VAT charged (included in total sales)', kes(r.S.vat))}${row('Cash sales (expected in the drawer)', kes(r.S.cash))}${row('M-Pesa sales', kes(r.S.mpesa))}${row('Other payment types', kes(r.S.other))}${row('Voided sales (' + r.V.n + ')', kes(r.V.total))}
+        <div class="panel" style="max-width:560px"><h2>${esc(req.shop.name)}: ${esc(dateFmt(day + 'T12:00:00+03:00'))}</h2><table>
+            ${row('Number of sales', r.S.n)}${row('Items sold', r.units)}${row('Sales before discounts', kes(r.S.gross))}${row('Discounts given', '-' + kes(r.S.disc))}${row('Total sales', kes(r.S.total), true)}${row('Sales excluding VAT', kes(Number(r.S.total) - Number(r.S.vat)))}${row('VAT collected (' + VAT_RATE + '%, included in prices)', kes(r.S.vat))}
+            ${row('Cash sales (expected in the drawer)', kes(r.S.cash))}${row('M-Pesa sales', kes(r.S.mpesa))}${row('Voided sales (' + r.V.n + ')', kes(r.V.total))}
             ${row('Gross profit', kes(r.gross))}${row('Expenses', kes(r.expenses))}${row('Net profit', (r.net < 0 ? '-' : '') + kes(Math.abs(r.net)), true)}</table></div>
-        <div class="grid2" style="align-items:start;max-width:1100px"><div class="panel"><h2>Sales by cashier</h2>${r.byCashier.length ? `<table><tr><th>Cashier</th><th class="num">Sales</th><th class="num">Total</th></tr>${r.byCashier.map(c => `<tr><td>${esc(c.who)}</td><td class="num">${c.n}</td><td class="num">${fmt(c.total)}</td></tr>`).join('')}</table>` : '<p class="muted">No sales on this day.</p>'}</div>
-        <div class="panel"><h2>Best sellers</h2>${r.top.length ? `<table><tr><th>Item</th><th class="num">Qty</th><th class="num">Sales</th></tr>${r.top.map(t => `<tr><td>${esc(t.name)}</td><td class="num">${t.qty}</td><td class="num">${fmt(t.revenue)}</td></tr>`).join('')}</table>` : '<p class="muted">No sales on this day.</p>'}</div></div>
+        <div class="panel" style="max-width:560px"><h2>Best sellers</h2>${r.top.length ? `<table><tr><th>Item</th><th class="num">Qty</th><th class="num">Sales</th></tr>${r.top.map(t => `<tr><td>${esc(t.name)}</td><td class="num">${t.qty}</td><td class="num">${fmt(t.revenue)}</td></tr>`).join('')}</table>` : '<p class="muted">No sales on this day.</p>'}</div>
         <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>` });
     }));
 
@@ -1208,341 +1340,103 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
         const isoDay = d => (d instanceof Date ? new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString() : String(d)).slice(0, 10);
         send(req, res, { title: 'Reports', nav: 'reports', body: `<h1>Reports</h1>
         <div class="panel"><form method="GET" class="row"><div><label for="f">From</label><input id="f" type="date" name="from" value="${from}"></div><div><label for="t">To</label><input id="t" type="date" name="to" value="${to}"></div><button class="btn dark" type="submit">Show</button><a class="btn ghost" href="/pos/reports.csv?from=${from}&to=${to}">Download CSV</a></form></div>
-        <div class="cards"><div class="stat c1"><span>Total sales</span><b>${kes(r.S.total)}</b><span>${r.S.n} sales</span></div><div class="stat c3"><span>Gross profit</span><b>${kes(r.gross)}</b></div><div class="stat c4"><span>Expenses</span><b>${kes(r.expenses)}</b></div><div class="stat ${r.net >= 0 ? 'c2' : 'c9'}"><span>Net profit</span><b>${r.net < 0 ? '-' : ''}${kes(Math.abs(r.net))}</b></div><div class="stat c7"><span>Cash</span><b>${kes(r.S.cash)}</b></div><div class="stat c5"><span>M-Pesa</span><b>${kes(r.S.mpesa)}</b></div></div>
+        <div class="cards"><div class="stat c1"><span>Total sales</span><b>${kes(r.S.total)}</b><span>${r.S.n} sales</span></div><div class="stat c3"><span>Gross profit</span><b>${kes(r.gross)}</b></div><div class="stat c4"><span>Expenses</span><b>${kes(r.expenses)}</b></div><div class="stat ${r.net >= 0 ? 'c2' : 'c9'}"><span>Net profit</span><b>${r.net < 0 ? '-' : ''}${kes(Math.abs(r.net))}</b></div><div class="stat c6"><span>VAT collected</span><b>${kes(r.S.vat)}</b></div><div class="stat c7"><span>Cash</span><b>${kes(r.S.cash)}</b></div><div class="stat c5"><span>M-Pesa</span><b>${kes(r.S.mpesa)}</b></div></div>
         <div class="grid2" style="align-items:start"><div class="panel"><h2>Best sellers</h2>${r.top.length ? `<table><tr><th>Item</th><th class="num">Qty</th><th class="num">Sales</th></tr>${r.top.map(t => `<tr><td>${esc(t.name)}</td><td class="num">${t.qty}</td><td class="num">${fmt(t.revenue)}</td></tr>`).join('')}</table>` : '<p class="muted">No sales in this period.</p>'}</div>
         <div class="panel"><h2>Sales by day</h2>${days.rows.length ? `<div class="tablewrap"><table><tr><th>Day</th><th class="num">Sales</th><th class="num">Total</th></tr>${days.rows.map(d => `<tr><td>${esc(dateFmt(isoDay(d.d) + 'T12:00:00+03:00'))}</td><td class="num">${d.n}</td><td class="num">${fmt(d.total)}</td></tr>`).join('')}</table></div>` : '<p class="muted">No sales in this period.</p>'}</div></div>` });
     }));
     router.get('/reports.csv', ah(async (req, res) => {
         const today = todayNairobi();
         const from = validDate(req.query.from) ? req.query.from : today.slice(0, 8) + '01', to = validDate(req.query.to) ? req.query.to : today;
-        const r = await q(`SELECT s.receipt_no, s.created_at, s.method, s.mpesa_ref, s.subtotal_cents, s.discount_cents, s.total_cents, s.status, string_agg(si.name || ' x' || si.qty, '; ' ORDER BY si.id) AS items
+        const r = await q(`SELECT s.receipt_no, s.created_at, s.method, s.mpesa_ref, s.subtotal_cents, s.discount_cents, s.total_cents, s.vat_cents, s.cashier_name, s.status, string_agg(si.name || ' x' || si.qty, '; ' ORDER BY si.id) AS items
             FROM pos_sales s LEFT JOIN pos_sale_items si ON si.sale_id = s.id WHERE s.shop_id=$1 AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 GROUP BY s.id ORDER BY s.created_at`, [req.shop.id, from, to]);
-        const lines = [['Receipt', 'Date', 'Method', 'M-Pesa code', 'Subtotal', 'Discount', 'Total', 'Status', 'Items'].map(csvCell).join(',')];
-        for (const s of r.rows) lines.push([s.receipt_no, timeFmt(s.created_at), s.method, s.mpesa_ref || '', (s.subtotal_cents / 100).toFixed(2), (s.discount_cents / 100).toFixed(2), (s.total_cents / 100).toFixed(2), s.status, s.items || ''].map(csvCell).join(','));
+        const lines = [['Receipt', 'Date', 'Method', 'M-Pesa code', 'Subtotal', 'Discount', 'Total', 'VAT included', 'Cashier', 'Status', 'Items'].map(csvCell).join(',')];
+        for (const s of r.rows) lines.push([s.receipt_no, timeFmt(s.created_at), s.method, s.mpesa_ref || '', (s.subtotal_cents / 100).toFixed(2), (s.discount_cents / 100).toFixed(2), (s.total_cents / 100).toFixed(2), (s.vat_cents / 100).toFixed(2), s.cashier_name || '', s.status, s.items || ''].map(csvCell).join(','));
         res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="sales-${from}-to-${to}.csv"`, 'Cache-Control': 'no-store' }).send('﻿' + lines.join('\r\n'));
     }));
 
-    // ======================= BUSINESS, BRANCHES, STAFF, PAYMENTS, SUBSCRIPTION =======================
-    const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
-    const delPost = (action, label = 'Delete') => `<form action="${action}" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${label}</button></form>`;
-    const killSessions = uid => q(`DELETE FROM session WHERE (sess->'user'->>'id') = $1`, [String(uid)]).catch(() => {});
-
-    // creates a login for a cashier or manager; the owner vouches for them, so no email confirmation is needed
-    async function createStaff(client, { bizId, branchId, role, name, email, phone, password, fallbackPhone }) {
-        name = str(name).slice(0, 80); email = str(email).toLowerCase();
-        if (name.length < 2) return 'Enter the person\'s name.';
-        if (!validEmail(email)) return 'Enter a valid email address. It is what they log in with.';
-        if (typeof password !== 'string' || password.length < 8 || password.length > 72) return 'The password must be 8 to 72 characters.';
-        const ph = phone ? platform.normalizePhone(phone) : '';
-        if (phone && !ph) return 'The phone number is not valid.';
-        if ((await client.query('SELECT 1 FROM users WHERE lower(email)=$1', [email])).rowCount) return 'That email already has an account. Use a different email.';
-        const hash = await platform.hashPassword(password);
-        const u = (await client.query('INSERT INTO users (name, email, phone, password_hash, email_verified) VALUES ($1,$2,$3,$4,TRUE) RETURNING id', [name, email, ph || fallbackPhone || '-', hash])).rows[0];
-        await client.query('INSERT INTO pos_members (user_id, business_id, branch_id, role) VALUES ($1,$2,$3,$4)', [u.id, bizId, branchId, role]);
-        return '';
-    }
-
-    // ----- branch settings -----
+    // ----- settings (owner only) -----
     router.get('/settings', ah(async (req, res) => {
-        const s = req.shop;
-        send(req, res, { title: 'Branch Settings', nav: 'settings', body: `<h1>Branch Settings</h1>${notice(req)}${errBox(req)}<div class="panel" style="max-width:620px"><form action="/pos/settings" method="POST">
-            <div class="field"><label for="n">Branch name</label><input id="n" name="name" required maxlength="120" value="${esc(s.branch)}"></div>
-            <div class="field"><label for="p">Branch phone</label><input id="p" name="phone" maxlength="40" value="${esc(s.phone)}"></div>
-            <div class="field"><label for="a">Branch address</label><input id="a" name="address" maxlength="200" value="${esc(s.address)}"></div>
+        const s = req.shop, b = req.biz, isBranch = s.id !== b.id;
+        const logo = b.logo && LOGO_OK.test(b.logo) ? b.logo : '';
+        send(req, res, { title: 'Shop Settings', nav: 'settings', body: `<h1>Shop Settings</h1>${notice(req)}${errBox(req)}
+        <div class="panel" style="max-width:620px"><h2>${isBranch ? 'This branch' : 'Your shop'}</h2>${isBranch ? '<p class="muted">You are editing the branch chosen at the top of the menu. The name and address print on this branch\'s receipts.</p>' : ''}<form action="/pos/settings" method="POST">
+            <div class="field"><label for="n">${isBranch ? 'Branch name' : 'Business name (printed on receipts)'}</label><input id="n" name="name" required maxlength="120" value="${esc(s.name)}"></div>
+            <div class="field"><label for="p">Phone</label><input id="p" name="phone" maxlength="40" value="${esc(s.phone)}"></div>
+            <div class="field"><label for="a">Address</label><input id="a" name="address" maxlength="200" value="${esc(s.address)}"></div>
+            <div class="field"><label for="f">Receipt footer message</label><input id="f" name="footer" maxlength="200" value="${esc(s.receipt_footer)}"></div>
             <button class="btn" type="submit">Save</button></form></div>
-            ${req.role === 'owner' ? '<p class="muted">The business name, logo, KRA PIN, VAT and receipt footer are under <a href="/pos/business">Business & Receipts</a>.</p>' : ''}` });
+        <div class="panel" style="max-width:620px"><h2>Business-wide (all branches)</h2><form action="/pos/settings/business" method="POST">
+            <div class="field"><label for="k">KRA PIN (printed on receipts)</label><input id="k" name="tax_pin" maxlength="40" value="${esc(b.tax_pin)}"></div>
+            <div class="field"><label><input type="checkbox" name="vat" value="1" ${b.vat_enabled ? 'checked' : ''} style="width:auto"> My prices include ${VAT_RATE}% VAT (receipts show the VAT amount)</label><small>Switch this off only if the business is not registered for VAT.</small></div>
+            <button class="btn" type="submit">Save</button></form></div>
+        <div class="panel" style="max-width:620px"><h2>Receipt logo</h2>
+            <p>${logo ? `<img src="${logo}" alt="Your logo" style="max-height:90px;max-width:260px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:4px">` : '<span class="muted">No logo yet.</span>'}</p>
+            <div class="field"><label for="logo-file">Choose a logo (PNG or JPG)</label><input id="logo-file" type="file" accept="image/png,image/jpeg"><small>It is shrunk to fit automatically and printed at the top of every receipt.</small></div>
+            <p><img id="logo-prev" alt="Preview" style="display:none;max-height:90px;max-width:260px;border:1px dashed var(--line);border-radius:6px;padding:4px"></p>
+            <div id="logo-msg" class="muted" role="status"></div>
+            <button class="btn" id="logo-save" type="button" disabled>Save logo</button>
+            ${logo ? '<form action="/pos/settings/logo/remove" method="POST" style="display:inline"><button class="btn ghost" type="submit">Remove logo</button></form>' : ''}</div>
+        <script nonce="${req.nonce || ''}">
+        (function () {
+            var f = document.getElementById('logo-file'), pv = document.getElementById('logo-prev'), msg = document.getElementById('logo-msg'), btn = document.getElementById('logo-save'), data = '';
+            f.addEventListener('change', function () {
+                var file = f.files[0]; if (!file) return; btn.disabled = true; data = '';
+                if (file.type !== 'image/png' && file.type !== 'image/jpeg') { msg.textContent = 'Please choose a PNG or JPG picture.'; return; }
+                var rd = new FileReader();
+                rd.onerror = function () { msg.textContent = 'Could not read that picture.'; };
+                rd.onload = function () {
+                    var img = new Image();
+                    img.onerror = function () { msg.textContent = 'Could not read that picture.'; };
+                    img.onload = function () {
+                        var s = Math.min(1, 256 / Math.max(img.width, img.height)), w = Math.max(1, Math.round(img.width * s)), h = Math.max(1, Math.round(img.height * s)), c = document.createElement('canvas');
+                        function enc(type, quality) { c.width = w; c.height = h; var x = c.getContext('2d'); if (type === 'image/jpeg') { x.fillStyle = '#fff'; x.fillRect(0, 0, w, h); } x.drawImage(img, 0, 0, w, h); return c.toDataURL(type, quality); }
+                        var out = enc('image/png', 0.92), steps = [0.85, 0.7, 0.55], i = 0;
+                        while (out.length > 38000 && i < 6) { if (i < 3) out = enc('image/jpeg', steps[i]); else { w = Math.round(w * 0.75); h = Math.round(h * 0.75); out = enc('image/jpeg', 0.7); } i++; }
+                        if (out.length > 38000) { msg.textContent = 'That picture is too detailed. Try a simpler logo.'; return; }
+                        data = out; pv.src = out; pv.style.display = ''; btn.disabled = false; msg.textContent = 'This is how it will look. Press Save logo.';
+                    };
+                    img.src = rd.result;
+                };
+                rd.readAsDataURL(file);
+            });
+            btn.addEventListener('click', function () {
+                if (!data) return; btn.disabled = true; msg.textContent = 'Saving...';
+                fetch('/pos/settings/logo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dataUrl: data }) })
+                .then(function (r) { return r.json(); }).then(function (d) { if (d.ok) location.href = '/pos/settings?ok=' + encodeURIComponent('Logo saved.'); else { msg.textContent = d.error || 'Could not save the logo.'; btn.disabled = false; } })
+                .catch(function () { msg.textContent = 'Connection problem. Try again.'; btn.disabled = false; });
+            });
+        })();
+        </script>` });
     }));
     router.post('/settings', ah(async (req, res) => {
         const name = str(req.body.name).slice(0, 120);
-        if (name.length < 2) return back(res, '/pos/settings', '', 'Enter the branch name.');
-        await q('UPDATE pos_shops SET name=$2, phone=$3, address=$4 WHERE id=$1', [req.shop.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200)]);
-        back(res, '/pos/settings', 'Saved.');
+        if (name.length < 2) return res.redirect('/pos/settings?err=' + encodeURIComponent('Please enter a name.'));
+        await q('UPDATE pos_shops SET name=$2, phone=$3, address=$4, receipt_footer=$5 WHERE id=$1', [req.shop.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200), str(req.body.footer).slice(0, 200)]);
+        res.redirect('/pos/settings?ok=' + encodeURIComponent('Saved.'));
     }));
-
-    // ----- business, receipts, logo, VAT (owner) -----
-    router.get('/business', ah(async (req, res) => {
-        const s = req.shop;
-        send(req, res, { title: 'Business & Receipts', nav: 'biz', body: `<h1>Business & Receipts</h1>${notice(req)}${errBox(req)}
-        <div class="panel" style="max-width:640px"><h2>Name and receipt details</h2><form action="/pos/business" method="POST">
-            <div class="field"><label for="n">Business name (printed on receipts)</label><input id="n" name="name" required maxlength="120" value="${esc(s.name)}"></div>
-            <div class="field"><label for="k">KRA PIN (optional)</label><input id="k" name="tax_pin" maxlength="40" value="${esc(s.tax_pin)}"></div>
-            <div class="field"><label for="v">VAT rate added to your selling prices (%)</label><input id="v" name="vat" inputmode="decimal" value="${s.vat_rate}"><small>Item prices are entered before VAT. The POS adds this VAT at the sale, and the receipt shows subtotal, VAT and the total the customer pays. Use 0 if you are not VAT registered.</small></div>
-            <div class="field"><label for="f">Receipt footer message</label><input id="f" name="footer" maxlength="200" value="${esc(s.receipt_footer)}"></div>
-            <button class="btn" type="submit">Save</button></form></div>
-        <div class="panel" style="max-width:640px"><h2>Logo</h2>
-            ${s.has_logo ? `<p><img src="/pos/logo?v=${s.logo_ver}" alt="Your logo" style="max-height:90px;max-width:260px;border:1px solid var(--line);padding:6px;border-radius:8px"></p>` : '<p class="muted">No logo yet. Your business name is printed alone.</p>'}
-            <div class="field"><label for="lg">Choose a PNG or JPG logo</label><input id="lg" type="file" accept="image/png,image/jpeg"><small>It is shrunk automatically. A simple, high-contrast logo prints best on receipts.</small></div>
-            <div id="lgmsg" class="alert" style="display:none" role="alert"></div>
-            <button class="btn" id="lgup" type="button">Upload logo</button>
-            ${s.has_logo ? delPost('/pos/business/logo/remove', 'Remove logo') : ''}</div>
-        <script nonce="${req.nonce || ''}">
-        (function(){var f=document.getElementById('lg'),b=document.getElementById('lgup'),m=document.getElementById('lgmsg');
-        function say(t){m.textContent=t;m.style.display='block';}
-        b.addEventListener('click',function(){var file=f.files&&f.files[0];if(!file){say('Choose a picture first.');return;}
-        var img=new Image(),u=URL.createObjectURL(file);img.onload=function(){var max=400,r=Math.min(1,max/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=Math.max(1,Math.round(img.width*r));c.height=Math.max(1,Math.round(img.height*r));var x=c.getContext('2d');x.drawImage(img,0,0,c.width,c.height);
-        c.toBlob(function(bl){if(!bl||bl.size>280000){c.toBlob(function(b2){send(b2);},'image/jpeg',0.85);}else send(bl);},'image/png');URL.revokeObjectURL(u);};
-        img.onerror=function(){say('That file could not be read as a picture.');};img.src=u;});
-        function send(bl){if(!bl){say('The picture could not be prepared.');return;}fetch('/pos/business/logo',{method:'POST',credentials:'same-origin',headers:{'Content-Type':bl.type},body:bl}).then(function(r){return r.json().then(function(d){return{ok:r.ok,d:d};});}).then(function(x){if(x.ok)location.href='/pos/business?ok='+encodeURIComponent('Logo saved.');else say(x.d.error||'Upload failed.');}).catch(function(){say('Connection problem. Try again.');});}})();
-        </script>` });
+    router.post('/settings/business', ah(async (req, res) => {
+        await q('UPDATE pos_shops SET tax_pin=$2, vat_enabled=$3 WHERE id=$1', [req.biz.id, str(req.body.tax_pin).slice(0, 40), req.body.vat === '1']);
+        await audit(req, 'settings.business', 'VAT ' + (req.body.vat === '1' ? 'on' : 'off') + ', KRA PIN updated');
+        res.redirect('/pos/settings?ok=' + encodeURIComponent('Saved.'));
     }));
-    router.post('/business', ah(async (req, res) => {
-        const name = str(req.body.name).slice(0, 120), vatRaw = str(req.body.vat) === '' ? '16' : str(req.body.vat);
-        if (name.length < 2) return back(res, '/pos/business', '', 'Enter the business name.');
-        if (!/^\d{1,2}(\.\d)?$/.test(vatRaw) || Number(vatRaw) > 30) return back(res, '/pos/business', '', 'The VAT rate must be a number from 0 to 30.');
-        await q('UPDATE pos_businesses SET name=$2, tax_pin=$3, receipt_footer=$4, vat_rate=$5 WHERE id=$1', [req.shop.business_id, name, str(req.body.tax_pin).slice(0, 40), str(req.body.footer).slice(0, 200), Number(vatRaw)]);
-        back(res, '/pos/business', 'Saved.');
-    }));
-    router.post('/business/logo', express.raw({ type: ['image/png', 'image/jpeg'], limit: '300kb' }), ah(async (req, res) => {
-        const b = req.body;
-        if (!Buffer.isBuffer(b) || b.length < 20) return res.status(400).json({ error: 'No picture received.' });
-        const png = b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), jpg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
-        if (!png && !jpg) return res.status(400).json({ error: 'Only PNG or JPG pictures are accepted.' });   // content is checked, not just the label
-        await q('UPDATE pos_businesses SET logo=$2, logo_mime=$3, logo_ver=logo_ver+1 WHERE id=$1', [req.shop.business_id, b, png ? 'image/png' : 'image/jpeg']);
+    router.post('/settings/logo', ah(async (req, res) => {
+        const d = String((req.body && req.body.dataUrl) || '');
+        if (d.length > 41000 || !LOGO_OK.test(d)) return res.status(400).json({ error: 'That picture could not be used. Choose a PNG or JPG.' });
+        const bytes = Buffer.from(d.slice(d.indexOf(',') + 1), 'base64');
+        const png = bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47, jpg = bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+        if (bytes.length > 30000 || !(png || jpg) || (png && !d.startsWith('data:image/png')) || (jpg && !d.startsWith('data:image/jpeg'))) return res.status(400).json({ error: 'That picture could not be used. Choose a PNG or JPG that is not too large.' });
+        await q('UPDATE pos_shops SET logo=$2 WHERE id=$1', [req.biz.id, d]);
+        await audit(req, 'settings.logo', 'logo changed');
         res.json({ ok: true });
     }));
-    router.post('/business/logo/remove', ah(async (req, res) => {
-        await q('UPDATE pos_businesses SET logo=NULL, logo_mime=NULL, logo_ver=logo_ver+1 WHERE id=$1', [req.shop.business_id]);
-        back(res, '/pos/business', 'Logo removed.');
+    router.post('/settings/logo/remove', ah(async (req, res) => {
+        await q('UPDATE pos_shops SET logo=NULL WHERE id=$1', [req.biz.id]);
+        res.redirect('/pos/settings?ok=' + encodeURIComponent('Logo removed.'));
     }));
-
-    // ----- branches (owner) -----
-    router.get('/branches', ah(async (req, res) => {
-        const r = await q(`SELECT s.*, (SELECT count(*) FROM pos_members m WHERE m.branch_id=s.id AND m.role='cashier' AND m.active)::int cashiers, (SELECT u.email FROM pos_members m JOIN users u ON u.id=m.user_id WHERE m.branch_id=s.id AND m.role='manager' AND m.active ORDER BY m.id LIMIT 1) AS manager FROM pos_shops s WHERE s.business_id=$1 ORDER BY s.id`, [req.shop.business_id]);
-        send(req, res, { title: 'Branches', nav: 'branches', body: `<h1>Branches</h1>${notice(req)}${errBox(req)}
-        <div class="panel"><h2>Open a new branch</h2><p class="muted" style="margin-top:0">Each extra branch adds KES ${branchFee().toLocaleString('en-KE')} per month to your subscription from your next payment.</p><form action="/pos/branches" method="POST"><div class="grid2">
-            <div class="field"><label for="n">Branch name</label><input id="n" name="name" required maxlength="120" placeholder="e.g. Homa Bay Town"></div>
-            <div class="field"><label for="p">Phone</label><input id="p" name="phone" maxlength="40"></div>
-            <div class="field"><label for="a">Address</label><input id="a" name="address" maxlength="200"></div></div>
-            <div class="field"><label><input type="checkbox" name="copy" value="1" style="width:auto"> Copy the items and categories of <b>${esc(req.shop.branch)}</b> (stock starts at zero)</label></div>
-            <h3 style="margin:14px 0 6px">Branch manager login (optional)</h3><p class="muted" style="margin-top:0">A manager runs this branch: items, stock, reports and cashiers. You can also add one later.</p>
-            <div class="grid2"><div class="field"><label for="mn">Manager name</label><input id="mn" name="mgr_name" maxlength="80"></div><div class="field"><label for="me">Manager email (their login)</label><input id="me" name="mgr_email" type="email" maxlength="254"></div><div class="field"><label for="mp">Password (8+ characters)</label><input id="mp" name="mgr_password" type="password" autocomplete="new-password" maxlength="72"></div></div>
-            <button class="btn" type="submit">Create branch</button></form></div>
-        <div class="panel tablewrap"><table><tr><th>Branch</th><th>Phone</th><th>Cashiers</th><th>Manager</th><th>Status</th><th></th></tr>${r.rows.map(b => `<tr><td>${esc(b.name)}<br><small class="muted">${esc(b.address)}</small></td><td>${esc(b.phone)}</td><td>${b.cashiers}</td><td>${esc(b.manager || '-')}</td><td><span class="tag ${b.active ? 'ok' : 'gray'}">${b.active ? 'active' : 'switched off'}</span></td><td class="right nowrap">${b.active ? `<form action="/pos/branch/switch" method="POST" style="display:inline"><input type="hidden" name="branch_id" value="${b.id}"><button class="btn small" type="submit">Open</button></form> ` : ''}${delPost('/pos/branches/' + b.id + '/toggle', b.active ? 'Switch off' : 'Switch on')}</td></tr>`).join('')}</table></div>` });
-    }));
-    router.post('/branches', ah(async (req, res) => {
-        const name = str(req.body.name).slice(0, 120);
-        if (name.length < 2) return back(res, '/pos/branches', '', 'Enter the branch name.');
-        const wantMgr = str(req.body.mgr_email) || str(req.body.mgr_name) || req.body.mgr_password;
-        const client = await pool().connect();
-        let err = '';
-        try {
-            await client.query('BEGIN');
-            const b = (await client.query('INSERT INTO pos_shops (business_id, name, phone, address) VALUES ($1,$2,$3,$4) RETURNING id', [req.shop.business_id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200)])).rows[0];
-            if (req.body.copy === '1') {
-                await client.query('INSERT INTO pos_categories (shop_id, name) SELECT $1, name FROM pos_categories WHERE shop_id=$2 ON CONFLICT DO NOTHING', [b.id, req.shop.id]);
-                await client.query(`INSERT INTO pos_items (shop_id, category_id, name, barcode, price_cents, cost_cents, stock, track_stock, reorder_level)
-                    SELECT $1, (SELECT c2.id FROM pos_categories c2 JOIN pos_categories c1 ON c1.name = c2.name AND c1.shop_id = $2 WHERE c1.id = i.category_id AND c2.shop_id = $1), i.name, i.barcode, i.price_cents, i.cost_cents, 0, i.track_stock, i.reorder_level FROM pos_items i WHERE i.shop_id=$2 AND i.active`, [b.id, req.shop.id]);
-            }
-            if (wantMgr) err = await createStaff(client, { bizId: req.shop.business_id, branchId: b.id, role: 'manager', name: req.body.mgr_name, email: req.body.mgr_email, password: req.body.mgr_password, fallbackPhone: str(req.body.phone) });
-            if (err) await client.query('ROLLBACK'); else await client.query('COMMIT');
-        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
-        if (err) return back(res, '/pos/branches', '', err);
-        back(res, '/pos/branches', 'Branch created.');
-    }));
-    router.post('/branches/:id/toggle', ah(async (req, res) => {
-        const id = parseCount(req.params.id, { min: 1 });
-        if (id) {
-            const active = (await q('SELECT count(*)::int n FROM pos_shops WHERE business_id=$1 AND active', [req.shop.business_id])).rows[0].n;
-            const r = (await q('SELECT active FROM pos_shops WHERE id=$1 AND business_id=$2', [id, req.shop.business_id])).rows[0];
-            if (r && r.active && active <= 1) return back(res, '/pos/branches', '', 'You need at least one active branch.');
-            if (r) await q('UPDATE pos_shops SET active = NOT active WHERE id=$1 AND business_id=$2', [id, req.shop.business_id]);
-        }
-        back(res, '/pos/branches', 'Updated.');
-    }));
-    router.post('/branch/switch', ah(async (req, res) => {
-        const id = parseCount(req.body.branch_id, { min: 1 });
-        if (id && req.branches.some(b => b.id === id)) req.session.posBranch = id;
-        res.redirect('/pos/app');
-    }));
-
-    // ----- cashiers and staff of the current branch -----
-    router.get('/staff', ah(async (req, res) => {
-        const r = await q(`SELECT m.id, m.role, m.active, u.name, u.email, u.phone FROM pos_members m JOIN users u ON u.id=m.user_id WHERE m.branch_id=$1 AND m.business_id=$2 ORDER BY m.role, u.name`, [req.shop.id, req.shop.business_id]);
-        send(req, res, { title: 'Cashiers & Staff', nav: 'staff', body: `<h1>Cashiers & Staff <small class="muted" style="font-size:.9rem">${esc(req.shop.branch)}</small></h1>${notice(req)}${errBox(req)}
-        <div class="panel"><h2>Add a login for this branch</h2><form action="/pos/staff" method="POST"><div class="grid2">
-            <div class="field"><label for="n">Name</label><input id="n" name="name" required maxlength="80"></div>
-            <div class="field"><label for="e">Email (their login)</label><input id="e" name="email" type="email" required maxlength="254"></div>
-            <div class="field"><label for="p">Phone (optional)</label><input id="p" name="phone" maxlength="20"></div>
-            <div class="field"><label for="w">Password (8+ characters)</label><input id="w" name="password" type="password" required minlength="8" maxlength="72" autocomplete="new-password"></div>
-            <div class="field"><label for="r">Role</label><select id="r" name="role"><option value="cashier">Cashier: sells and views own sales</option>${req.role === 'owner' ? '<option value="manager">Manager: runs this branch</option>' : ''}</select></div></div>
-            <button class="btn" type="submit">Add login</button></form><p class="muted">Give the person their email and password. They log in at the website and open the POS. Each cashier's sales are recorded under their name.</p></div>
-        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Name</th><th>Login email</th><th>Role</th><th>Status</th><th></th></tr>${r.rows.map(m => `<tr><td>${esc(m.name)}</td><td>${esc(m.email)}</td><td>${esc(m.role)}</td><td><span class="tag ${m.active ? 'ok' : 'gray'}">${m.active ? 'active' : 'switched off'}</span></td><td class="right nowrap">${(req.role === 'owner' || m.role === 'cashier') ? `${delPost('/pos/staff/' + m.id + '/toggle', m.active ? 'Switch off' : 'Switch on')} <form action="/pos/staff/${m.id}/password" method="POST" style="display:inline"><input name="password" type="password" placeholder="New password" minlength="8" maxlength="72" required style="width:140px;display:inline-block;padding:5px" autocomplete="new-password"> <button class="btn small ghost" type="submit">Set</button></form>` : ''}</td></tr>`).join('')}</table>` : '<p class="muted">No cashiers yet for this branch.</p>'}</div>` });
-    }));
-    router.post('/staff', ah(async (req, res) => {
-        const role = req.body.role === 'manager' && req.role === 'owner' ? 'manager' : 'cashier';
-        const client = await pool().connect();
-        let err = '';
-        try {
-            await client.query('BEGIN');
-            err = await createStaff(client, { bizId: req.shop.business_id, branchId: req.shop.id, role, name: req.body.name, email: req.body.email, phone: str(req.body.phone), password: req.body.password, fallbackPhone: req.shop.phone });
-            if (err) await client.query('ROLLBACK'); else await client.query('COMMIT');
-        } catch (e) { await client.query('ROLLBACK').catch(() => {}); if (e.code === '23505') err = 'That email already has an account.'; else throw e; } finally { client.release(); }
-        back(res, '/pos/staff', 'Login added.', err);
-    }));
-    const staffRow = async (req, idParam) => {
-        const id = parseCount(idParam, { min: 1 });
-        const m = id && (await q(`SELECT id, user_id, role, active FROM pos_members WHERE id=$1 AND branch_id=$2 AND business_id=$3 AND role <> 'owner'`, [id, req.shop.id, req.shop.business_id])).rows[0];
-        return m && (req.role === 'owner' || m.role === 'cashier') ? m : null;
-    };
-    router.post('/staff/:id/toggle', ah(async (req, res) => {
-        const m = await staffRow(req, req.params.id);
-        if (m) { await q('UPDATE pos_members SET active = NOT active WHERE id=$1', [m.id]); if (m.active) await killSessions(m.user_id); }
-        back(res, '/pos/staff', 'Updated.');
-    }));
-    router.post('/staff/:id/password', ah(async (req, res) => {
-        const m = await staffRow(req, req.params.id), pw = typeof req.body.password === 'string' ? req.body.password : '';
-        if (!m) return back(res, '/pos/staff', '', 'Person not found.');
-        if (pw.length < 8 || pw.length > 72) return back(res, '/pos/staff', '', 'The password must be 8 to 72 characters.');
-        await q('UPDATE users SET password_hash=$2 WHERE id=$1', [m.user_id, await platform.hashPassword(pw)]);
-        await killSessions(m.user_id);
-        back(res, '/pos/staff', 'Password changed. They have been logged out.');
-    }));
-
-    // ----- all-branch report (owner) -----
-    router.get('/business-report', ah(async (req, res) => {
-        const today = todayNairobi();
-        const from = validDate(req.query.from) ? req.query.from : today.slice(0, 8) + '01', to = validDate(req.query.to) ? req.query.to : today;
-        const all = (await q('SELECT id, name, active FROM pos_shops WHERE business_id=$1 ORDER BY id', [req.shop.business_id])).rows;
-        const rows = await Promise.all(all.map(async b => ({ b, r: await periodSummary(b.id, from, to) })));
-        const sum = f => rows.reduce((a, x) => a + f(x.r), 0);
-        send(req, res, { title: 'All-branch Report', nav: 'bizreport', body: `<h1>All-branch Report</h1>
-        <div class="panel"><form method="GET" class="row"><div><label for="f">From</label><input id="f" type="date" name="from" value="${from}"></div><div><label for="t">To</label><input id="t" type="date" name="to" value="${to}"></div><button class="btn dark" type="submit">Show</button></form></div>
-        <div class="panel tablewrap"><table><tr><th>Branch</th><th class="num">Sales</th><th class="num">Total sales</th><th class="num">VAT</th><th class="num">Gross profit</th><th class="num">Expenses</th><th class="num">Net profit</th></tr>
-        ${rows.map(({ b, r }) => `<tr><td>${esc(b.name)}${b.active ? '' : ' <span class="tag gray">off</span>'}</td><td class="num">${r.S.n}</td><td class="num">${fmt(r.S.total)}</td><td class="num">${fmt(r.S.vat)}</td><td class="num">${fmt(r.gross)}</td><td class="num">${fmt(r.expenses)}</td><td class="num">${r.net < 0 ? '-' : ''}${fmt(Math.abs(r.net))}</td></tr>`).join('')}
-        <tr><td><b>All branches</b></td><td class="num"><b>${sum(r => r.S.n)}</b></td><td class="num"><b>${fmt(sum(r => Number(r.S.total)))}</b></td><td class="num"><b>${fmt(sum(r => Number(r.S.vat)))}</b></td><td class="num"><b>${fmt(sum(r => r.gross))}</b></td><td class="num"><b>${fmt(sum(r => r.expenses))}</b></td><td class="num"><b>${fmt(sum(r => r.net))}</b></td></tr></table></div>` });
-    }));
-
-    // ----- payment methods (owner): M-Pesa STK with the business's own credentials, plus other ways to take payment -----
-    router.get('/payments', ah(async (req, res) => {
-        const [c, methods] = await Promise.all([mpesaCreds(req.shop.business_id), payMethods(req.shop.business_id)]);
-        const presets = ['Airtel Money', 'T-Kash', 'Card (POS machine)', 'Bank transfer', 'Cheque'];
-        send(req, res, { title: 'Payment Methods', nav: 'payments', body: `<h1>Payment Methods</h1>${notice(req)}${errBox(req)}
-        <div class="panel" style="max-width:720px"><h2>M-Pesa STK push (Safaricom Daraja)</h2>
-            ${c ? `<p><span class="tag ok">Connected</span> ${c.type === 'till' ? 'Till (Buy Goods)' : 'Paybill'} shortcode <b>${esc(c.shortcode)}</b>. Cashiers will see "M-Pesa (STK push)" on the POS Terminal. The secrets are stored encrypted and never shown again.</p>
-            <form action="/pos/payments/mpesa/test" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Test connection</button></form> <form action="/pos/payments/mpesa/remove" method="POST" style="display:inline"><button class="btn small bad" type="submit">Remove</button></form><hr style="border:0;border-top:1px solid var(--line);margin:16px 0"><p class="muted">To change the details, enter them again below.</p>` : '<p class="muted">Add your own paybill or till from the Safaricom Daraja portal (Go Live). Customers then pay straight into <b>your</b> account, not ours.</p>'}
-            <form action="/pos/payments/mpesa" method="POST"><div class="grid2">
-                <div class="field"><label for="t">Account type</label><select id="t" name="type"><option value="paybill">Paybill</option><option value="till">Till number (Buy Goods)</option></select></div>
-                <div class="field"><label for="s">Business shortcode (paybill, or the till's head-office number)</label><input id="s" name="shortcode" required inputmode="numeric" maxlength="10" autocomplete="off"></div>
-                <div class="field"><label for="tl">Till number (only for tills)</label><input id="tl" name="till" inputmode="numeric" maxlength="10" autocomplete="off"></div>
-                <div class="field"><label for="k">Consumer key</label><input id="k" name="key" required maxlength="120" autocomplete="off"></div>
-                <div class="field"><label for="x">Consumer secret</label><input id="x" name="secret" type="password" required maxlength="120" autocomplete="off"></div>
-                <div class="field"><label for="pk">Lipa na M-Pesa passkey</label><input id="pk" name="passkey" type="password" required maxlength="200" autocomplete="off"></div></div>
-                <button class="btn" type="submit">Save M-Pesa details</button></form></div>
-        <div class="panel" style="max-width:720px"><h2>Other ways to take payment</h2>
-            <p class="muted">Cash and M-Pesa code entry are always available. Add the others you accept, such as Airtel Money, card machine or bank transfer. The cashier records the payment reference. Automatic confirmation for these gateways needs a separate integration for each one.</p>
-            ${methods.length ? `<table>${methods.map(m => `<tr><td>${esc(m.name)}</td><td>${m.needs_ref ? 'asks for a reference' : 'no reference'}</td><td class="right">${delPost('/pos/payments/methods/' + m.id + '/delete', 'Remove')}</td></tr>`).join('')}</table>` : '<p class="muted">None added yet.</p>'}
-            <form action="/pos/payments/methods" method="POST" class="row" style="margin-top:12px"><div><label for="mn">Name</label><input id="mn" name="name" list="pl" required maxlength="30"><datalist id="pl">${presets.map(p => `<option value="${esc(p)}">`).join('')}</datalist></div><div style="flex:0 0 auto"><label><input type="checkbox" name="needs_ref" value="1" checked style="width:auto"> Ask for a reference</label></div><button class="btn" type="submit">Add</button></form></div>` });
-    }));
-    router.post('/payments/mpesa', ah(async (req, res) => {
-        const b = req.body, type = b.type === 'till' ? 'till' : 'paybill';
-        const shortcode = str(b.shortcode), till = str(b.till), key = str(b.key), secret = str(b.secret), passkey = str(b.passkey);
-        if (!/^\d{4,10}$/.test(shortcode)) return back(res, '/pos/payments', '', 'The shortcode must be 4 to 10 digits.');
-        if (type === 'till' && !/^\d{4,10}$/.test(till)) return back(res, '/pos/payments', '', 'Enter the till number.');
-        if (!key || !secret || !passkey) return back(res, '/pos/payments', '', 'Enter the consumer key, consumer secret and passkey.');
-        await q('UPDATE pos_businesses SET mpesa_enc=$2, mpesa_type=$3 WHERE id=$1', [req.shop.business_id, encrypt({ shortcode, till: type === 'till' ? till : '', key, secret, passkey }), type]);
-        tokenCache.delete(req.shop.business_id);
-        back(res, '/pos/payments', 'M-Pesa details saved. Use "Test connection" to check them.');
-    }));
-    router.post('/payments/mpesa/test', ah(async (req, res) => {
-        const c = await mpesaCreds(req.shop.business_id);
-        if (!c) return back(res, '/pos/payments', '', 'Add your M-Pesa details first.');
-        try { await darajaToken(req.shop.business_id, c, true); back(res, '/pos/payments', 'Connected: Safaricom accepted your consumer key and secret.'); }
-        catch (e) { back(res, '/pos/payments', '', e.message); }
-    }));
-    router.post('/payments/mpesa/remove', ah(async (req, res) => {
-        await q('UPDATE pos_businesses SET mpesa_enc=NULL, mpesa_type=NULL WHERE id=$1', [req.shop.business_id]);
-        tokenCache.delete(req.shop.business_id);
-        back(res, '/pos/payments', 'M-Pesa details removed.');
-    }));
-    router.post('/payments/methods', ah(async (req, res) => {
-        const name = str(req.body.name).replace(/[<>]/g, '').slice(0, 30);
-        if (!name || /^(cash|mpesa|m-pesa)$/i.test(name)) return back(res, '/pos/payments', '', 'Choose a name other than Cash or M-Pesa; those are built in.');
-        await q('INSERT INTO pos_pay_methods (business_id, name, needs_ref) VALUES ($1,$2,$3) ON CONFLICT (business_id, name) DO NOTHING', [req.shop.business_id, name, req.body.needs_ref === '1']);
-        back(res, '/pos/payments', 'Payment method added.');
-    }));
-    router.post('/payments/methods/:id/delete', ah(async (req, res) => {
-        const id = parseCount(req.params.id, { min: 1 });
-        if (id) await q('DELETE FROM pos_pay_methods WHERE id=$1 AND business_id=$2', [id, req.shop.business_id]);
-        back(res, '/pos/payments', 'Removed. Past sales keep their payment type.');
-    }));
-
-    // ----- subscription (monthly fee, paid to Tencent's own paybill by STK push) -----
-    router.get('/subscribe', ah(async (req, res) => {
-        const live = req.business.active_until && new Date(req.business.active_until) > new Date();
-        const nBranches = (await q('SELECT count(*)::int n FROM pos_shops WHERE business_id=$1 AND active', [req.shop.business_id])).rows[0].n;
-        const fee = monthlyTotal(nBranches), extra = Math.max(0, nBranches - 1), payId = parseCount(req.query.pay, { min: 1 });
-        const hist = (await q(`SELECT months, amount, status, receipt, created_at FROM pos_sub_payments WHERE business_id=$1 ORDER BY id DESC LIMIT 12`, [req.shop.business_id])).rows;
-        send(req, res, { title: 'Subscription', nav: 'sub', body: `<h1>Subscription</h1>${notice(req)}${errBox(req)}
-        <div class="panel" style="max-width:640px">
-            ${live ? `<p><span class="tag ok">Active</span> Your POS is paid until <b>${esc(dateFmt(req.business.active_until))}</b>. Paying again adds time on top.</p>` : `<p><span class="tag warn">Not active</span> Pay the monthly subscription to switch on your POS. It includes all your branches and cashiers.</p>`}
-            <table style="max-width:420px;margin-bottom:10px"><tr><td>Main shop</td><td class="num">KES ${subFee().toLocaleString('en-KE')}</td></tr>${extra ? `<tr><td>${extra} extra branch${extra > 1 ? 'es' : ''} × KES ${branchFee().toLocaleString('en-KE')}</td><td class="num">KES ${(extra * branchFee()).toLocaleString('en-KE')}</td></tr>` : ''}<tr><td><b>Per month</b></td><td class="num"><b>KES ${fee.toLocaleString('en-KE')}</b></td></tr></table><p class="muted" style="margin-top:0">Cashiers are unlimited. The amount follows the number of active branches when you pay.</p>
-            ${payId ? `<div class="alert ok" id="paywait" role="status">Check your phone and enter your M-Pesa PIN. This page updates when the payment is confirmed.</div><div class="alert" id="payfail" role="alert" style="display:none"></div>` : ''}
-            <form action="/pos/subscribe" method="POST"><div class="grid2">
-                <div class="field"><label for="m">How long?</label><select id="m" name="months">${[1, 3, 6, 12].map(n => `<option value="${n}">${n} month${n > 1 ? 's' : ''}: KES ${(fee * n).toLocaleString('en-KE')}</option>`).join('')}</select></div>
-                <div class="field"><label for="p">M-Pesa number to pay from</label><input id="p" name="phone" inputmode="tel" required value="${esc(req.session.user.phone || '')}" placeholder="0712345678"></div></div>
-                <button class="btn ok" type="submit">Pay with M-Pesa</button></form>
-            ${platform.mpesaConfigured() ? '' : '<p class="muted" style="margin-top:10px">Online payment is not switched on yet. Please call 0740 311 014 to pay.</p>'}</div>
-        ${hist.length ? `<div class="panel tablewrap" style="max-width:640px"><h2>Payments</h2><table><tr><th>Date</th><th>Months</th><th class="num">Amount</th><th>Status</th><th>M-Pesa</th></tr>${hist.map(h => `<tr><td>${esc(dateFmt(h.created_at))}</td><td>${h.months}</td><td class="num">${h.amount.toLocaleString('en-KE')}</td><td><span class="tag ${h.status === 'paid' ? 'ok' : h.status === 'failed' ? 'bad' : 'warn'}">${esc(h.status)}</span></td><td>${esc(h.receipt)}</td></tr>`).join('')}</table></div>` : ''}
-        ${payId ? `<script nonce="${req.nonce || ''}">(function(){var n=0;function poll(){if(++n>60){var w=document.getElementById('paywait');if(w)w.textContent='Still waiting. If you paid, refresh this page in a minute.';return;}
-        fetch('/pos/subscribe/status/${payId}',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(s){if(s.status==='paid'){location.href='/pos/app?ok='+encodeURIComponent('Payment received. Your POS is active.');return;}
-        if(s.status==='failed'){document.getElementById('paywait').style.display='none';var f=document.getElementById('payfail');f.textContent='The payment was not completed. You can try again.';f.style.display='block';return;}setTimeout(poll,3000);}).catch(function(){setTimeout(poll,4000);});}poll();})();</script>` : ''}` });
-    }));
-    router.post('/subscribe', saleLimiter, ah(async (req, res) => {
-        const months = parseCount(req.body.months, { min: 1, max: 12 }), phone = platform.normalizePhone(String(req.body.phone || ''));
-        if (![1, 3, 6, 12].includes(months)) return back(res, '/pos/subscribe', '', 'Choose how many months.');
-        if (!phone) return back(res, '/pos/subscribe', '', 'Enter a valid M-Pesa number, for example 0712345678.');
-        if (!platform.mpesaConfigured()) return back(res, '/pos/subscribe', '', 'Online payment is not switched on yet. Please call 0740 311 014.');
-        const recent = await q(`SELECT 1 FROM pos_sub_payments WHERE business_id=$1 AND status='pending' AND created_at > now() - interval '60 seconds'`, [req.shop.business_id]);
-        if (recent.rowCount) return back(res, '/pos/subscribe', '', 'A payment request was just sent. Please wait a minute before trying again.');
-        const nb = (await q('SELECT count(*)::int n FROM pos_shops WHERE business_id=$1 AND active', [req.shop.business_id])).rows[0].n;
-        const amount = monthlyTotal(nb) * months;
-        const id = (await q('INSERT INTO pos_sub_payments (business_id, months, amount, phone) VALUES ($1,$2,$3,$4) RETURNING id', [req.shop.business_id, months, amount, phone])).rows[0].id;
-        try {
-            const d = await platform.stkPush({ amount, phone, ref: 'POS' + req.shop.business_id, desc: 'POS subscription' });
-            await q('UPDATE pos_sub_payments SET checkout_id=$2 WHERE id=$1', [id, String(d.CheckoutRequestID || '')]);
-            res.redirect('/pos/subscribe?pay=' + id);
-        } catch (err) {
-            await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1`, [id]);
-            console.error('POS subscription STK failed:', err.message);
-            back(res, '/pos/subscribe', '', 'Could not send the M-Pesa request. Please try again, or call 0740 311 014.');
-        }
-    }));
-    router.get('/subscribe/status/:id', ah(async (req, res) => {
-        const id = parseCount(req.params.id, { min: 1 });
-        let r = id && (await q('SELECT * FROM pos_sub_payments WHERE id=$1 AND business_id=$2', [id, req.shop.business_id])).rows[0];
-        if (!r) return res.status(404).json({ status: 'unknown' });
-        if (r.status === 'pending' && r.checkout_id && Date.now() - new Date(r.created_at) > 25000 && (!r.last_query || Date.now() - new Date(r.last_query) > 12000)) {
-            await q('UPDATE pos_sub_payments SET last_query=now() WHERE id=$1', [id]);
-            try {
-                const d = await platform.stkQuery(r.checkout_id);
-                if (String(d.ResultCode) === '0') await completeSubPayment(id, '');
-                else if (d.ResultCode !== undefined && String(d.ResultCode) !== '') await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [id]);
-            } catch (_) { /* still processing */ }
-            r = (await q('SELECT status FROM pos_sub_payments WHERE id=$1', [id])).rows[0];
-        }
-        res.json({ status: r.status });
-    }));
-
-    // ----- install as an app -----
-    router.get('/install', (req, res) => send(req, res, { title: 'Install the app', nav: 'install', body: `<h1>Install Tencent POS as an app</h1>
-        <div class="panel" style="max-width:680px"><p>The POS installs on your phone, tablet or computer and opens in its own window, like any other app. It needs the internet to save sales.</p>
-            <p><button class="btn ok" id="install-main" type="button" style="padding:12px 20px;font-size:1rem">Install now</button></p>
-            <div id="install-msg" class="alert" role="status" style="display:none"></div>
-            <div id="install-ua" class="alert ok" style="display:none"></div>
-            <h2>Android (Chrome)</h2><p>Open the menu (three dots) and tap <b>Install app</b> or <b>Add to Home screen</b>.</p>
-            <h2>iPhone and iPad (Safari only)</h2><p>Tap the <b>Share</b> button, then <b>Add to Home Screen</b>. This only works in Safari, not in Chrome on iPhone.</p>
-            <h2>Windows or Mac (Chrome or Edge)</h2><p>Click the install icon at the right of the address bar, or open the menu and choose <b>Install Tencent POS</b> (in Chrome: Cast, save and share, then Install page as app).</p>
-            <h2>No install option showing?</h2><p class="muted">Open the website in Chrome or Edge directly. Links opened inside WhatsApp, Facebook or other apps can't install it. Private windows and Firefox on computers don't offer it either. If it is already installed, open it from your home screen or app list.</p>
-            <p class="muted">Cashiers can install it too: log in on their device and follow the same steps.</p></div>
-        <script nonce="${req.nonce || ''}">(function(){var ua=navigator.userAgent||'',m=document.getElementById('install-msg'),u=document.getElementById('install-ua'),b=document.getElementById('install-main');
-        var ios=/iPhone|iPad|iPod/.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1),inapp=/FBAN|FBAV|Instagram|WhatsApp/.test(ua);
-        var standalone=(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches)||window.navigator.standalone===true;
-        if(standalone){b.style.display='none';u.textContent='You are already using the installed app.';u.style.display='block';return;}
-        if(ios){u.textContent='On this iPhone/iPad: tap the Share button in Safari, then "Add to Home Screen".';u.style.display='block';}
-        else if(inapp){u.textContent='You opened this inside another app. Open the website in Chrome or Edge to install.';u.style.display='block';}
-        b.addEventListener('click',function(){if(!window.__tposInstall()){m.textContent=ios?'Use Share, then Add to Home Screen in Safari.':'Your browser has not offered the install prompt yet. Use the browser menu as shown below (Install app, or Add to Home screen), or open this site in Chrome or Edge.';m.style.display='block';}});})();</script>` }));
 
     // ======================= EXTRA PAGES =======================
+    const errBox = req => req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 160))}</div>` : '';
+    const back = (res, path, ok, err) => res.redirect(path + '?' + (err ? 'err=' + encodeURIComponent(err) : 'ok=' + encodeURIComponent(ok)));
     const delBtn = action => `<form action="${action}" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form>`;
     const itemOptions = items => '<option value="">-</option>' + items.map(i => `<option value="${i.id}">${esc(i.name)}</option>`).join('');
     // reads rows item_1/qty_1/price_1 .. item_10; blank price uses the item's own default
@@ -1699,9 +1593,9 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
         const total = lines.reduce((a, l) => a + l.qty * Number(l.unit_price_cents), 0), sh = req.shop;
         send(req, res, { title: 'Quote #' + c.quote_no, nav: 'quotes', body: `<div class="noprint" style="margin-bottom:14px"><button class="btn" id="prt" type="button">Print / Save as PDF</button> <a class="btn ghost" href="/pos/quotes">Back</a>
             ${c.status === 'open' ? `<form action="/pos/quotes/${id}/status" method="POST" style="display:inline"><button class="btn ok small" name="status" value="accepted">Mark accepted</button> <button class="btn ghost small" name="status" value="cancelled">Cancel quote</button></form>` : ''}</div>${notice(req)}
-        <div class="panel" style="max-width:720px"><h1 style="margin-bottom:4px">Quotation #${c.quote_no}</h1><p><b>${esc(sh.name)}</b><br>${esc(sh.address)}${sh.phone ? '<br>Tel ' + esc(sh.phone) : ''}${sh.tax_pin ? '<br>PIN ' + esc(sh.tax_pin) : ''}</p>
+        <div class="panel" style="max-width:720px"><h1 style="margin-bottom:4px">Quotation #${c.quote_no}</h1><p>${req.biz.logo && LOGO_OK.test(req.biz.logo) ? `<img src="${req.biz.logo}" alt="" style="max-height:64px;max-width:200px"><br>` : ''}<b>${esc(req.biz.name)}</b>${sh.id !== req.biz.id ? '<br>' + esc(sh.name) : ''}<br>${esc(sh.address)}${sh.phone ? '<br>Tel ' + esc(sh.phone) : ''}${req.biz.tax_pin ? '<br>PIN ' + esc(req.biz.tax_pin) : ''}</p>
         <p>Date: ${esc(dateFmt(c.created_at))}${c.valid_until ? '<br>Valid until: ' + esc(dateFmt(isoDate(c.valid_until) + 'T12:00:00+03:00')) : ''}<br>Customer: ${esc(c.customer_name || '-')} ${esc(c.customer_phone)}<br>Status: ${esc(c.status)}</p>
-        <table><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit price</th><th class="num">Total</th></tr>${lines.map(l => `<tr><td>${esc(l.name)}</td><td class="num">${l.qty}</td><td class="num">${fmt(l.unit_price_cents)}</td><td class="num">${fmt(l.qty * Number(l.unit_price_cents))}</td></tr>`).join('')}<tr><td colspan="3">Subtotal (before VAT)</td><td class="num">${fmt(total)}</td></tr>${sh.vat_rate > 0 ? `<tr><td colspan="3">VAT ${sh.vat_rate}%</td><td class="num">${fmt(vatOf(total, sh.vat_rate))}</td></tr>` : ''}<tr><td colspan="3"><b>Total (KES)</b></td><td class="num"><b>${fmt(total + vatOf(total, sh.vat_rate))}</b></td></tr></table>${c.note ? '<p>' + esc(c.note) + '</p>' : ''}</div>
+        <table><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit price</th><th class="num">Total</th></tr>${lines.map(l => `<tr><td>${esc(l.name)}</td><td class="num">${l.qty}</td><td class="num">${fmt(l.unit_price_cents)}</td><td class="num">${fmt(l.qty * Number(l.unit_price_cents))}</td></tr>`).join('')}<tr><td colspan="3"><b>Total (KES)</b></td><td class="num"><b>${fmt(total)}</b></td></tr></table>${req.biz.vat_enabled ? '<p class="muted">All prices include VAT at ' + VAT_RATE + '%.</p>' : ''}${c.note ? '<p>' + esc(c.note) + '</p>' : ''}</div>
         <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>` });
     }));
     router.post('/quotes/:id/status', ah(async (req, res) => {
@@ -1890,34 +1784,376 @@ self.addEventListener('fetch',e=>{if(e.request.mode==='navigate'){e.respondWith(
     }));
 
     app.use('/pos', router);
-}
 
+    // ======================= BUSINESS FEATURES: subscription, gateways, branches, staff, install =======================
+    const pubUrl = path => (publicBaseUrl || '') + path;
 
-// Called from server.js when Safaricom reports a payment that is not a survey booking: it may be a POS subscription.
-async function completeSubPayment(id, receipt) {
-    const pool = _ctx.getPool();
-    const p = (await pool.query(`UPDATE pos_sub_payments SET status='paid', receipt=$2 WHERE id=$1 AND status <> 'paid' RETURNING *`, [id, String(receipt || '').slice(0, 40)])).rows[0];
-    if (!p) return;   // already counted, so duplicate callbacks and polls add nothing
-    const b = (await pool.query(`UPDATE pos_businesses SET active_until = GREATEST(COALESCE(active_until, now()), now()) + ($2 || ' months')::interval WHERE id=$1 RETURNING name, active_until`, [p.business_id, String(p.months)])).rows[0];
-    if (_ctx.platform && _ctx.platform.notify && b) _ctx.platform.notify(`✅ POS subscription paid: ${b.name}`, { Business: b.name, Months: String(p.months), Amount: 'KES ' + p.amount, 'M-Pesa receipt': receipt || '(see statement)', 'Active until': new Date(b.active_until).toISOString().slice(0, 10) }).catch(() => {});
-}
-async function handlePlatformCallback(cb) {
-    if (!_ctx.getPool) return false;
-    const pool = _ctx.getPool();
-    const r = (await pool.query('SELECT * FROM pos_sub_payments WHERE checkout_id=$1', [String(cb.CheckoutRequestID || '')])).rows[0];
-    if (!r) return false;
-    if (Number(cb.ResultCode) !== 0) { await pool.query(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [r.id]); return true; }
-    const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
-    const meta = n => { const it = items.find(i => i.Name === n); return it ? it.Value : undefined; };
-    if (Number(meta('Amount')) !== r.amount) {
-        console.error('POS subscription amount mismatch, not activated');
-        if (_ctx.platform && _ctx.platform.notify) _ctx.platform.notify('⚠️ CHECK POS PAYMENT: amount mismatch', { 'Business id': String(r.business_id), Expected: String(r.amount), Reported: String(meta('Amount')), 'M-Pesa receipt': String(meta('MpesaReceiptNumber') || '') }).catch(() => {});
+    // ----- monthly subscription, paid by M-Pesa to the platform's own account (the one set up in server.js) -----
+    const subLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many payment attempts. Please try again later.' });
+    const subLastCheck = new Map();
+    async function markSubPaid(id, receipt) {   // only the first caller extends the subscription, even if the callback and the status check arrive together
+        const done = await q(`WITH p AS (UPDATE pos_sub_payments SET status='paid', receipt=CASE WHEN $2 <> '' THEN $2 ELSE receipt END, paid_at=now() WHERE id=$1 AND status <> 'paid' RETURNING business_id)
+                 UPDATE pos_shops s SET sub_until = GREATEST(now(), COALESCE(s.sub_until, now())) + interval '1 month' FROM p WHERE s.id = p.business_id RETURNING s.id`, [id, String(receipt || '').slice(0, 40)]);
+        if (done.rows[0]) await auditRaw(done.rows[0].id, null, 'system', null, '', 'sub.paid', 'KES ' + SUB_FEE_KES + ' ' + String(receipt || ''), '');
+        if (receipt) await q(`UPDATE pos_sub_payments SET receipt=$2 WHERE id=$1 AND receipt = ''`, [id, String(receipt).slice(0, 40)]);
+    }
+    // called from server.js when Safaricom's callback is not for a booking; returns true when it was ours
+    async function handlePlatformCallback(cb) {
+        const p = (await q('SELECT * FROM pos_sub_payments WHERE checkout_request_id=$1', [String(cb.CheckoutRequestID || '')])).rows[0];
+        if (!p) return false;
+        const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [], meta = n => { const it = items.find(i => i.Name === n); return it ? it.Value : undefined; };
+        const receipt = String(meta('MpesaReceiptNumber') || '').slice(0, 40);
+        if (p.status === 'paid') { if (receipt) await q(`UPDATE pos_sub_payments SET receipt=$2 WHERE id=$1 AND receipt = ''`, [p.id, receipt]); return true; }
+        if (Number(cb.ResultCode) !== 0) { await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [p.id]); return true; }
+        if (Number(meta('Amount')) !== p.amount_kes) { await q(`UPDATE pos_sub_payments SET status='review', receipt=$2 WHERE id=$1 AND status IN ('pending','review')`, [p.id, receipt]); return true; }
+        try {   // do not trust the callback alone
+            const r = await platform.stkQuery(p.checkout_request_id);
+            if (String(r.ResultCode) !== '0') { await q(`UPDATE pos_sub_payments SET status='review' WHERE id=$1 AND status='pending'`, [p.id]); return true; }
+        } catch (e) { console.error('POS subscription status check failed, leaving it pending for the background check:', e.message); return true; }
+        await markSubPaid(p.id, receipt);
         return true;
     }
-    await completeSubPayment(r.id, String(meta('MpesaReceiptNumber') || ''));
-    return true;
+    router.get('/subscribe', ah(async (req, res) => {
+        const b = req.biz, until = b.sub_until ? new Date(b.sub_until) : null, active = req.subActive;
+        const hist = (await q('SELECT amount_kes, status, receipt, created_at FROM pos_sub_payments WHERE business_id=$1 ORDER BY created_at DESC LIMIT 12', [b.id])).rows;
+        const phone = platform && platform.normalizePhone ? (platform.normalizePhone(req.session.user.phone) || '') : '';
+        const payId = parseCount(req.query.pay, { min: 1 });
+        send(req, res, { title: 'Subscription', nav: 'subscription', body: `<h1>Subscription</h1>${notice(req)}${errBox(req)}
+        <div class="panel" style="max-width:620px"><h2>${active ? 'Your POS is active' : 'Your POS is not active'}</h2>
+            <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month</b> for the whole business, including all branches and cashiers. Paying early adds a month to the end of your current period.</p>
+            ${payId ? `<div id="paybox" class="alert ok" role="status">Check your phone and enter your M-Pesa PIN. Waiting for the payment...</div>` : ''}
+            ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" class="row"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" type="submit">Pay KES ${SUB_FEE_KES.toLocaleString('en-KE')} with M-Pesa</button></form>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
+        </div>
+        ${active ? '<div class="panel" style="max-width:620px"><h2>Install the app</h2><p>Your POS can be installed on phones, tablets and computers. <a href="/pos/install">Open the install page</a>.</p></div>' : ''}
+        <div class="panel tablewrap" style="max-width:620px"><h2>Payments</h2>${hist.length ? `<table><tr><th>Date</th><th class="num">Amount</th><th>Status</th><th>M-Pesa code</th></tr>${hist.map(h => `<tr><td>${esc(timeFmt(h.created_at))}</td><td class="num">${h.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${h.status === 'paid' ? 'ok' : h.status === 'pending' ? 'warn' : 'bad'}">${esc(h.status)}</span></td><td>${esc(h.receipt)}</td></tr>`).join('')}</table>` : '<p class="muted">No payments yet.</p>'}</div>
+        ${payId ? `<script nonce="${req.nonce || ''}">(function(){var n=0,box=document.getElementById('paybox'),t=setInterval(function(){n++;fetch('/pos/subscribe/status/${payId}',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.status==='paid'){clearInterval(t);location.href='/pos/subscribe?ok='+encodeURIComponent('Payment received. Your POS is active.');}else if(d.status==='failed'){clearInterval(t);location.href='/pos/subscribe?err='+encodeURIComponent('The payment was cancelled or timed out. Please try again.');}else if(d.status==='review'){clearInterval(t);box.textContent='We are confirming your payment and will call you shortly.';}else if(n>=60){clearInterval(t);box.textContent='We have not seen the payment yet. If you paid, it will switch on automatically.';}}).catch(function(){});},4000);})();</script>` : ''}` });
+    }));
+    router.post('/subscribe', subLimiter, ah(async (req, res) => {
+        if (!platform || !platform.mpesaConfigured()) return back(res, '/pos/subscribe', '', 'Online payment is not available right now. Please call 0740 311 014.');
+        const phone = platform.normalizePhone(str(req.body.phone));
+        if (!phone) return back(res, '/pos/subscribe', '', 'Please enter a valid Safaricom number, for example 0712345678.');
+        const open = (await q(`SELECT id FROM pos_sub_payments WHERE business_id=$1 AND status='pending' AND created_at > now() - interval '2 minutes'`, [req.biz.id])).rows[0];
+        if (open) return res.redirect('/pos/subscribe?pay=' + open.id);
+        let row = null;
+        for (let i = 0; i < 5 && !row; i++) {
+            try { row = (await q(`INSERT INTO pos_sub_payments (business_id, amount_kes, phone, account_ref) VALUES ($1,$2,$3,$4) RETURNING id, account_ref`, [req.biz.id, SUB_FEE_KES, phone, 'POS' + crypto.randomBytes(4).toString('hex').toUpperCase()])).rows[0]; }
+            catch (e) { if (e.code !== '23505') throw e; }
+        }
+        if (!row) return back(res, '/pos/subscribe', '', 'Could not start the payment. Please try again.');
+        try {
+            const r = await platform.stkPush({ amount: SUB_FEE_KES, phone, accountRef: row.account_ref, desc: 'POS monthly' });
+            await q('UPDATE pos_sub_payments SET checkout_request_id=$2 WHERE id=$1', [row.id, r.CheckoutRequestID]);
+        } catch (e) {
+            console.error('POS subscription STK failed:', e.message);
+            await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1`, [row.id]);
+            return back(res, '/pos/subscribe', '', 'We could not send the M-Pesa prompt. Check the number and try again.');
+        }
+        res.redirect('/pos/subscribe?pay=' + row.id);
+    }));
+    router.get('/subscribe/status/:id', pollLimiter, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        let p = id && (await q('SELECT * FROM pos_sub_payments WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rows[0];
+        if (!p) return res.status(404).json({ status: 'unknown' });
+        if (p.status === 'pending' && p.checkout_request_id && Date.now() - new Date(p.created_at).getTime() > 25000 && Date.now() - (subLastCheck.get(p.id) || 0) > 12000) {
+            subLastCheck.set(p.id, Date.now());
+            try {
+                const r = await platform.stkQuery(p.checkout_request_id);
+                if (String(r.ResultCode) === '0') await markSubPaid(p.id, '');
+                else if (r.ResultCode !== undefined && String(r.ResultCode) !== '') await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [p.id]);
+            } catch (_) { /* still processing */ }
+            p = (await q('SELECT status FROM pos_sub_payments WHERE id=$1', [id])).rows[0];
+        }
+        res.set('Cache-Control', 'no-store').json({ status: p.status });
+    }));
+
+    // ----- payment gateways (owner): the business's own M-Pesa till/paybill, and others -----
+    // Changing payment settings needs a fresh two-step code, because this is where a hijacked account would redirect the money.
+    const stepFresh = req => Boolean(req.has2fa && req.session.posStepAt && Date.now() - req.session.posStepAt < STEP_VALID_MS);
+    function needStep(req, res, path) {   // true when the request was refused
+        if (!req.has2fa) { back(res, '/pos/security', '', 'Turn on two-step login first. It is required to change payment settings.'); return true; }
+        if (!stepFresh(req)) { back(res, path, '', 'Enter your two-step code at the top of the page first.'); return true; }
+        return false;
+    }
+    router.post('/gateways/unlock', ah(async (req, res) => {
+        if (!req.has2fa) return back(res, '/pos/security', '', 'Turn on two-step login first.');
+        const r = await verifyOwnerOtp(req, req.body.otp);
+        await saveSess(req);
+        back(res, '/pos/gateways', r.ok ? 'Unlocked for 10 minutes.' : '', r.ok ? '' : (r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.'));
+    }));
+    router.get('/gateways', ah(async (req, res) => {
+        const gws = (await q('SELECT id, provider, cfg, active, is_default, callback_token FROM pos_gateways WHERE business_id=$1 ORDER BY id', [req.biz.id])).rows;
+        const byProv = Object.fromEntries(gws.map(g => [g.provider, g]));
+        const recent = (await q(`SELECT p.id, p.amount_kes, p.status, p.receipt, p.fail_reason, p.created_at, p.cashier_name, s.name AS shop FROM pos_payments p JOIN pos_shops s ON s.id=p.shop_id WHERE s.id=$1 OR s.parent_id=$1 ORDER BY p.created_at DESC LIMIT 15`, [req.biz.id])).rows;
+        const mp = byProv.mpesa, ps = byProv.paystack, mc = mp ? mp.cfg : {}, fresh = stepFresh(req);
+        const act = g => `<form action="/pos/gateways/${g.id}/test" method="POST" style="display:inline"><button class="btn small ghost">Test keys</button></form> ${g.is_default ? '<span class="tag ok">default</span>' : `<form action="/pos/gateways/${g.id}/default" method="POST" style="display:inline"><button class="btn small ghost">Make default</button></form>`} <form action="/pos/gateways/${g.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost">${g.active ? 'Switch off' : 'Switch on'}</button></form> <form action="/pos/gateways/${g.id}/rotate" method="POST" style="display:inline"><button class="btn small ghost">New callback address</button></form> <form action="/pos/gateways/${g.id}/delete" method="POST" style="display:inline"><button class="btn small ghost">Remove</button></form>`;
+        send(req, res, { title: 'Payment Gateways', nav: 'gateways', body: `<h1>Payment Gateways</h1>${notice(req)}${errBox(req)}
+        <p class="muted" style="max-width:700px">Connect your own M-Pesa till or paybill so customers can pay from a prompt on their phone at the POS terminal. The money goes straight to your account, not ours. Your keys are stored encrypted and are never shown again.</p>
+        ${vault.enabled ? '' : '<div class="alert" role="alert">Keys cannot be saved yet: the site administrator must set POS_CRED_KEY (a long random secret) in the server settings.</div>'}
+        ${req.has2fa ? (fresh ? '<div class="alert ok" role="status">Unlocked: you can change payment settings for the next few minutes.</div>' : `<div class="panel" style="max-width:720px"><form action="/pos/gateways/unlock" method="POST" class="row"><div><label for="otp">Two-step code (needed to change anything on this page)</label><input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20"></div><button class="btn" type="submit">Unlock</button></form></div>`) : '<div class="alert" role="alert">Payment settings need two-step login. <a href="/pos/security">Turn it on first</a>.</div>'}
+        <div class="panel" style="max-width:720px"><h2>M-Pesa (Safaricom Daraja) ${mp ? (mp.active ? '<span class="tag ok">connected</span>' : '<span class="tag gray">off</span>') : ''}</h2>
+            ${mp ? `<p>${act(mp)}</p><p class="muted">Callback address used for this business: <code>${esc(pubUrl('/pos/mpesa/cb/' + String(mp.callback_token).trim()))}</code> (sent with every prompt, nothing to register). Every payment is also double-checked with Safaricom before a sale is saved.</p>` : ''}
+            <form action="/pos/gateways/mpesa" method="POST"><div class="grid2">
+                <div class="field"><label for="env">Environment</label><select id="env" name="env"><option value="production" ${mc.env === 'production' ? 'selected' : ''}>Live (production)</option><option value="sandbox" ${mc.env === 'sandbox' ? 'selected' : ''}>Test (sandbox)</option></select></div>
+                <div class="field"><label for="tt">Your account type</label><select id="tt" name="txnType"><option value="paybill" ${mc.txnType !== 'till' ? 'selected' : ''}>Paybill</option><option value="till" ${mc.txnType === 'till' ? 'selected' : ''}>Buy Goods (Till)</option></select></div>
+                <div class="field"><label for="sc">Business shortcode</label><input id="sc" name="shortcode" inputmode="numeric" maxlength="8" value="${esc(mc.shortcode || '')}" placeholder="Paybill number, or store number for a till"></div>
+                <div class="field"><label for="tl">Till number (Buy Goods only)</label><input id="tl" name="till" inputmode="numeric" maxlength="8" value="${esc(mc.till || '')}"></div>
+                <div class="field"><label for="ck">Consumer key</label><input id="ck" name="consumerKey" autocomplete="off" placeholder="${mp ? 'saved: leave blank to keep' : ''}"></div>
+                <div class="field"><label for="cs">Consumer secret</label><input id="cs" name="consumerSecret" type="password" autocomplete="off" placeholder="${mp ? 'saved: leave blank to keep' : ''}"></div>
+                <div class="field"><label for="pk">Lipa na M-Pesa passkey</label><input id="pk" name="passkey" type="password" autocomplete="off" placeholder="${mp ? 'saved: leave blank to keep' : ''}"></div></div>
+            <p class="muted">Get the key, secret and passkey from developer.safaricom.co.ke (your app, then Go Live), or from Safaricom Business support.</p>
+            <button class="btn" type="submit">${mp ? 'Update M-Pesa' : 'Connect M-Pesa'}</button></form></div>
+        ${PAYSTACK_ON ? `<div class="panel" style="max-width:720px"><h2>Paystack (M-Pesa mobile money) ${ps ? (ps.active ? '<span class="tag ok">connected</span>' : '<span class="tag gray">off</span>') : ''}</h2>
+            ${ps ? `<p>${act(ps)}</p><p class="muted">Optional webhook address for your Paystack dashboard: <code>${esc(pubUrl('/pos/paystack/hook/' + String(ps.callback_token).trim()))}</code></p>` : ''}
+            <form action="/pos/gateways/paystack" method="POST"><div class="field"><label for="sk">Paystack secret key</label><input id="sk" name="secretKey" type="password" autocomplete="off" placeholder="${ps ? 'saved: leave blank to keep' : 'sk_live_...'}"></div>
+            <p class="muted">Not yet tested against Paystack's live service: try a small sale first.</p>
+            <button class="btn" type="submit">${ps ? 'Update Paystack' : 'Connect Paystack'}</button></form></div>` : ''}
+        <div class="panel tablewrap"><h2>Recent phone-prompt payments</h2>${recent.length ? `<table><tr><th>When</th><th>Shop</th><th>Cashier</th><th class="num">KES</th><th>Status</th><th>Code</th><th></th></tr>${recent.map(r => `<tr><td class="nowrap">${esc(timeFmt(r.created_at))}</td><td>${esc(r.shop)}</td><td>${esc(r.cashier_name)}</td><td class="num">${r.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${r.status === 'paid' ? 'ok' : r.status === 'pending' ? 'warn' : 'bad'}">${esc(r.status)}</span>${r.fail_reason ? '<br><small class="muted">' + esc(r.fail_reason) + '</small>' : ''}</td><td>${esc(r.receipt)}</td><td class="right">${r.status === 'review' || r.status === 'pending' ? `<form action="/pos/payments/${esc(r.id)}/confirm" method="POST" style="display:inline"><input name="receipt" placeholder="M-Pesa code" maxlength="14" required style="width:110px;display:inline-block"> <button class="btn small ghost" type="submit">I received it</button></form>` : ''}</td></tr>`).join('')}</table><p class="muted">"review" means the amount or status did not match, or no confirmation came: check your M-Pesa statement. Only press "I received it" after you see the money, with the code from your statement.</p>` : '<p class="muted">None yet.</p>'}</div>` });
+    }));
+    async function saveGateway(req, res, provider, cfg, secrets) {
+        const existing = (await q('SELECT 1 FROM pos_gateways WHERE business_id=$1 AND is_default', [req.biz.id])).rowCount > 0;
+        await q(`INSERT INTO pos_gateways (business_id, provider, cfg, secrets, callback_token, is_default) VALUES ($1,$2,$3::jsonb,$4,$5,$6)
+                 ON CONFLICT (business_id, provider) DO UPDATE SET cfg=EXCLUDED.cfg, secrets=EXCLUDED.secrets, active=TRUE`, [req.biz.id, provider, JSON.stringify(cfg), vault.seal(secrets, `${req.biz.id}:${provider}`), crypto.randomBytes(24).toString('hex'), !existing]);
+        await audit(req, 'gateway.save', `${provider} ${cfg.env || ''} ${cfg.shortcode || ''}`.trim());   // never the secrets
+        const gw = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, provider]);
+        try { await GW.PROVIDERS[provider].test(gw); return back(res, '/pos/gateways', 'Saved. The keys were accepted.'); }
+        catch (e) { return back(res, '/pos/gateways', 'Saved, but the keys were NOT accepted (' + String(e.message).slice(0, 80) + '). Check them and the Live/Test setting.'); }
+    }
+    router.post('/gateways/mpesa', ah(async (req, res) => {
+        if (!vault.enabled) return back(res, '/pos/gateways', '', 'Keys cannot be saved until the site administrator sets POS_CRED_KEY.');
+        if (needStep(req, res, '/pos/gateways')) return;
+        const b = req.body || {}, old = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, 'mpesa']);
+        const cfg = { env: b.env === 'sandbox' ? 'sandbox' : 'production', txnType: b.txnType === 'till' ? 'till' : 'paybill', shortcode: str(b.shortcode), till: str(b.till) };
+        const secrets = { consumerKey: str(b.consumerKey) || (old && old.secrets.consumerKey) || '', consumerSecret: str(b.consumerSecret) || (old && old.secrets.consumerSecret) || '', passkey: str(b.passkey) || (old && old.secrets.passkey) || '' };
+        if (!/^\d{5,8}$/.test(cfg.shortcode)) return back(res, '/pos/gateways', '', 'Enter the business shortcode (5 to 8 digits).');
+        if (cfg.txnType === 'till' && !/^\d{5,8}$/.test(cfg.till)) return back(res, '/pos/gateways', '', 'For Buy Goods, enter your till number.');
+        if (cfg.txnType !== 'till') cfg.till = '';
+        for (const k of ['consumerKey', 'consumerSecret', 'passkey']) if (!/^\S{8,300}$/.test(secrets[k])) return back(res, '/pos/gateways', '', 'Please fill in the consumer key, consumer secret and passkey.');
+        await saveGateway(req, res, 'mpesa', cfg, secrets);
+    }));
+    router.post('/gateways/paystack', ah(async (req, res) => {
+        if (!PAYSTACK_ON) return back(res, '/pos/gateways', '', 'Paystack is not switched on for this server.');
+        if (!vault.enabled) return back(res, '/pos/gateways', '', 'Keys cannot be saved until the site administrator sets POS_CRED_KEY.');
+        if (needStep(req, res, '/pos/gateways')) return;
+        const old = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, 'paystack']);
+        const secretKey = str(req.body.secretKey) || (old && old.secrets.secretKey) || '';
+        if (!/^sk_(live|test)_[A-Za-z0-9]{10,}$/.test(secretKey)) return back(res, '/pos/gateways', '', 'Enter your Paystack secret key (it starts with sk_).');
+        await saveGateway(req, res, 'paystack', {}, { secretKey });
+    }));
+    const gwById = async req => { const id = parseCount(req.params.id, { min: 1 }); return id ? loadGateway('id=$1 AND business_id=$2', [id, req.biz.id]) : null; };
+    router.post('/gateways/:id/test', ah(async (req, res) => {
+        const gw = await gwById(req); if (!gw) return back(res, '/pos/gateways', '', 'Gateway not found.');
+        try { await GW.PROVIDERS[gw.provider].test(gw); back(res, '/pos/gateways', 'The keys are accepted.'); } catch (e) { back(res, '/pos/gateways', '', 'The keys were not accepted: ' + String(e.message).slice(0, 100)); }
+    }));
+    const gwAction = (name, label, fn) => router.post('/gateways/:id/' + name, ah(async (req, res) => {
+        if (needStep(req, res, '/pos/gateways')) return;
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id && await fn(req, id)) await audit(req, 'gateway.' + name, 'gateway #' + id);
+        back(res, '/pos/gateways', label);
+    }));
+    gwAction('default', 'Default gateway changed.', async (req, id) => (await q('UPDATE pos_gateways SET is_default = (id=$2) WHERE business_id=$1', [req.biz.id, id])).rowCount > 0);
+    gwAction('toggle', 'Saved.', async (req, id) => (await q('UPDATE pos_gateways SET active = NOT active WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rowCount > 0);
+    gwAction('delete', 'Removed.', async (req, id) => (await q('DELETE FROM pos_gateways WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rowCount > 0);
+    gwAction('rotate', 'New callback address created. Payments already waiting are still checked directly with the payment company.', async (req, id) => (await q('UPDATE pos_gateways SET callback_token=$3 WHERE id=$1 AND business_id=$2', [id, req.biz.id, crypto.randomBytes(24).toString('hex')])).rowCount > 0);
+    // the owner can settle a payment by hand after seeing the money on their M-Pesa statement
+    router.post('/payments/:id/confirm', ah(async (req, res) => {
+        if (needStep(req, res, '/pos/gateways')) return;
+        const code = str(req.body.receipt).toUpperCase();
+        if (!/^[A-Z0-9]{8,14}$/.test(code)) return back(res, '/pos/gateways', '', 'Enter the M-Pesa code from your statement.');
+        const p = (await q(`SELECT p.id FROM pos_payments p JOIN pos_shops s ON s.id = p.shop_id WHERE p.id=$1 AND p.status IN ('pending','review') AND p.sale_id IS NULL AND (s.id=$2 OR s.parent_id=$2)`, [String(req.params.id).slice(0, 32), req.biz.id])).rows[0];
+        if (!p) return back(res, '/pos/gateways', '', 'That payment can no longer be confirmed.');
+        await finalizePayment(p.id, code);
+        await audit(req, 'payment.manual_confirm', 'payment ' + p.id + ' code ' + code);
+        back(res, '/pos/gateways', 'Payment confirmed and the sale was saved.');
+    }));
+
+    // ----- branches (owner): linked accounts under the same business -----
+    const passwordProblem = (pw, min, username = '') => pw.length < min ? `The password must be at least ${min} characters.` : Buffer.byteLength(pw) > 72 ? 'The password is too long (72 characters at most).' : (COMMON_PW.has(pw.toLowerCase()) || (username && pw.toLowerCase() === String(username).toLowerCase())) ? 'That password is too easy to guess. Choose a different one.' : '';
+    const MIN_PW = { manager: 10, cashier: 8 };
+    const USERNAME_OK = /^[A-Za-z0-9._-]{3,30}$/;
+    router.get('/branches', ah(async (req, res) => {
+        const today = todayNairobi();
+        const rows = (await q(`SELECT s.id, s.name, s.address, s.phone, s.active, (s.parent_id IS NULL) AS hq,
+                (SELECT count(*)::int FROM pos_staff t WHERE t.shop_id=s.id AND t.active) AS staff,
+                COALESCE((SELECT sum(total_cents) FROM pos_sales x WHERE x.shop_id=s.id AND x.status='completed' AND (x.created_at AT TIME ZONE '${TZ}')::date = $2),0)::bigint AS today
+              FROM pos_shops s WHERE s.id=$1 OR s.parent_id=$1 ORDER BY (s.parent_id IS NULL) DESC, s.name`, [req.biz.id, today])).rows;
+        const total = rows.reduce((a, r) => a + Number(r.today), 0);
+        send(req, res, { title: 'Branches', nav: 'branches', body: `<h1>Branches</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><p style="margin-top:0">Staff sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with this business code: <b style="font-size:1.2rem;letter-spacing:.1em">${esc(req.biz.code || '')}</b></p>
+            <p class="muted" style="margin-bottom:0">Today's sales across all branches: <b>${kes(total)}</b></p></div>
+        <div class="panel tablewrap"><table><tr><th>Branch</th><th>Address</th><th class="num">Staff</th><th class="num">Sales today</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.hq ? ' <span class="tag gray">head office</span>' : ''}${r.active ? '' : ' <span class="tag bad">paused</span>'}</td><td>${esc(r.address)}</td><td class="num">${r.staff}</td><td class="num">${fmt(r.today)}</td><td class="right">${r.active ? `<form action="/pos/branches/switch" method="POST" style="display:inline"><input type="hidden" name="shop_id" value="${r.id}"><button class="btn small" type="submit">Open</button></form>` : ''} ${r.hq ? '' : `<form action="/pos/branches/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Pause' : 'Resume'}</button></form>`}</td></tr>`).join('')}</table></div>
+        <div class="panel" style="max-width:720px"><h2>Open a new branch</h2><form action="/pos/branches" method="POST"><div class="grid2">
+            <div class="field"><label for="bn">Branch name</label><input id="bn" name="name" required maxlength="120" placeholder="e.g. Kisumu Branch"></div>
+            <div class="field"><label for="ba">Address</label><input id="ba" name="address" maxlength="200"></div>
+            <div class="field"><label for="bp">Branch phone</label><input id="bp" name="phone" maxlength="40"></div></div>
+            <div class="field"><label><input type="checkbox" name="copy" value="1" checked style="width:auto"> Copy my items and categories to the new branch (stock starts at 0)</label></div>
+            <h2 style="margin-top:14px">Branch manager login (optional)</h2><p class="muted">The manager runs the branch and can register its cashiers.</p><div class="grid2">
+            <div class="field"><label for="mn">Manager name</label><input id="mn" name="mname" maxlength="80"></div>
+            <div class="field"><label for="mu">Username</label><input id="mu" name="musername" maxlength="30" autocapitalize="none" autocomplete="off"></div>
+            <div class="field"><label for="mp">Password</label><input id="mp" name="mpassword" type="password" autocomplete="new-password" maxlength="72"></div></div>
+            <button class="btn" type="submit">Open branch</button></form></div>` });
+    }));
+    router.post('/branches', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 120), mname = str(req.body.mname).slice(0, 80), mu = str(req.body.musername), mpw = String(req.body.mpassword || '');
+        if (name.length < 2) return back(res, '/pos/branches', '', 'Please enter the branch name.');
+        const wantManager = Boolean(mname || mu || mpw);
+        if (wantManager && (mname.length < 2 || !USERNAME_OK.test(mu) || passwordProblem(mpw, MIN_PW.manager, mu))) return back(res, '/pos/branches', '', 'For the manager login enter a name, a username (3 to 30 letters or numbers) and a password of at least 10 characters that is not easy to guess.');
+        const count = Number((await q('SELECT count(*) n FROM pos_shops WHERE parent_id=$1', [req.biz.id])).rows[0].n);
+        if (count >= 50) return back(res, '/pos/branches', '', 'You have reached the limit of 50 branches.');
+        const hash = wantManager ? await bcrypt.hash(mpw, 10) : '';
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const b = (await client.query('INSERT INTO pos_shops (parent_id, name, phone, address, receipt_footer) VALUES ($1,$2,$3,$4,$5) RETURNING id', [req.biz.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200), req.biz.receipt_footer])).rows[0];
+            if (req.body.copy === '1') {
+                await client.query('INSERT INTO pos_categories (shop_id, name) SELECT $2, name FROM pos_categories WHERE shop_id=$1', [req.biz.id, b.id]);
+                await client.query(`INSERT INTO pos_items (shop_id, category_id, name, barcode, price_cents, cost_cents, stock, track_stock, reorder_level, active)
+                    SELECT $2, nc.id, i.name, i.barcode, i.price_cents, i.cost_cents, 0, i.track_stock, i.reorder_level, i.active FROM pos_items i
+                    LEFT JOIN pos_categories oc ON oc.id = i.category_id LEFT JOIN pos_categories nc ON nc.shop_id = $2 AND nc.name = oc.name WHERE i.shop_id = $1`, [req.biz.id, b.id]);
+            }
+            if (wantManager) await client.query(`INSERT INTO pos_staff (business_id, shop_id, role, name, username, password_hash) VALUES ($1,$2,'manager',$3,$4,$5)`, [req.biz.id, b.id, mname, mu, hash]);
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            if (e.code === '23505') return back(res, '/pos/branches', '', 'That username is already used in your business. Choose another.');
+            throw e;
+        } finally { client.release(); }
+        await audit(req, 'branch.open', name);
+        back(res, '/pos/branches', 'Branch opened.');
+    }));
+    router.post('/branches/switch', ah(async (req, res) => {
+        const id = parseCount(req.body.shop_id, { min: 1 });
+        if (id && req.branches.some(b => b.id === id && b.active)) { req.session.posShopId = id; await saveSess(req); }
+        res.redirect('/pos/app');
+    }));
+    router.post('/branches/:id/toggle', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id && (await q('UPDATE pos_shops SET active = NOT active WHERE id=$1 AND parent_id=$2', [id, req.biz.id])).rowCount) await audit(req, 'branch.toggle', 'branch #' + id);
+        back(res, '/pos/branches', 'Saved.');
+    }));
+
+    // ----- staff: managers and cashiers -----
+    const staffScope = req => req.actor.role === 'owner' ? { sql: '(t.business_id=$1)', params: [req.biz.id] } : { sql: '(t.shop_id=$1 AND t.role=\'cashier\')', params: [req.shop.id] };
+    router.get('/staff', ah(async (req, res) => {
+        const owner = req.actor.role === 'owner', sc = staffScope(req);
+        const rows = (await q(`SELECT t.id, t.name, t.username, t.role, t.active, t.last_login, s.name AS shop FROM pos_staff t JOIN pos_shops s ON s.id=t.shop_id WHERE ${sc.sql} ORDER BY s.name, t.role, t.name`, sc.params)).rows;
+        send(req, res, { title: 'Staff', nav: 'staff', body: `<h1>${owner ? 'Staff & Cashiers' : 'Cashiers'}</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><p style="margin:0">They sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with business code <b>${esc(req.biz.code || '')}</b>, their username and their password.</p></div>
+        <div class="panel" style="max-width:720px"><h2>Register ${owner ? 'a staff member' : 'a cashier'}</h2><form action="/pos/staff" method="POST"><div class="grid2">
+            <div class="field"><label for="sn">Full name</label><input id="sn" name="name" required maxlength="80"></div>
+            <div class="field"><label for="su">Username</label><input id="su" name="username" required maxlength="30" autocapitalize="none" autocomplete="off"><small>3 to 30 letters, numbers, dot, dash or underscore.</small></div>
+            <div class="field"><label for="sp">Password</label><input id="sp" name="password" type="password" required maxlength="72" autocomplete="new-password"><small>At least 8 characters (10 for managers).</small></div>
+            ${owner ? `<div class="field"><label for="sr">Role</label><select id="sr" name="role"><option value="cashier">Cashier (sells only)</option><option value="manager">Branch manager</option></select></div>
+            <div class="field"><label for="ss">Works at</label><select id="ss" name="shop_id">${req.branches.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></div>` : ''}</div>
+            <button class="btn" type="submit">Register</button></form></div>
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>Name</th><th>Username</th><th>Role</th><th>Branch</th><th>Last sign-in</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.active ? '' : ' <span class="tag bad">off</span>'}</td><td>${esc(r.username)}</td><td>${esc(r.role)}</td><td>${esc(r.shop)}</td><td class="nowrap">${r.last_login ? esc(timeFmt(r.last_login)) : '-'}</td><td class="right nowrap">
+            <form action="/pos/staff/${r.id}/password" method="POST" style="display:inline"><input name="password" type="password" placeholder="New password" minlength="8" maxlength="72" required style="width:130px;display:inline-block" autocomplete="new-password"> <button class="btn small ghost" type="submit">Reset</button></form>
+            <form action="/pos/staff/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Switch off' : 'Switch on'}</button></form>
+            <form action="/pos/staff/${r.id}/delete" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form></td></tr>`).join('')}</table>` : '<p class="muted">No one registered yet.</p>'}</div>` });
+    }));
+    router.post('/staff', ah(async (req, res) => {
+        const owner = req.actor.role === 'owner';
+        const name = str(req.body.name).slice(0, 80), username = str(req.body.username), pw = String(req.body.password || '');
+        const role = owner && req.body.role === 'manager' ? 'manager' : 'cashier';
+        const shopId = owner ? parseCount(req.body.shop_id, { min: 1 }) : req.shop.id;
+        if (name.length < 2 || !USERNAME_OK.test(username)) return back(res, '/pos/staff', '', 'Enter a name and a username of 3 to 30 letters or numbers.');
+        const pwErr = passwordProblem(pw, MIN_PW[role], username);
+        if (pwErr) return back(res, '/pos/staff', '', pwErr);
+        if (!(owner ? req.branches : [{ id: req.shop.id }]).some(b => b.id === shopId)) return back(res, '/pos/staff', '', 'Choose a branch.');
+        try { await q('INSERT INTO pos_staff (business_id, shop_id, role, name, username, password_hash) VALUES ($1,$2,$3,$4,$5,$6)', [req.biz.id, shopId, role, name, username, await bcrypt.hash(pw, 10)]); }
+        catch (e) { if (e.code === '23505') return back(res, '/pos/staff', '', 'That username is already used in your business. Choose another.'); throw e; }
+        await audit(req, 'staff.add', `${username} (${role})`);
+        back(res, '/pos/staff', name + ' can now sign in.');
+    }));
+    const staffAct = (path, sqlFor) => router.post('/staff/:id/' + path, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 }), sc = staffScope(req);
+        let msg = 'Saved.';
+        if (id) {
+            const own = (await q(`SELECT t.id, t.name, t.username, t.role FROM pos_staff t WHERE t.id=$${sc.params.length + 1} AND ${sc.sql}`, [...sc.params, id])).rows[0];
+            if (own) { const r = await sqlFor(req, own); if (r === false) msg = 'That password is not strong enough (8 characters, 10 for managers, not easy to guess).'; else await audit(req, 'staff.' + path, `${own.username} (${own.role})`); }
+        }
+        back(res, '/pos/staff', msg);
+    }));
+    staffAct('password', async (req, t) => {
+        const pw = String(req.body.password || '');
+        if (passwordProblem(pw, MIN_PW[t.role], t.username)) return false;
+        await q('UPDATE pos_staff SET password_hash=$2, failed=0, locked_until=NULL, session_ver = session_ver + 1 WHERE id=$1', [t.id, await bcrypt.hash(pw, 10)]);
+        await q('DELETE FROM pos_auth_fails WHERE starts_with(key, $1)', [`u:${req.biz.code}:${String(t.username).toLowerCase()}`]);   // lift any sign-in lock
+    });
+    staffAct('toggle', (req, t) => q('UPDATE pos_staff SET active = NOT active, session_ver = session_ver + 1 WHERE id=$1', [t.id]));
+    staffAct('delete', (req, t) => q('DELETE FROM pos_staff WHERE id=$1', [t.id]));
+
+    // ----- a staff member changes their own password -----
+    router.get('/account', ah(async (req, res) => {
+        send(req, res, { title: 'My Account', nav: 'account', body: `<h1>My Account</h1>${notice(req)}${errBox(req)}<div class="panel" style="max-width:480px"><p>Signed in as <b>${esc(req.actor.name || '')}</b> (${esc(req.actor.role)}) at ${esc(req.shop.name)}.</p>
+            <form action="/pos/account/password" method="POST"><div class="field"><label for="cp">Current password</label><input id="cp" name="current" type="password" required autocomplete="current-password" maxlength="100"></div>
+            <div class="field"><label for="np">New password</label><input id="np" name="password" type="password" required minlength="8" maxlength="72" autocomplete="new-password"></div><button class="btn" type="submit">Change password</button></form></div>` });
+    }));
+    router.post('/account/password', ah(async (req, res) => {
+        if (req.actor.kind !== 'staff') return back(res, '/pos/app', 'Owners change their password on the main site.');
+        const row = (await q('SELECT password_hash FROM pos_staff WHERE id=$1', [req.actor.staffId])).rows[0];
+        const pw = String(req.body.password || '');
+        if (!row || !(await bcrypt.compare(String(req.body.current || ''), row.password_hash))) return back(res, '/pos/account', '', 'The current password is not right.');
+        const pwErr = passwordProblem(pw, MIN_PW[req.actor.role] || 8, req.actor.username || '');
+        if (pwErr) return back(res, '/pos/account', '', pwErr);
+        await q('UPDATE pos_staff SET password_hash=$2, session_ver = session_ver + 1 WHERE id=$1', [req.actor.staffId, await bcrypt.hash(pw, 10)]);
+        req.session.posStaff.ver += 1;   // this session stays signed in, every other one ends
+        await audit(req, 'staff.own_password', '');
+        back(res, '/pos/account', 'Password changed.');
+    }));
+
+    // ----- install as an app -----
+    router.get('/install', ah(async (req, res) => {
+        send(req, res, { title: 'Install App', nav: 'install', body: `<h1>Install the POS app</h1>
+        <div class="panel" style="max-width:640px"><p style="margin-top:0">Install Tencent POS on this phone, tablet or computer. It opens in its own window with its own icon, like any other app, and always stays up to date.</p>
+            <p><button class="btn ok" id="install-now" type="button" style="display:none">Install now</button></p>
+            <div id="install-help"><p><b>If there is no Install button above:</b></p><ul style="line-height:1.7">
+                <li><b>Android (Chrome):</b> tap the menu (three dots), then <i>Install app</i> or <i>Add to Home screen</i>.</li>
+                <li><b>iPhone / iPad (Safari):</b> tap Share, then <i>Add to Home Screen</i>.</li>
+                <li><b>Windows / Mac (Chrome or Edge):</b> click the install icon at the right end of the address bar.</li></ul></div>
+            <p class="muted">The POS needs internet to save sales. ${req.actor.role === 'owner' ? `Cashiers and managers install it the same way, opening <b>${esc(pubUrl('/pos/staff/login'))}</b> on their own device.` : ''}</p></div>` });
+    }));
+
+
+    // ----- background checks (safe to run on several server copies at once: every step is idempotent) -----
+    // 1) payments still waiting are asked about directly, so a sale is saved even if the callback never arrives
+    // 2) payments with no answer after 30 minutes go to "review" for the owner
+    // 3) gateway secrets sealed with an old key are re-sealed with the current key
+    // 4) old throttle rows are removed
+    let lastHousekeeping = 0;
+    async function sweep() {
+        const pend = (await q(`SELECT * FROM pos_payments WHERE status='pending' AND provider_ref IS NOT NULL AND created_at < now() - interval '25 seconds' AND created_at > now() - interval '30 minutes' ORDER BY created_at LIMIT 25`)).rows;
+        for (const p of pend) {
+            const gw = await loadGateway('id=$1', [p.gateway_id]);
+            if (!gw) continue;
+            await applyVerdict(p, await GW.PROVIDERS[gw.provider].verify(gw, p.provider_ref).catch(() => ({ state: 'pending' })));
+        }
+        await q(`UPDATE pos_payments SET status='review', fail_reason='No confirmation received. Check your M-Pesa statement.', updated_at=now() WHERE status='pending' AND created_at < now() - interval '30 minutes'`);
+        if (platform) {
+            const subs = (await q(`SELECT * FROM pos_sub_payments WHERE status='pending' AND checkout_request_id IS NOT NULL AND created_at < now() - interval '25 seconds' AND created_at > now() - interval '30 minutes' LIMIT 25`)).rows;
+            for (const p of subs) {
+                try {
+                    const r = await platform.stkQuery(p.checkout_request_id);
+                    if (String(r.ResultCode) === '0') await markSubPaid(p.id, '');
+                    else if (r.ResultCode !== undefined && String(r.ResultCode) !== '') await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [p.id]);
+                } catch (_) { /* not ready yet */ }
+            }
+        }
+        if (Date.now() - lastHousekeeping > 10 * 60 * 1000) {
+            lastHousekeeping = Date.now();
+            await q(`DELETE FROM pos_auth_fails WHERE COALESCE(locked_until, first_at) < now() - interval '2 days'`);
+            if (vault.enabled) {
+                for (const g of (await q('SELECT id, business_id, provider, secrets FROM pos_gateways')).rows) {
+                    if (!vault.needsRotation(g.secrets)) continue;
+                    try { const scope = `${g.business_id}:${g.provider}`; await q('UPDATE pos_gateways SET secrets=$2 WHERE id=$1 AND secrets=$3', [g.id, vault.seal(vault.open(g.secrets, scope), scope), g.secrets]); console.log('POS: re-sealed gateway', g.id, 'with the current key'); }
+                    catch (e) { console.error('POS: could not re-seal gateway', g.id + ':', e.message); }
+                }
+            }
+        }
+    }
+    if (process.env.POS_NO_JOBS !== '1') { const t = setInterval(() => sweep().catch(e => console.error('POS background check failed:', e.message)), 30000); if (t.unref) t.unref(); }
+
+    return { handlePlatformCallback };
 }
 
 module.exports = mountPos;
 module.exports.initSchema = initSchema;
-module.exports.handlePlatformCallback = handlePlatformCallback;
