@@ -140,7 +140,8 @@ async function initSchema(pool) {
         `CREATE TABLE IF NOT EXISTS pos_assets (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, cost_cents BIGINT NOT NULL, bought_on DATE NOT NULL, life_years INT NOT NULL DEFAULT 5, salvage_cents BIGINT NOT NULL DEFAULT 0, note VARCHAR(200) NOT NULL DEFAULT '')`,
         `CREATE TABLE IF NOT EXISTS pos_notes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, title VARCHAR(120) NOT NULL, body VARCHAR(4000) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`
     ];
-    for (const sql of T) await pool.query(sql);
+    const step = async sql => { try { await pool.query(sql); } catch (e) { throw new Error(`POS schema step failed (${e.message}) in: ${String(sql.text || sql).replace(/\s+/g, ' ').slice(0, 140)}`); } };
+    for (const sql of T) await step(sql);
 
     // ---- businesses, branches, staff, payment gateways, subscription and VAT ----
     const hadSub = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'sub_until'`);
@@ -177,9 +178,9 @@ async function initSchema(pool) {
         `CREATE TABLE IF NOT EXISTS pos_owner_security (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE, last_counter BIGINT NOT NULL DEFAULT 0, recovery JSONB NOT NULL DEFAULT '[]', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
         `CREATE TABLE IF NOT EXISTS pos_void_requests (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE, reason VARCHAR(200) NOT NULL, requested_by VARCHAR(80) NOT NULL DEFAULT '', staff_id INT, status VARCHAR(10) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), decided_at TIMESTAMPTZ, decided_by VARCHAR(80) NOT NULL DEFAULT '')`,
         `CREATE UNIQUE INDEX IF NOT EXISTS pos_void_one_pending ON pos_void_requests (sale_id) WHERE status = 'pending'`
-    ]) await pool.query(sql);
+    ]) await step(sql);
     // shops that were already using the POS before subscriptions existed keep working for a grace period
-    if (!hadSub.rowCount) await pool.query(`UPDATE pos_shops SET sub_until = now() + ($1 || ' days')::interval WHERE parent_id IS NULL`, [String(GRACE_DAYS)]);
+    if (!hadSub.rowCount) await step({ text: 'UPDATE pos_shops SET sub_until = now() + make_interval(days => $1::int) WHERE parent_id IS NULL', values: [GRACE_DAYS] });
     for (const s of (await pool.query('SELECT id FROM pos_shops WHERE parent_id IS NULL AND code IS NULL')).rows) await assignCode(pool, s.id);
 }
 
