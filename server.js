@@ -167,12 +167,12 @@ if (dbEnabled) {
     console.error('DATABASE_URL is not set: sign-in, bookings and receipts are switched off until you add it.');
 }
 
-let posReady = false, posInitRunning = false;
+let posReady = false, posInitRunning = false, posSetupNote = 'POS setup has not started: the main database setup has not finished yet.', dbSetupNote = '';
 async function initPosSchema() {
     if (posInitRunning || posReady) return;
-    posInitRunning = true;
-    try { await POS.initSchema(pool); posReady = true; console.log('POS tables ready.'); }
-    catch (err) { console.error('POS database setup failed, trying again in 30 seconds:', err.message); setTimeout(initPosSchema, 30000).unref(); }
+    posInitRunning = true; posSetupNote = 'POS setup is running.';
+    try { await POS.initSchema(pool); posReady = true; posSetupNote = ''; console.log('POS tables ready.'); }
+    catch (err) { posSetupNote = 'POS setup failed: ' + err.message; console.error('POS database setup failed, trying again in 30 seconds:', err.message); setTimeout(initPosSchema, 30000).unref(); }
     finally { posInitRunning = false; }
 }
 
@@ -243,10 +243,10 @@ async function initDb() {
             try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
         }
         if (POS) initPosSchema();   // the POS sets up its own tables separately, so a POS problem can never take bookings and login offline
-        dbReady = true;
+        dbReady = true; dbSetupNote = '';
         console.log('PostgreSQL tables initialized successfully.');
     } catch (err) {
-        dbReady = false;
+        dbReady = false; dbSetupNote = 'Main database setup failed: ' + err.message;
         console.error('Database initialization error, trying again in 15 seconds:', err.message);
         setTimeout(() => initDb(), 15000).unref();
     }
@@ -2189,7 +2189,13 @@ app.post('/ussd', (req, res) => {
 // ---------------------------------------------------------------
 if (POS) {
     // until the POS tables are ready, /pos says so instead of failing in strange ways
-    app.use('/pos', (req, res, next) => posReady ? next() : errorPage(req, res, 503, 'POS is starting up', 'The POS is getting ready. Please try again in a minute.'));
+    // (the site administrator, signed in with the NOTIFY_TO / mail address, also sees why, so no log digging is needed)
+    app.use('/pos', (req, res, next) => {
+        if (posReady) return next();
+        const me = String((req.session && req.session.user && req.session.user.email) || '').toLowerCase(), admin = String(MAIL.adminTo || '').toLowerCase();
+        const why = me && admin && me === admin ? ' [Administrator only: ' + (dbSetupNote || posSetupNote || 'no error recorded yet') + ']' : '';
+        return errorPage(req, res, 503, 'POS is starting up', 'The POS is getting ready. Please try again in a minute.' + why);
+    });
     posHooks = POS({
         app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
         publicBaseUrl: PUBLIC_BASE_URL,
