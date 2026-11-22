@@ -287,7 +287,7 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
         const voidBanner = role === 'owner' && req.pendingVoids ? `<div class="alert noprint" role="status">${req.pendingVoids} void request${req.pendingVoids === 1 ? '' : 's'} waiting for your approval. <a href="/pos/voids">Review</a></div>` : '';
         const banner = voidBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
         const links = navFor(role).map(([group, items]) => `<div class="nav-group">${esc(group)}</div>` +
-            items.map(([key, href, label]) => `<a href="${href}" class="${nav === key ? 'active' : ''}">${esc(label)}</a>`).join('')).join('');
+            items.map(([key, href, label]) => `<a href="${href}"${key === 'install' ? ' id="nav-install"' : ''} class="${nav === key ? 'active' : ''}">${esc(label)}</a>`).join('')).join('');
         return `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -344,8 +344,14 @@ ${switcher}${links}
 <script nonce="${req.nonce || ''}">
 (function(){var b=document.getElementById('side-btn'),s=document.getElementById('side');if(b)b.addEventListener('click',function(){var o=s.classList.toggle('open');b.setAttribute('aria-expanded',o?'true':'false');});
 var sw=document.getElementById('sw');if(sw)sw.addEventListener('change',function(){sw.form.submit();});
-var ev=null,ib=document.getElementById('install-now');window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();ev=e;if(ib)ib.style.display='';var h=document.getElementById('install-help');if(h)h.style.display='none';});
-if(ib)ib.addEventListener('click',function(){if(!ev)return;ev.prompt();ev.userChoice.then(function(){ev=null;ib.style.display='none';});});
+var ev=null,ib=document.getElementById('install-now'),ni=document.getElementById('nav-install');
+var standalone=(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches)||window.navigator.standalone===true;
+if(standalone&&ni)ni.style.display='none';
+function startInstall(){if(!ev)return false;var p=ev;ev=null;p.prompt();p.userChoice.then(function(c){if(c&&c.outcome==='accepted'){if(ni)ni.style.display='none';if(ib)ib.style.display='none';}});return true;}
+window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();ev=e;if(ib)ib.style.display='';var h=document.getElementById('install-help');if(h)h.style.display='none';});
+window.addEventListener('appinstalled',function(){if(ni)ni.style.display='none';});
+if(ni)ni.addEventListener('click',function(e){if(startInstall())e.preventDefault();});
+if(ib)ib.addEventListener('click',startInstall);
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{scope:'/pos/'}).catch(function(){});})();
 </script>
 </body></html>`;
@@ -2148,13 +2154,22 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     // ----- install as an app -----
     router.get('/install', ah(async (req, res) => {
         send(req, res, { title: 'Install App', nav: 'install', body: `<h1>Install the POS app</h1>
-        <div class="panel" style="max-width:640px"><p style="margin-top:0">Install Tencent POS on this phone, tablet or computer. It opens in its own window with its own icon, like any other app, and always stays up to date.</p>
-            <p><button class="btn ok" id="install-now" type="button" style="display:none">Install now</button></p>
-            <div id="install-help"><p><b>If there is no Install button above:</b></p><ul style="line-height:1.7">
-                <li><b>Android (Chrome):</b> tap the menu (three dots), then <i>Install app</i> or <i>Add to Home screen</i>.</li>
-                <li><b>iPhone / iPad (Safari):</b> tap Share, then <i>Add to Home Screen</i>.</li>
-                <li><b>Windows / Mac (Chrome or Edge):</b> click the install icon at the right end of the address bar.</li></ul></div>
-            <p class="muted">The POS needs internet to save sales. ${req.actor.role === 'owner' ? `Cashiers and managers install it the same way, opening <b>${esc(pubUrl('/pos/staff/login'))}</b> on their own device.` : ''}</p></div>` });
+        <div class="panel" style="max-width:640px">
+            <div id="installed" class="alert ok" role="status" style="display:none">The POS app is already installed on this device.</div>
+            <p id="install-intro" style="margin-top:0">Tap the button to install Tencent POS on this device. It gets its own icon and opens like any other app.</p>
+            <p><button class="btn ok" id="install-now" type="button" style="display:none;padding:14px 26px;font-size:1.05rem">Install now</button></p>
+            <div id="help-ios" style="display:none"><p><b>On iPhone / iPad</b> Apple does not allow one-tap installs: tap the Share button in Safari, then <i>Add to Home Screen</i>.</p></div>
+            <div id="help-other" style="display:none"><p>Your browser did not offer the install yet. Open this page in <b>Chrome</b> or <b>Edge</b> and try again, or use the browser menu (three dots), then <i>Install app</i> / <i>Add to Home screen</i>.</p></div>
+            <p class="muted">The POS needs internet to save sales. ${req.actor.role === 'owner' ? `Cashiers and managers install it the same way, opening <b>${esc(pubUrl('/pos/staff/login'))}</b> on their own device.` : ''}</p></div>
+        <script nonce="${req.nonce || ''}">
+        (function () {
+            var standalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+            if (standalone) { document.getElementById('installed').style.display = ''; document.getElementById('install-intro').style.display = 'none'; return; }
+            var ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+            if (ios) { document.getElementById('help-ios').style.display = ''; return; }
+            setTimeout(function () { var b = document.getElementById('install-now'); if (b && b.style.display === 'none') document.getElementById('help-other').style.display = ''; }, 2000);
+        })();
+        </script>` });
     }));
 
 
