@@ -110,7 +110,7 @@ const limiter = rateLimit({
     legacyHeaders: false,
     message: 'Too many requests from this network, please try again later.',
     skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/') ||
-        req.path.startsWith('/pos/mpesa/cb/') || req.path.startsWith('/pos/paystack/hook/') || req.path.startsWith('/pos/api/')   // payment-company callbacks and the till's own calls have their own limits in pos.js
+        req.path.startsWith('/pos/')   // payment-company callbacks and the till's own calls have their own limits in pos.js
 });
 const statusLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 400, standardHeaders: true, legacyHeaders: false, message: { status: 'unknown' } });
 const payLimiter = rateLimit({
@@ -161,7 +161,7 @@ if (dbEnabled) {
     else if (sslMode === 'insecure') ssl = { rejectUnauthorized: false };   // only if your provider's certificate cannot be verified
     else if (host === 'localhost' || host === '127.0.0.1' || (host && !host.includes('.'))) ssl = false;   // local, or Render's internal address
     else ssl = { rejectUnauthorized: true };
-    pool = new Pool({ connectionString: DATABASE_URL, ssl, max: 8, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 });
+    pool = new Pool({ connectionString: DATABASE_URL, ssl, max: 8, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000, statement_timeout: 30000, query_timeout: 35000, idle_in_transaction_session_timeout: 30000 });
     pool.on('error', err => console.error('Database pool error:', err.message));
 } else {
     console.error('DATABASE_URL is not set: sign-in, bookings and receipts are switched off until you add it.');
