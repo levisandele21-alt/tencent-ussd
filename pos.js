@@ -380,6 +380,14 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{s
         res.send(renderPage(req, { title: 'POS System for Shops', activeNav: 'pos', content }));
     });
 
+    // complimentary test accounts: owners whose login email is listed in POS_FREE_EMAILS use the POS without paying the subscription
+    const compEmails = new Set(String(process.env.POS_FREE_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+    const isComped = async (biz, a, req) => {
+        if (!compEmails.size) return false;
+        if (a.kind === 'owner') return compEmails.has(String((req.session.user && req.session.user.email) || '').toLowerCase());
+        const u = (await q('SELECT lower(email) AS email FROM users WHERE id = $1', [biz.owner_id])).rows[0];
+        return Boolean(u && compEmails.has(u.email));
+    };
     const vault = SEC.makeVault(process.env.POS_CRED_KEY, String(process.env.POS_CRED_KEY_OLD || '').split(','));
     const regen = req => new Promise((ok, no) => req.session.regenerate(e => (e ? no(e) : ok())));
     const saveSess = req => new Promise((ok, no) => req.session.save(e => (e ? no(e) : ok())));
@@ -604,6 +612,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         if (!roleAllows(a.role, req.method, req.path)) return deny(req, res);
         if (a.role === 'cashier' && req.path === '/app') return res.redirect('/pos/terminal');
         req.subActive = Boolean(biz.sub_until && new Date(biz.sub_until) > new Date());
+        if (!req.subActive && await isComped(biz, a, req)) { req.subActive = true; req.comped = true; }
         if (!req.subActive && !(a.role === 'owner' && /^\/subscribe(\/|$)/.test(req.path))) {
             if (isApi(req)) return res.status(402).json({ error: 'The POS subscription has ended. The owner must renew it.' });
             if (a.role === 'owner') return res.redirect('/pos/subscribe');
@@ -1851,9 +1860,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const b = req.biz, until = b.sub_until ? new Date(b.sub_until) : null, active = req.subActive;
         const hist = (await q('SELECT amount_kes, status, receipt, created_at FROM pos_sub_payments WHERE business_id=$1 ORDER BY created_at DESC LIMIT 12', [b.id])).rows;
         const phone = platform && platform.normalizePhone ? (platform.normalizePhone(req.session.user.phone) || '') : '';
+        const compNote = req.comped ? '<div class="alert ok" role="status">This is a complimentary test account: the POS is switched on without a subscription payment.</div>' : '';
         const payId = parseCount(req.query.pay, { min: 1 });
         send(req, res, { title: 'Subscription', nav: 'subscription', body: `<h1>Subscription</h1>${notice(req)}${errBox(req)}
-        <div class="panel" style="max-width:620px"><h2>${active ? 'Your POS is active' : 'Your POS is not active'}</h2>
+        ${compNote}<div class="panel" style="max-width:620px"><h2>${active ? 'Your POS is active' : 'Your POS is not active'}</h2>
             <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month</b> for the whole business, including all branches and cashiers. Paying early adds a month to the end of your current period.</p>
             ${payId ? `<div id="paybox" class="alert ok" role="status">Check your phone and enter your M-Pesa PIN. Waiting for the payment...</div>` : ''}
             ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" class="row"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" type="submit">Pay KES ${SUB_FEE_KES.toLocaleString('en-KE')} with M-Pesa</button></form>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
