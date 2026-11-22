@@ -1,2241 +1,2160 @@
 'use strict';
+// ---------------------------------------------------------------------------
+// Tencent POS: a point-of-sale service for shops, mounted into server.js at /pos.
+// Every shop has its own products, stock, sales and reports. Every database query is
+// limited to the signed-in owner's shop, so one shop can never see another shop's data.
+// ---------------------------------------------------------------------------
 const express = require('express');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const nodemailer = require('nodemailer');
-const path = require('path');
 const crypto = require('crypto');
-const fs = require('fs');
-const { Pool } = require('pg');
-const session = require('express-session');
-const pgSession = require('connect-pg-simple')(session);
 const bcrypt = require('bcryptjs');
+const GW = require('./pos-gateways');
+const SEC = require('./pos-security');
+const PAYSTACK_ON = process.env.POS_ENABLE_PAYSTACK === '1';   // Paystack code is not verified against their live service, so it stays off unless you switch it on
+const COMMON_PW = new Set(['password', 'password1', '12345678', '123456789', '1234567890', 'qwerty123', '11111111', '00000000', 'abcd1234', 'tencent123', 'welcome123']);
 
-let PDFDocument = null;
-try {
-    PDFDocument = require('pdfkit');
-} catch (_) {
-    console.error('pdfkit is not installed: PDF receipts are disabled.');
+const TZ = 'Africa/Nairobi';
+const VAT_RATE = 16;   // percent. Selling prices already include this VAT.
+const vatOf = gross => Math.round(Number(gross) * VAT_RATE / (100 + VAT_RATE));   // VAT inside a VAT-inclusive amount, in cents
+const envInt = (name, fallback) => { const n = Number(process.env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
+const SUB_FEE_KES = envInt('POS_MONTHLY_FEE', 3000);   // monthly subscription, paid to the platform M-Pesa account in server.js
+const GRACE_DAYS = envInt('POS_GRACE_DAYS', 30);       // shops that already existed before subscriptions started get this many free days
+const LOGO_OK = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/;
+const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const newCode = () => Array.from(crypto.randomBytes(6), b => CODE_CHARS[b % CODE_CHARS.length]).join('');
+async function assignCode(db, shopId) {   // short business code that staff type when they sign in
+    for (let i = 0; i < 12; i++) {
+        try { const r = await db.query('UPDATE pos_shops SET code=$2 WHERE id=$1 AND code IS NULL', [shopId, newCode()]); return r.rowCount; }
+        catch (e) { if (e.code !== '23505') throw e; }
+    }
+    throw new Error('Could not create a business code');
 }
 
-process.on('unhandledRejection', err => console.error('Unhandled rejection:', err && err.message ? err.message : err));
+async function initSchema(pool) {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_shops (
+            id SERIAL PRIMARY KEY,
+            owner_id INT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+            name VARCHAR(120) NOT NULL,
+            phone VARCHAR(40) NOT NULL DEFAULT '',
+            address VARCHAR(200) NOT NULL DEFAULT '',
+            tax_pin VARCHAR(40) NOT NULL DEFAULT '',
+            receipt_footer VARCHAR(200) NOT NULL DEFAULT 'Thank you for shopping with us!',
+            next_receipt INT NOT NULL DEFAULT 1,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_categories (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            name VARCHAR(80) NOT NULL,
+            UNIQUE (shop_id, name)
+        )`);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_items (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            category_id INT REFERENCES pos_categories(id) ON DELETE SET NULL,
+            name VARCHAR(120) NOT NULL,
+            barcode VARCHAR(60),
+            price_cents BIGINT NOT NULL,
+            cost_cents BIGINT NOT NULL DEFAULT 0,
+            stock INT NOT NULL DEFAULT 0,
+            track_stock BOOLEAN NOT NULL DEFAULT TRUE,
+            reorder_level INT NOT NULL DEFAULT 5,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS pos_items_barcode_uq ON pos_items (shop_id, barcode) WHERE barcode IS NOT NULL');
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_items_shop_idx ON pos_items (shop_id, active)');
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_sales (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            receipt_no INT NOT NULL,
+            subtotal_cents BIGINT NOT NULL,
+            discount_cents BIGINT NOT NULL DEFAULT 0,
+            total_cents BIGINT NOT NULL,
+            paid_cents BIGINT NOT NULL,
+            change_cents BIGINT NOT NULL DEFAULT 0,
+            method VARCHAR(10) NOT NULL,
+            mpesa_ref VARCHAR(20),
+            customer_name VARCHAR(80) NOT NULL DEFAULT '',
+            customer_phone VARCHAR(30) NOT NULL DEFAULT '',
+            status VARCHAR(10) NOT NULL DEFAULT 'completed',
+            void_reason VARCHAR(200),
+            voided_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (shop_id, receipt_no)
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_sales_shop_time_idx ON pos_sales (shop_id, created_at DESC)');
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_sale_items (
+            id SERIAL PRIMARY KEY,
+            sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE,
+            item_id INT REFERENCES pos_items(id) ON DELETE SET NULL,
+            name VARCHAR(120) NOT NULL,
+            qty INT NOT NULL,
+            unit_price_cents BIGINT NOT NULL,
+            unit_cost_cents BIGINT NOT NULL DEFAULT 0
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_sale_items_sale_idx ON pos_sale_items (sale_id)');
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_stock_moves (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            item_id INT NOT NULL REFERENCES pos_items(id) ON DELETE CASCADE,
+            change INT NOT NULL,
+            balance INT NOT NULL,
+            reason VARCHAR(12) NOT NULL,
+            note VARCHAR(200) NOT NULL DEFAULT '',
+            sale_id INT REFERENCES pos_sales(id) ON DELETE SET NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_moves_shop_idx ON pos_stock_moves (shop_id, created_at DESC)');
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS pos_expenses (
+            id SERIAL PRIMARY KEY,
+            shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE,
+            category VARCHAR(60) NOT NULL,
+            amount_cents BIGINT NOT NULL,
+            note VARCHAR(200) NOT NULL DEFAULT '',
+            spent_on DATE NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS pos_expenses_shop_idx ON pos_expenses (shop_id, spent_on DESC)');
+    await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS next_po INT NOT NULL DEFAULT 1');
+    await pool.query('ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS next_quote INT NOT NULL DEFAULT 1');
+    const T = [
+        `CREATE TABLE IF NOT EXISTS pos_suppliers (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, phone VARCHAR(40) NOT NULL DEFAULT '', email VARCHAR(160) NOT NULL DEFAULT '', address VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_purchase_orders (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, supplier_id INT REFERENCES pos_suppliers(id) ON DELETE SET NULL, po_no INT NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'open', note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), received_at TIMESTAMPTZ, UNIQUE (shop_id, po_no))`,
+        `CREATE TABLE IF NOT EXISTS pos_po_lines (id SERIAL PRIMARY KEY, po_id INT NOT NULL REFERENCES pos_purchase_orders(id) ON DELETE CASCADE, item_id INT NOT NULL REFERENCES pos_items(id) ON DELETE CASCADE, qty INT NOT NULL, cost_cents BIGINT NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS pos_quotes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, quote_no INT NOT NULL, customer_name VARCHAR(120) NOT NULL DEFAULT '', customer_phone VARCHAR(40) NOT NULL DEFAULT '', valid_until DATE, status VARCHAR(10) NOT NULL DEFAULT 'open', note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (shop_id, quote_no))`,
+        `CREATE TABLE IF NOT EXISTS pos_quote_lines (id SERIAL PRIMARY KEY, quote_id INT NOT NULL REFERENCES pos_quotes(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, qty INT NOT NULL, unit_price_cents BIGINT NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS pos_drawer (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, opened_at TIMESTAMPTZ NOT NULL DEFAULT now(), opening_cents BIGINT NOT NULL DEFAULT 0, closed_at TIMESTAMPTZ, expected_cents BIGINT, counted_cents BIGINT, note VARCHAR(200) NOT NULL DEFAULT '')`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS pos_drawer_one_open ON pos_drawer (shop_id) WHERE closed_at IS NULL`,
+        `CREATE TABLE IF NOT EXISTS pos_drawer_moves (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, drawer_id INT NOT NULL REFERENCES pos_drawer(id) ON DELETE CASCADE, kind VARCHAR(3) NOT NULL, amount_cents BIGINT NOT NULL, note VARCHAR(200) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_expense_cats (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(60) NOT NULL, UNIQUE (shop_id, name))`,
+        `CREATE TABLE IF NOT EXISTS pos_recurring (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, category VARCHAR(60) NOT NULL, amount_cents BIGINT NOT NULL, note VARCHAR(200) NOT NULL DEFAULT '', day_of_month INT NOT NULL, last_run DATE)`,
+        `CREATE TABLE IF NOT EXISTS pos_budgets (shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, category VARCHAR(60) NOT NULL, amount_cents BIGINT NOT NULL, PRIMARY KEY (shop_id, category))`,
+        `CREATE TABLE IF NOT EXISTS pos_assets (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, cost_cents BIGINT NOT NULL, bought_on DATE NOT NULL, life_years INT NOT NULL DEFAULT 5, salvage_cents BIGINT NOT NULL DEFAULT 0, note VARCHAR(200) NOT NULL DEFAULT '')`,
+        `CREATE TABLE IF NOT EXISTS pos_notes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, title VARCHAR(120) NOT NULL, body VARCHAR(4000) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`
+    ];
+    const step = async sql => { try { await pool.query(sql); } catch (e) { throw new Error(`POS schema step failed (${e.message}) in: ${String(sql.text || sql).replace(/\s+/g, ' ').slice(0, 140)}`); } };
+    for (const sql of T) await step(sql);
 
-const app = express();
-app.disable('x-powered-by');
-app.set('trust proxy', 1);   // Render sits in front of the app
-
-// ---------------------------------------------------------------
-// 0. Settings
-// ---------------------------------------------------------------
-const PORT = process.env.PORT || 10000;
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-const LINK_SECRET = process.env.LINK_SECRET || '';   // must be its own secret, never the M-Pesa callback secret
-const SESSION_SECRET = process.env.SESSION_SECRET || '';
-if (LINK_SECRET.length < 16) console.error('LINK_SECRET is missing or shorter than 16 characters: shareable booking links are switched off.');
-if (SESSION_SECRET.length < 32) console.error('SESSION_SECRET is missing or shorter than 32 characters: everyone is logged out whenever the server restarts. Add a long random value in Render.');
-
-// ---------------------------------------------------------------
-// 1. Small helpers
-// ---------------------------------------------------------------
-function esc(value = '') {
-    return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    // ---- businesses, branches, staff, payment gateways, subscription and VAT ----
+    const hadSub = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'sub_until'`);
+    for (const sql of [
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES pos_shops(id) ON DELETE CASCADE',   // set on branches: points at the head office
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS code VARCHAR(10)',                                          // business code used by staff to sign in
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS logo TEXT',
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS vat_enabled BOOLEAN NOT NULL DEFAULT TRUE',
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS sub_until TIMESTAMPTZ',
+        'ALTER TABLE pos_shops DROP CONSTRAINT IF EXISTS pos_shops_owner_id_key',                                   // one business per owner now means one HEAD OFFICE per owner
+        'ALTER TABLE pos_shops ALTER COLUMN owner_id DROP NOT NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_shops_owner_root_uq ON pos_shops (owner_id) WHERE parent_id IS NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_shops_code_uq ON pos_shops (code) WHERE code IS NOT NULL',
+        'CREATE INDEX IF NOT EXISTS pos_shops_parent_idx ON pos_shops (parent_id)',
+        'ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS vat_cents BIGINT NOT NULL DEFAULT 0',
+        'ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS staff_id INT',
+        `ALTER TABLE pos_sales ADD COLUMN IF NOT EXISTS cashier_name VARCHAR(80) NOT NULL DEFAULT ''`,
+        `CREATE TABLE IF NOT EXISTS pos_staff (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, role VARCHAR(10) NOT NULL, name VARCHAR(80) NOT NULL, username VARCHAR(40) NOT NULL, password_hash VARCHAR(100) NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, failed INT NOT NULL DEFAULT 0, locked_until TIMESTAMPTZ, last_login TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_staff_user_uq ON pos_staff (business_id, lower(username))',
+        'CREATE INDEX IF NOT EXISTS pos_staff_shop_idx ON pos_staff (shop_id)',
+        `CREATE TABLE IF NOT EXISTS pos_gateways (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, provider VARCHAR(20) NOT NULL, cfg JSONB NOT NULL DEFAULT '{}', secrets TEXT NOT NULL, callback_token CHAR(48) NOT NULL UNIQUE, active BOOLEAN NOT NULL DEFAULT TRUE, is_default BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (business_id, provider))`,
+        `CREATE TABLE IF NOT EXISTS pos_payments (id VARCHAR(32) PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, gateway_id INT REFERENCES pos_gateways(id) ON DELETE SET NULL, staff_id INT, cashier_name VARCHAR(80) NOT NULL DEFAULT '', amount_kes INT NOT NULL, phone VARCHAR(20) NOT NULL, provider_ref VARCHAR(120), status VARCHAR(10) NOT NULL DEFAULT 'pending', receipt VARCHAR(40) NOT NULL DEFAULT '', cart JSONB NOT NULL, sale_id INT REFERENCES pos_sales(id) ON DELETE SET NULL, fail_reason VARCHAR(160) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE INDEX IF NOT EXISTS pos_payments_ref_idx ON pos_payments (provider_ref)',
+        'CREATE INDEX IF NOT EXISTS pos_payments_shop_idx ON pos_payments (shop_id, created_at DESC)',
+        `CREATE TABLE IF NOT EXISTS pos_sub_payments (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, amount_kes INT NOT NULL, phone VARCHAR(20) NOT NULL, account_ref VARCHAR(20) NOT NULL UNIQUE, checkout_request_id VARCHAR(100), status VARCHAR(10) NOT NULL DEFAULT 'pending', receipt VARCHAR(40) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), paid_at TIMESTAMPTZ)`,
+        'CREATE INDEX IF NOT EXISTS pos_sub_checkout_idx ON pos_sub_payments (checkout_request_id)',
+        'ALTER TABLE pos_staff ADD COLUMN IF NOT EXISTS session_ver INT NOT NULL DEFAULT 0',   // bumped on password change or switch-off: ends that person's sessions
+        `CREATE TABLE IF NOT EXISTS pos_auth_fails (key TEXT PRIMARY KEY, count INT NOT NULL DEFAULT 0, first_at TIMESTAMPTZ NOT NULL DEFAULT now(), locked_until TIMESTAMPTZ)`,
+        `CREATE TABLE IF NOT EXISTS pos_audit (id BIGSERIAL PRIMARY KEY, business_id INT NOT NULL, shop_id INT, actor_kind VARCHAR(10) NOT NULL, actor_id INT, actor_name VARCHAR(80) NOT NULL DEFAULT '', action VARCHAR(40) NOT NULL, detail VARCHAR(300) NOT NULL DEFAULT '', ip VARCHAR(60) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE INDEX IF NOT EXISTS pos_audit_biz_idx ON pos_audit (business_id, id DESC)',
+        `CREATE OR REPLACE FUNCTION pos_audit_immutable() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'the audit log cannot be changed'; END; $$ LANGUAGE plpgsql`,
+        'DROP TRIGGER IF EXISTS pos_audit_no_change ON pos_audit',
+        'CREATE TRIGGER pos_audit_no_change BEFORE UPDATE OR DELETE ON pos_audit FOR EACH ROW EXECUTE PROCEDURE pos_audit_immutable()',
+        `CREATE TABLE IF NOT EXISTS pos_owner_security (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE, last_counter BIGINT NOT NULL DEFAULT 0, recovery JSONB NOT NULL DEFAULT '[]', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_void_requests (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE, reason VARCHAR(200) NOT NULL, requested_by VARCHAR(80) NOT NULL DEFAULT '', staff_id INT, status VARCHAR(10) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), decided_at TIMESTAMPTZ, decided_by VARCHAR(80) NOT NULL DEFAULT '')`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS pos_void_one_pending ON pos_void_requests (sale_id) WHERE status = 'pending'`
+    ]) await step(sql);
+    // shops that were already using the POS before subscriptions existed keep working for a grace period
+    if (!hadSub.rowCount) await step({ text: 'UPDATE pos_shops SET sub_until = now() + make_interval(days => $1::int) WHERE parent_id IS NULL', values: [GRACE_DAYS] });
+    for (const s of (await pool.query('SELECT id FROM pos_shops WHERE parent_id IS NULL AND code IS NULL')).rows) await assignCode(pool, s.id);
 }
-const flat = value => (Array.isArray(value) ? value.join(', ') : (value || ''));
-const str = v => (typeof v === 'string' ? v.trim() : '');
-const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);   // Express 4 does not catch async errors by itself
 
-// Only plain image/video files in the project folder are public. Source code, package.json and
-// any key or .env file are never served.
-const PUBLIC_FILE = /^\/[A-Za-z0-9_.-]+\.(png|jpe?g|gif|webp|svg|ico|mp4|webm)$/i;
-const staticFiles = express.static(__dirname, { dotfiles: 'ignore', index: false, redirect: false, maxAge: '1h' });
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+const fmt = cents => (Number(cents) / 100).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const kes = cents => 'KES ' + fmt(cents);
+function parseMoney(v) {   // "1250" or "1250.50" -> cents; anything else -> null
+    const s = String(v == null ? '' : v).trim().replace(/,/g, '');
+    if (!/^\d{1,9}(\.\d{1,2})?$/.test(s)) return null;
+    return Math.round(parseFloat(s) * 100);
+}
+function parseCount(v, { min = 0, max = 1000000 } = {}) {
+    const s = String(v == null ? '' : v).trim();
+    if (!/^-?\d{1,7}$/.test(s)) return null;
+    const n = Number(s);
+    return n >= min && n <= max ? n : null;
+}
+const validDate = v => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(v || ''))) return false;
+    const d = new Date(v + 'T00:00:00Z');
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+};
+const todayNairobi = () => new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+const addDays = (iso, n) => new Date(new Date(iso + 'T00:00:00Z').getTime() + n * 86400000).toISOString().slice(0, 10);
+const csvCell = v => {   // quotes, and a leading apostrophe stops spreadsheet formulas such as =HYPERLINK(...)
+    let s = String(v == null ? '' : v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+};
+const timeFmt = d => new Date(d).toLocaleString('en-KE', { timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const dateFmt = d => new Date(d).toLocaleDateString('en-KE', { timeZone: TZ, day: '2-digit', month: 'short', year: 'numeric' });
+const isoDate = d => (d instanceof Date ? new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString() : String(d)).slice(0, 10);
+function assetBookValue(a, todayIso) {   // straight-line depreciation by whole days
+    const cost = Number(a.cost_cents), salv = Number(a.salvage_cents), days = (new Date(todayIso) - new Date(isoDate(a.bought_on))) / 86400000;
+    const dep = (cost - salv) * Math.max(0, days) / (a.life_years * 365);
+    return Math.max(salv, Math.round(cost - dep));
+}
 
-// The logo file name has been wrong before (double extension), so find it instead of hard-coding it
-let LOGO_FILE = '';
-try {
-    const images = fs.readdirSync(__dirname).filter(f => /\.(png|jpe?g|webp|svg)$/i.test(f) && /logo/i.test(f));
-    LOGO_FILE = images.find(f => /^tencent/i.test(f)) || images[0] || '';
-} catch (_) { /* no logo, the site still works */ }
-let HERO_VIDEO = false;
-try { HERO_VIDEO = fs.existsSync(path.join(__dirname, 'hero.mp4')); } catch (_) { /* optional */ }
+// ---------------------------------------------------------------------------
+// Mount
+// ---------------------------------------------------------------------------
+function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, platform = null, publicBaseUrl = '' }) {
+    const pool = () => getPool();
+    const router = express.Router();
+    const q = (text, params) => pool().query(text, params);
 
-// ---------------------------------------------------------------
-// 2. Security headers (with a Content-Security-Policy) and public files
-// ---------------------------------------------------------------
-app.use((req, res, next) => {
-    res.locals.nonce = crypto.randomBytes(16).toString('base64');
-    req.nonce = res.locals.nonce;
-    next();
-});
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`],
-            styleSrc: ["'self'", "'unsafe-inline'"],
-            imgSrc: ["'self'", 'data:'],
-            mediaSrc: ["'self'"],
-            connectSrc: ["'self'"],
-            fontSrc: ["'self'"],
-            formAction: ["'self'"],
-            frameAncestors: ["'none'"],
-            baseUri: ["'self'"],
-            objectSrc: ["'none'"],
-            upgradeInsecureRequests: null
+    // ----- layout -----
+    const BASE_NAV = [
+        ['Main', [['app', '/pos/app', 'Dashboard'], ['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'Sales History'], ['daily', '/pos/daily', 'Daily Sales (Z-Report)'], ['drawer', '/pos/drawer', 'Cash Drawer'], ['quotes', '/pos/quotes', 'Quotes']]],
+        ['Inventory', [['items', '/pos/items', 'Items'], ['categories', '/pos/categories', 'Categories'], ['stock', '/pos/stock', 'Stock In / Out & Adjustment'], ['history', '/pos/stock/history', 'Stock History'], ['low', '/pos/stock/low', 'Low Stock Alerts'], ['suppliers', '/pos/suppliers', 'Suppliers'], ['po', '/pos/purchase-orders', 'Purchase Orders']]],
+        ['Money', [['expenses', '/pos/expenses', 'Expenses'], ['ecats', '/pos/expense-categories', 'Expense Categories'], ['recurring', '/pos/recurring', 'Recurring Expenses'], ['budgets', '/pos/budgets', 'Budgets'], ['assets', '/pos/assets', 'Assets'], ['reports', '/pos/reports', 'Reports'], ['notebook', '/pos/notebook', 'Notebook']]]
+    ];
+    function navFor(role) {
+        if (role === 'cashier') return [['Sell', [['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'My Sales'], ['account', '/pos/account', 'My Account']]], ['App', [['install', '/pos/install', 'Install App']]]];
+        const shop = [];
+        if (role === 'owner') shop.push(['branches', '/pos/branches', 'Branches']);
+        shop.push(['staff', '/pos/staff', role === 'owner' ? 'Staff & Cashiers' : 'Cashiers']);
+        if (role === 'owner') shop.push(['gateways', '/pos/gateways', 'Payment Gateways'], ['voids', '/pos/voids', 'Void Requests'], ['audit', '/pos/audit', 'Audit Log'], ['security', '/pos/security', 'Security (2-step login)'], ['subscription', '/pos/subscribe', 'Subscription'], ['settings', '/pos/settings', 'Shop Settings & Logo']);
+        else shop.push(['account', '/pos/account', 'My Account']);
+        shop.push(['install', '/pos/install', 'Install App']);
+        return [...BASE_NAV, ['Shop', shop]];
+    }
+    function layout(req, { title, nav = '', body, bare = false }) {
+        const shop = req.shop;
+        const role = (req.actor && req.actor.role) || 'owner', biz = req.biz || shop, isStaff = Boolean(req.actor && req.actor.kind === 'staff');
+        const logoImg = biz && biz.logo && LOGO_OK.test(biz.logo) ? `<img src="${biz.logo}" alt="" style="max-height:36px;max-width:130px;display:block;margin-bottom:6px;background:#fff;border-radius:5px;padding:2px">` : '';
+        const switcher = role === 'owner' && req.branches && req.branches.length > 1 ? `<form action="/pos/branches/switch" method="POST" style="margin:0 0 6px"><label for="sw" style="color:#6b87a6;font-size:.7rem;padding:0 10px;text-transform:uppercase;letter-spacing:.06em">Branch</label><select id="sw" name="shop_id" style="margin:2px 8px 0;width:calc(100% - 16px);font-size:.85rem">${req.branches.map(b => `<option value="${b.id}"${shop && b.id === shop.id ? ' selected' : ''}>${esc(biz && b.id === biz.id ? b.name + ' (head office)' : b.name)}</option>`).join('')}</select></form>` : '';
+        const daysLeft = biz && biz.sub_until ? Math.ceil((new Date(biz.sub_until) - Date.now()) / 86400000) : null;
+        const voidBanner = role === 'owner' && req.pendingVoids ? `<div class="alert noprint" role="status">${req.pendingVoids} void request${req.pendingVoids === 1 ? '' : 's'} waiting for your approval. <a href="/pos/voids">Review</a></div>` : '';
+        const banner = voidBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
+        const links = navFor(role).map(([group, items]) => `<div class="nav-group">${esc(group)}</div>` +
+            items.map(([key, href, label]) => `<a href="${href}" class="${nav === key ? 'active' : ''}">${esc(label)}</a>`).join('')).join('');
+        return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)} | ${esc(shop ? shop.name : 'Tencent POS')}</title>
+<meta name="robots" content="noindex">
+<link rel="manifest" href="/pos/manifest.webmanifest"><meta name="theme-color" content="#0b1b2e"><link rel="icon" type="image/png" href="/pos/icon-192.png"><link rel="apple-touch-icon" href="/pos/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Tencent POS">
+<style>
+:root{--bg:#f1f5f9;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--side:#0b1b2e;--side2:#12304d;--accent:#0ea5e9;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--radius:10px}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);font-size:15px;line-height:1.45}
+a{color:#0369a1}.side{position:fixed;inset:0 auto 0 0;width:236px;background:var(--side);color:#cbd5e1;overflow-y:auto;padding:14px 10px 24px;z-index:30}
+.side .brand{display:block;color:#fff;font-weight:800;font-size:1.05rem;padding:6px 10px 2px;text-decoration:none}.side .shopname{padding:0 10px 12px;font-size:.82rem;color:#7dd3fc;border-bottom:1px solid #1e3a56;margin-bottom:6px}
+.nav-group{font-size:.7rem;letter-spacing:.06em;color:#6b87a6;padding:14px 10px 4px;text-transform:uppercase}
+.side a{display:block;color:#cbd5e1;text-decoration:none;padding:8px 10px;border-radius:7px;font-size:.92rem}.side a:hover{background:var(--side2)}.side a.active{background:var(--accent);color:#04223a;font-weight:700}
+.side form{margin:10px 0 0}.side .linkbtn{width:100%;text-align:left;background:none;border:0;color:#fca5a5;padding:8px 10px;cursor:pointer;font:inherit;font-size:.92rem;border-radius:7px}.side .linkbtn:hover{background:var(--side2)}
+.main{margin-left:236px;padding:22px 26px 60px;min-height:100vh}.top{display:none}
+h1{font-size:1.5rem;margin:0 0 16px}h2{font-size:1.1rem;margin:0 0 10px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-bottom:18px}
+.stat{border-radius:var(--radius);padding:16px 18px;color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12)}.stat b{display:block;font-size:1.55rem;line-height:1.2}.stat span{font-size:.78rem;letter-spacing:.04em;text-transform:uppercase;opacity:.92}
+.c1{background:#2563eb}.c2{background:#059669}.c3{background:#16a34a}.c4{background:#d97706}.c5{background:#7c3aed}.c6{background:#be185d}.c7{background:#0891b2}.c8{background:#1e3a5f}.c9{background:#dc2626}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;margin-bottom:18px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:.92rem;vertical-align:middle}th{font-size:.76rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}td.num,th.num{text-align:right;white-space:nowrap}
+.tablewrap{overflow-x:auto}
+.btn{display:inline-block;border:0;border-radius:8px;padding:9px 14px;background:var(--accent);color:#04223a;font-weight:700;cursor:pointer;text-decoration:none;font:inherit;font-weight:700;font-size:.9rem}
+.btn.dark{background:#0f172a;color:#fff}.btn.ok{background:var(--ok);color:#fff}.btn.bad{background:var(--bad);color:#fff}.btn.ghost{background:#fff;border:1px solid var(--line);color:var(--ink)}.btn.small{padding:5px 10px;font-size:.8rem}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+label{display:block;font-weight:600;font-size:.85rem;margin:0 0 4px}input,select,textarea{width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit;background:#fff;color:var(--ink)}
+input:focus,select:focus,textarea:focus,.btn:focus-visible,a:focus-visible{outline:3px solid #7dd3fc;outline-offset:1px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.field{margin-bottom:14px}.field small{color:var(--muted)}
+.alert{padding:11px 14px;border-radius:8px;margin-bottom:14px;background:#fef2f2;border:1px solid #fecaca;color:#991b1b}.alert.ok{background:#f0fdf4;border-color:#bbf7d0;color:#166534}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:700}.tag.ok{background:#dcfce7;color:#166534}.tag.bad{background:#fee2e2;color:#991b1b}.tag.warn{background:#fef3c7;color:#92400e}.tag.gray{background:#e2e8f0;color:#334155}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.row>*{flex:1 1 150px}.row>.btn{flex:0 0 auto}
+.muted{color:var(--muted)}.right{text-align:right}.nowrap{white-space:nowrap}
+@media(max-width:860px){.side{transform:translateX(-100%);transition:transform .2s;width:260px}.side.open{transform:none}.main{margin-left:0;padding:14px 14px 60px}.top{display:flex;align-items:center;gap:12px;background:var(--side);color:#fff;margin:-14px -14px 14px;padding:10px 14px;position:sticky;top:0;z-index:20}.top button{background:none;border:1px solid #3b5878;color:#fff;border-radius:7px;padding:6px 12px;font-size:1.1rem;cursor:pointer}}
+@media print{.side,.top,.noprint{display:none!important}.main{margin:0;padding:0}body{background:#fff}.panel{border:0;padding:0}}
+${bare ? '.side,.top{display:none!important}.main{margin:0 auto;max-width:480px;padding-top:7vh}' : ''}
+.pos-wrap{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:16px;align-items:start}
+.pos-items{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px}
+.pos-item{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px;text-align:left;cursor:pointer;font:inherit;display:flex;flex-direction:column;gap:4px;min-height:84px}.pos-item:hover{border-color:var(--accent);box-shadow:0 0 0 2px #bae6fd}.pos-item b{font-size:.92rem}.pos-item .p{color:#0369a1;font-weight:800}.pos-item .s{font-size:.75rem;color:var(--muted)}.pos-item.out{opacity:.45}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 12px;cursor:pointer;font:inherit;font-size:.85rem}.chip.on{background:#0f172a;color:#fff;border-color:#0f172a}
+.cart{position:sticky;top:12px}.cart .lines{max-height:38vh;overflow:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:10px 0}.cline{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:8px 2px;border-bottom:1px solid var(--line)}.cline:last-child{border:0}.cline .qty{display:flex;align-items:center;gap:4px}.cline .qty button{width:28px;height:28px;border-radius:6px;border:1px solid var(--line);background:#fff;cursor:pointer;font-size:1rem}
+.tot{display:flex;justify-content:space-between;padding:3px 0}.tot.big{font-size:1.35rem;font-weight:800;border-top:2px solid var(--ink);margin-top:6px;padding-top:8px}
+.pay{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.pay button{padding:10px;border:2px solid var(--line);background:#fff;border-radius:8px;cursor:pointer;font:inherit;font-weight:700}.pay button.on{border-color:var(--accent);background:#e0f2fe}
+.modal{position:fixed;inset:0;background:rgba(2,6,23,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}.modal.show{display:flex}.modal .box{background:#fff;border-radius:14px;padding:22px;max-width:420px;width:100%;text-align:center}
+@media(max-width:1000px){.pos-wrap{grid-template-columns:1fr}.cart{position:static}}
+</style></head><body>
+<div class="top noprint"><button type="button" id="side-btn" aria-label="Open menu" aria-expanded="false">&#9776;</button><strong>${esc(biz ? biz.name : 'Tencent POS')}</strong></div>
+<nav class="side" id="side" aria-label="POS menu">
+<a class="brand" href="/pos/start">Tencent POS</a><div class="shopname">${logoImg}${esc(biz ? biz.name : '')}${shop && biz && shop.id !== biz.id ? '<br>' + esc(shop.name) : ''}${isStaff ? '<br>' + esc(req.actor.name) + ' (' + esc(role) + ')' : ''}</div>
+${switcher}${links}
+<div class="nav-group">Account</div>${isStaff ? '' : '<a href="/">Back to website</a>'}
+<form action="${isStaff ? '/pos/staff/logout' : '/logout'}" method="POST"><button class="linkbtn" type="submit">Log out</button></form>
+</nav>
+<main class="main">${banner}${body}</main>
+<script nonce="${req.nonce || ''}">
+(function(){var b=document.getElementById('side-btn'),s=document.getElementById('side');if(b)b.addEventListener('click',function(){var o=s.classList.toggle('open');b.setAttribute('aria-expanded',o?'true':'false');});
+var sw=document.getElementById('sw');if(sw)sw.addEventListener('change',function(){sw.form.submit();});
+var ev=null,ib=document.getElementById('install-now');window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();ev=e;if(ib)ib.style.display='';var h=document.getElementById('install-help');if(h)h.style.display='none';});
+if(ib)ib.addEventListener('click',function(){if(!ev)return;ev.prompt();ev.userChoice.then(function(){ev=null;ib.style.display='none';});});
+if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{scope:'/pos/'}).catch(function(){});})();
+</script>
+</body></html>`;
+    }
+    const send = (req, res, opts, status = 200) => res.status(status).set('Cache-Control', 'no-store').send(layout(req, opts));
+    const notice = (req) => req.query.ok ? `<div class="alert ok" role="status">${esc(String(req.query.ok).slice(0, 120))}</div>` : '';
+
+    // ----- public landing page for the service -----
+    app.get('/pos', (req, res) => {
+        const loggedIn = Boolean(req.session && req.session.user);
+        const content = `
+        <div class="general-container">
+            <h2>Tencent POS: a point of sale for your shop</h2>
+            <p class="sub-title">Sell faster, know your stock, and see your profit every day. Works on any phone, tablet or computer, and installs like an app. KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month.</p>
+            <div class="form-container" style="border-left:4px solid var(--primary);">
+                <h3 style="margin-top:0;color:var(--primary);">What your shop gets</h3>
+                <ul style="line-height:1.8;padding-left:20px;margin-bottom:0;">
+                    <li><strong>Fast sales screen:</strong> tap items or scan barcodes, take cash or M-Pesa, give change, print or share the receipt.</li>
+                    <li><strong>Stock control:</strong> stock goes down with every sale, add or remove stock, and get low-stock alerts before you run out.</li>
+                    <li><strong>Daily and monthly reports:</strong> sales, profit, best sellers, cash versus M-Pesa, and a daily closing report.</li>
+                    <li><strong>Expenses:</strong> record rent, transport and other costs so you see real profit.</li>
+                    <li><strong>Your own private account:</strong> your products and sales are visible only to you.</li>
+                </ul>
+            </div>
+            <div class="form-container" style="margin-top:20px;">
+                <p style="margin-top:0;">${loggedIn ? 'You are logged in. Open your POS to start selling.' : 'Create a free account, confirm your email, and set up your shop in two minutes.'}</p>
+                <a href="/pos/app" class="cta-btn">${loggedIn ? 'Open my POS' : 'Get started'}</a>
+                <a href="/contact" class="cta-btn" style="margin-left:8px;">Ask us about setup & hardware</a>
+            </div>
+            <p class="muted" style="margin-top:14px;">We can also supply and install barcode scanners, receipt printers, tablets and shop WiFi.</p>
+        </div>`;
+        res.send(renderPage(req, { title: 'POS System for Shops', activeNav: 'pos', content }));
+    });
+
+    const vault = SEC.makeVault(process.env.POS_CRED_KEY, String(process.env.POS_CRED_KEY_OLD || '').split(','));
+    const regen = req => new Promise((ok, no) => req.session.regenerate(e => (e ? no(e) : ok())));
+    const saveSess = req => new Promise((ok, no) => req.session.save(e => (e ? no(e) : ok())));
+
+    // ----- files that make the POS installable as an app (public, no sign-in needed) -----
+    const SW_JS = `const V='tpos-v1';
+self.addEventListener('install',function(e){e.waitUntil(caches.open(V).then(function(c){return c.addAll(['/pos/offline','/pos/icon-192.png']);}).then(function(){return self.skipWaiting();}));});
+self.addEventListener('activate',function(e){e.waitUntil(caches.keys().then(function(k){return Promise.all(k.filter(function(x){return x!==V;}).map(function(x){return caches.delete(x);}));}).then(function(){return self.clients.claim();}));});
+self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.respondWith(fetch(e.request).catch(function(){return caches.match('/pos/offline');}));}});`;
+    const MANIFEST = JSON.stringify({
+        name: 'Tencent POS', short_name: 'POS', description: 'Point of sale for shops', id: '/pos/start', start_url: '/pos/start', scope: '/pos/', display: 'standalone',
+        background_color: '#ffffff', theme_color: '#0b1b2e',
+        icons: [{ src: '/pos/icon-192.png', sizes: '192x192', type: 'image/png' }, { src: '/pos/icon-512.png', sizes: '512x512', type: 'image/png' }, { src: '/pos/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }]
+    });
+    router.get('/manifest.webmanifest', (req, res) => res.set({ 'Content-Type': 'application/manifest+json', 'Cache-Control': 'public, max-age=3600' }).send(MANIFEST));
+    router.get('/sw.js', (req, res) => res.set({ 'Content-Type': 'application/javascript; charset=utf-8', 'Service-Worker-Allowed': '/pos/', 'Cache-Control': 'no-cache' }).send(SW_JS));
+    for (const [name, size, maskable] of [['icon-192.png', 192, false], ['icon-512.png', 512, false], ['icon-maskable-512.png', 512, true]]) {
+        router.get('/' + name, (req, res) => res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' }).send(GW.iconPng(size, maskable)));
+    }
+    router.get('/offline', (req, res) => res.set('Cache-Control', 'no-store').send('<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Offline</title></head><body style="font-family:system-ui,sans-serif;text-align:center;padding:12vh 20px;color:#0f172a"><h1>You are offline</h1><p>Tencent POS needs an internet connection to save sales and keep your stock correct.<br>Check your WiFi or mobile data, then reopen the app.</p></body></html>'));
+
+    // ----- M-Pesa / gateway callbacks (called by the payment company, so no sign-in; every one is checked in gatewayCallback) -----
+    router.post('/mpesa/cb/:token', (req, res) => {
+        res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
+        gatewayCallback('mpesa', req.params.token, req.body).catch(e => console.error('POS M-Pesa callback error:', e.message));
+    });
+    router.post('/paystack/hook/:token', (req, res) => {
+        res.sendStatus(200);
+        gatewayCallback('paystack', req.params.token, req.body).catch(e => console.error('POS Paystack webhook error:', e.message));
+    });
+
+    // ----- staff (managers and cashiers) sign in with business code + username + password -----
+    const staffForm = (error = '', v = {}) => `<h1>Staff sign in</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+        <form action="/pos/staff/login" method="POST">
+            <div class="field"><label for="c">Business code</label><input id="c" name="code" required maxlength="10" autocapitalize="characters" autocomplete="off" value="${esc(v.code || '')}" placeholder="e.g. K7M2QX"><small>Your manager or the shop owner can give you this code.</small></div>
+            <div class="field"><label for="u">Username</label><input id="u" name="username" required maxlength="40" autocapitalize="none" autocomplete="username" value="${esc(v.username || '')}"></div>
+            <div class="field"><label for="p">Password</label><input id="p" name="password" type="password" required maxlength="100" autocomplete="current-password"></div>
+            <button class="btn" type="submit" style="width:100%">Sign in</button></form></div>
+        <p class="muted">Shop owner? <a href="/login?next=/pos/app">Sign in with your owner account</a>.</p>`;
+    const staffLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false, message: 'Too many sign-in attempts. Please wait a few minutes and try again.' });
+    const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', 10);   // compared when the username is unknown, so timing does not give it away
+    // ----- audit log: append-only (the database refuses UPDATE and DELETE on it) -----
+    async function auditRaw(bizId, shopId, kind, actorId, actorName, action, detail, ip) {
+        try { await q('INSERT INTO pos_audit (business_id, shop_id, actor_kind, actor_id, actor_name, action, detail, ip) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [bizId, shopId || null, kind, actorId || null, String(actorName || '').slice(0, 80), action, String(detail || '').slice(0, 300), String(ip || '').slice(0, 60)]); }
+        catch (e) { console.error('Audit write failed:', e.message); }
+    }
+    const audit = (req, action, detail) => auditRaw(req.biz ? req.biz.id : (req.actor && req.actor.businessId), req.shop ? req.shop.id : null, req.actor ? req.actor.kind : 'system', req.actor ? (req.actor.staffId || (req.session && req.session.user && req.session.user.id)) : null, req.actor ? req.actor.name : '', action, detail, req.ip);
+
+    // ----- attack throttling kept in the database (survives restarts, shared by every server instance) -----
+    const failLocked = async keys => (await q('SELECT 1 FROM pos_auth_fails WHERE key = ANY($1::text[]) AND locked_until > now() LIMIT 1', [keys])).rowCount > 0;
+    async function failHit(key, max, windowSec, lockSec) {
+        const r = await q(`INSERT INTO pos_auth_fails (key, count, first_at) VALUES ($1, 1, now()) ON CONFLICT (key) DO UPDATE SET
+                count = CASE WHEN pos_auth_fails.first_at < now() - make_interval(secs => $2) THEN 1 ELSE pos_auth_fails.count + 1 END,
+                first_at = CASE WHEN pos_auth_fails.first_at < now() - make_interval(secs => $2) THEN now() ELSE pos_auth_fails.first_at END RETURNING count`, [key, windowSec]);
+        if (r.rows[0].count >= max) await q('UPDATE pos_auth_fails SET locked_until = now() + make_interval(secs => $2) WHERE key = $1', [key, lockSec]);
+    }
+    const failClear = keys => q('DELETE FROM pos_auth_fails WHERE key = ANY($1::text[])', [keys]);
+    const STAFF_IDLE_MS = 30 * 60 * 1000, STAFF_ABS_MS = 12 * 3600 * 1000;   // staff are signed out after 30 idle minutes, and always after 12 hours
+
+    router.get('/staff/login', requireDb, (req, res) => {
+        if (req.session && req.session.posStaff) return res.redirect('/pos/app');
+        send(req, res, { title: 'Staff sign in', bare: true, body: staffForm(req.query.expired ? 'You were signed out to keep the shop safe. Please sign in again.' : '') });
+    });
+    router.post('/staff/login', staffLimiter, requireDb, ah(async (req, res) => {
+        const code = str(req.body.code).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10), username = str(req.body.username).slice(0, 40), password = String(req.body.password || '').slice(0, 100);
+        const fail = (m, status = 401) => send(req, res, { title: 'Staff sign in', bare: true, body: staffForm(m, { code, username }) }, status);
+        const GENERIC = 'The business code, username or password is not right.';
+        const ip = String(req.ip || '').slice(0, 60), uname = username.toLowerCase();
+        // three separate counters: this network, this account from this network, and this account from anywhere.
+        // So a stranger who guesses a cashier's username locks only their own network out, not the cashier.
+        const kIp = 'ip:' + ip, kPair = `u:${code}:${uname}:${ip}`, kAcct = `u:${code}:${uname}`;
+        if (await failLocked([kIp, kPair, kAcct])) return fail('Too many attempts. Please wait 15 minutes and try again.', 429);
+        const row = code && username ? (await q('SELECT s.* FROM pos_staff s JOIN pos_shops b ON b.id = s.business_id WHERE b.code = $1 AND lower(s.username) = lower($2)', [code, username])).rows[0] : null;
+        const ok = await bcrypt.compare(password, row ? row.password_hash : DUMMY_HASH);
+        if (!row || !row.active || !ok) {
+            await Promise.all([failHit(kIp, 30, 900, 900), failHit(kPair, 5, 900, 900), failHit(kAcct, 40, 3600, 900)]);
+            if (row) await auditRaw(row.business_id, row.shop_id, 'staff', row.id, row.name, 'staff.login_failed', '', ip);
+            return fail(GENERIC);
         }
-    }
-}));
+        await failClear([kPair, kAcct]);
+        await q('UPDATE pos_staff SET last_login = now() WHERE id = $1', [row.id]);
+        await regen(req);
+        req.session.cookie.maxAge = STAFF_ABS_MS;   // the browser cookie also expires after 12 hours
+        req.session.posStaff = { id: row.id, ver: row.session_ver, at: Date.now(), last: Date.now() };
+        await saveSess(req);
+        await auditRaw(row.business_id, row.shop_id, 'staff', row.id, row.name, 'staff.login', '', ip);
+        res.redirect('/pos/app');
+    }));
+    router.post('/staff/logout', (req, res) => {
+        const done = () => res.redirect('/pos/staff/login');
+        if (req.session) req.session.destroy(done); else done();
+    });
+    // where the installed app opens
+    router.get('/start', (req, res) => res.redirect(req.session && (req.session.posStaff || req.session.user) ? '/pos/app' : '/pos/staff/login'));
 
-app.use((req, res, next) => {
-    if (req.method === 'GET' && PUBLIC_FILE.test(req.path)) return staticFiles(req, res, next);
-    next();
-});
-app.get('/brand-logo', (req, res, next) => {
-    if (!LOGO_FILE) return next();
-    res.set('Cache-Control', 'public, max-age=3600');
-    res.sendFile(path.join(__dirname, LOGO_FILE), err => { if (err && !res.headersSent) next(); });
-});
-
-// ---------------------------------------------------------------
-// 3. Rate limits (before the session, so floods never reach the database)
-// ---------------------------------------------------------------
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 300,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: 'Too many requests from this network, please try again later.',
-    skip: req => req.path.startsWith('/payments/cb/') || req.path.startsWith('/payments/status/') ||
-        req.path.startsWith('/pos/mpesa/cb/') || req.path.startsWith('/pos/paystack/hook/') || req.path.startsWith('/pos/api/')   // payment-company callbacks and the till's own calls have their own limits in pos.js
-});
-const statusLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 400, standardHeaders: true, legacyHeaders: false, message: { status: 'unknown' } });
-const payLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many payment attempts from this network. Please try again later.'
-});
-const registerLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many sign-up attempts from this network. Please try again later.'
-});
-const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    skipSuccessfulRequests: true,   // only failed logins count
-    message: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.'
-});
-const forgotLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 8, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many password reset requests from this network. Please try again later.'
-});
-const resetLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many attempts. Please wait a few minutes and try again.'
-});
-const resendLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many email requests. Please try again later.' });
-app.use(limiter);
-
-app.use(express.json({ limit: '50kb' }));
-app.use(express.urlencoded({ extended: false, limit: '20kb' }));
-
-// ---------------------------------------------------------------
-// 4. Database (PostgreSQL)
-// ---------------------------------------------------------------
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const dbEnabled = Boolean(DATABASE_URL);
-// Tencent POS (point of sale service for shops) lives in pos.js. If that file is missing the rest of the site still works.
-let POS = null;
-let posHooks = null;   // set when the POS is mounted: lets the POS claim M-Pesa callbacks for its subscription payments
-try { POS = require('./pos'); } catch (e) { console.error('POS module not loaded:', e.message); }
-let pool = null;
-let dbReady = false;
-
-if (dbEnabled) {
-    let host = '';
-    try { host = new URL(DATABASE_URL).hostname; } catch (_) { /* pg reports a bad URL itself */ }
-    const sslMode = (process.env.DATABASE_SSL || '').toLowerCase();
-    let ssl;
-    if (sslMode === 'off') ssl = false;
-    else if (sslMode === 'insecure') ssl = { rejectUnauthorized: false };   // only if your provider's certificate cannot be verified
-    else if (host === 'localhost' || host === '127.0.0.1' || (host && !host.includes('.'))) ssl = false;   // local, or Render's internal address
-    else ssl = { rejectUnauthorized: true };
-    pool = new Pool({ connectionString: DATABASE_URL, ssl, max: 8, connectionTimeoutMillis: 10000, idleTimeoutMillis: 30000 });
-    pool.on('error', err => console.error('Database pool error:', err.message));
-} else {
-    console.error('DATABASE_URL is not set: sign-in, bookings and receipts are switched off until you add it.');
-}
-
-let posReady = false, posInitRunning = false, posSetupNote = 'POS setup has not started: the main database setup has not finished yet.', dbSetupNote = '';
-async function initPosSchema() {
-    if (posInitRunning || posReady) return;
-    posInitRunning = true; posSetupNote = 'POS setup is running.';
-    try { await POS.initSchema(pool); posReady = true; posSetupNote = ''; console.log('POS tables ready.'); }
-    catch (err) { posSetupNote = 'POS setup failed: ' + err.message; console.error('POS database setup failed, trying again in 30 seconds:', err.message); setTimeout(initPosSchema, 30000).unref(); }
-    finally { posInitRunning = false; }
-}
-
-async function initDb() {
-    if (!dbEnabled) return;
-    try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`);
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS bookings (
-                id VARCHAR(64) PRIMARY KEY,
-                user_id INT REFERENCES users(id),
-                name VARCHAR(255) NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                service VARCHAR(255) NOT NULL,
-                location VARCHAR(255) NOT NULL,
-                amount INT NOT NULL,
-                account_ref VARCHAR(50) NOT NULL,
-                status VARCHAR(50) NOT NULL,
-                receipt VARCHAR(100),
-                checkout_request_id VARCHAR(100),
-                created_at BIGINT NOT NULL,
-                paid_at BIGINT
-            )`);
-        // Added later: safe to run on a database that already has the older tables
-        const had = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'receipt_sent'`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS receipt_sent BOOLEAN NOT NULL DEFAULT FALSE`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS email_status VARCHAR(300)`);
-        // Price breakdown (older bookings keep these empty and show only the total)
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS base_amount INT`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_km INT`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS travel_fee INT`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS urgency VARCHAR(20)`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS urgency_fee INT`);
-        await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS geo VARCHAR(40)`);
-        if (!had.rowCount) {
-            // First run of this version: receipts for payments that were already made are not re-sent
-            await pool.query(`UPDATE bookings SET receipt_sent = TRUE WHERE status = 'paid'`);
-        }
-        // Email confirmation and password reset
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE`);
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS auth_tokens (
-                id SERIAL PRIMARY KEY,
-                user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                kind VARCHAR(10) NOT NULL,
-                token_hash CHAR(64) NOT NULL UNIQUE,
-                expires_at BIGINT NOT NULL,
-                used_at BIGINT,
-                created_at BIGINT NOT NULL
-            )`);
-        await pool.query('CREATE INDEX IF NOT EXISTS auth_tokens_user_idx ON auth_tokens (user_id, kind)');
-        await pool.query('CREATE INDEX IF NOT EXISTS bookings_user_idx ON bookings (user_id, created_at DESC)');
-        await pool.query('CREATE INDEX IF NOT EXISTS bookings_checkout_idx ON bookings (checkout_request_id)');
-        // Uniqueness: skipped (with a warning) only if old data already contains duplicates
-        for (const sql of [
-            'CREATE UNIQUE INDEX IF NOT EXISTS bookings_account_ref_uq ON bookings (account_ref)',
-            'CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq ON users (lower(email))'
-        ]) {
-            try { await pool.query(sql); } catch (e) { console.error('Could not add a unique index (old duplicate data?):', e.message); }
-        }
-        if (POS) initPosSchema();   // the POS sets up its own tables separately, so a POS problem can never take bookings and login offline
-        dbReady = true; dbSetupNote = '';
-        console.log('PostgreSQL tables initialized successfully.');
-    } catch (err) {
-        dbReady = false; dbSetupNote = 'Main database setup failed: ' + err.message;
-        console.error('Database initialization error, trying again in 15 seconds:', err.message);
-        setTimeout(() => initDb(), 15000).unref();
-    }
-}
-
-// ---------------------------------------------------------------
-// 5. Sessions
-// ---------------------------------------------------------------
-app.use(session({
-    store: dbEnabled ? new pgSession({ pool, tableName: 'session', createTableIfMissing: true, errorLog: e => console.error('Session store error:', e.message) }) : undefined,
-    name: 'tc.sid',
-    secret: SESSION_SECRET.length >= 32 ? SESSION_SECRET : crypto.randomBytes(32).toString('hex'),
-    resave: false,
-    saveUninitialized: false,   // visitors who never log in get no cookie
-    cookie: {
-        httpOnly: true,
-        sameSite: 'lax',
-        secure: 'auto',   // secure whenever the request came over HTTPS (Render), without needing NODE_ENV
-        maxAge: 14 * 24 * 60 * 60 * 1000
-    }
-}));
-
-app.use((req, res, next) => {
-    res.locals.user = (req.session && req.session.user) || null;
-    next();
-});
-
-// Reject form posts that come from other websites (CSRF). Browsers always say where a form came from;
-// cookies are also SameSite=Lax. Safaricom's callback is a machine call and is exempt.
-app.use((req, res, next) => {
-    if (req.method !== 'POST' || req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/') || req.path.startsWith('/pos/paystack/hook/')) return next();
-    const fetchSite = req.get('sec-fetch-site');
-    const origin = req.get('origin');
-    let blocked = false;
-    if (fetchSite) {
-        // Modern browsers say exactly how the request relates to this site, so trust that and skip host comparisons
-        blocked = fetchSite === 'cross-site';
-    } else if (origin) {
-        // Older browsers: compare the Origin with every name this site is reached by (Render, custom domain, proxy)
-        const allowed = new Set([req.get('host'), req.get('x-forwarded-host')].filter(Boolean).map(h => h.split(',')[0].trim().toLowerCase()));
-        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) { /* not set */ }
-        try { blocked = !allowed.has(new URL(origin).host.toLowerCase()); } catch (_) { blocked = true; }
-    }
-    if (blocked) return errorPage(req, res, 403, 'Request blocked', 'This request came from another website, so it was blocked.');
-    next();
-});
-
-const BCRYPT_COST = 11;
-const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST);   // compared when the email is unknown, so timing does not reveal which emails exist
-const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
-
-// Only go back to our own pages after login (stops //evil.com style redirects)
-const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos', '/pos/app', '/pos/terminal', '/pos/subscribe']);
-function safeNext(value) {
-    const v = typeof value === 'string' ? value : '';
-    if (!v.startsWith('/') || v.startsWith('//') || v.includes('\\')) return '/survey';
-    const pathOnly = v.split('?')[0].split('#')[0];
-    return NEXT_ALLOWED.has(pathOnly) ? pathOnly : '/survey';
-}
-
-function requireAuth(req, res, next) {
-    if (req.session && req.session.user) return next();
-    if (req.method === 'GET') return res.redirect('/login?next=' + encodeURIComponent(safeNext(req.path)));
-    return res.redirect('/login');
-}
-function requireDb(req, res, next) {
-    if (dbReady) return next();
-    return errorPage(req, res, 503, 'Please try again shortly', dbEnabled
-        ? 'Our booking system is starting up. Please try again in a minute.'
-        : 'Accounts are not switched on yet. Please call us on 0740 311 014.');
-}
-const regenerateSession = req => new Promise((resolve, reject) => req.session.regenerate(err => (err ? reject(err) : resolve())));
-const saveSession = req => new Promise((resolve, reject) => req.session.save(err => (err ? reject(err) : resolve())));
-
-// Booking needs a confirmed email, so receipts can only ever go to an inbox the customer controls
-async function requireVerified(req, res, next) {
-    try {
-        const u = req.session && req.session.user;
-        if (!u) return res.redirect('/login');
-        if (u.verified) return next();
-        const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [u.id]);   // may have been confirmed in another browser
-        if (r.rows[0] && r.rows[0].email_verified) {
-            u.verified = true;
+    // ----- everything below needs a signed-in owner (confirmed email) or a staff member -----
+    router.use(requireDb);
+    const isApi = req => req.path.startsWith('/api/');
+    const OTP_VALID_MS = 12 * 3600 * 1000, STEP_VALID_MS = 10 * 60 * 1000;
+    router.use(ah(async (req, res, next) => {
+        const st = req.session && req.session.posStaff;
+        if (st) {
+            const now = Date.now();
+            const stale = () => { delete req.session.posStaff; return isApi(req) ? res.status(401).json({ error: 'Please sign in again.' }) : res.redirect('/pos/staff/login?expired=1'); };
+            if (!st.at || now - st.at > STAFF_ABS_MS || now - (st.last || st.at) > STAFF_IDLE_MS) return stale();
+            const r = (await q('SELECT id, role, name, username, business_id, shop_id, session_ver FROM pos_staff WHERE id = $1 AND active', [st.id])).rows[0];
+            if (!r || r.session_ver !== st.ver) return stale();   // switched off, deleted, or password changed: every old session ends
+            if (now - (st.last || 0) > 60000) st.last = now;
+            req.actor = { kind: 'staff', role: r.role, staffId: r.id, name: r.name, username: r.username, businessId: r.business_id, shopId: r.shop_id };
             return next();
         }
-        return res.redirect('/verify-email/pending');
-    } catch (err) { next(err); }
-}
+        requireAuth(req, res, () => requireVerified(req, res, () => {
+            req.actor = { kind: 'owner', role: 'owner', name: req.session.user.name || 'Owner' };
+            ownerGate(req, res, next).catch(next);
+        }));
+    }));
 
-// Passwords
-const COMMON_PASSWORDS = new Set(['password', 'password1', 'password123', '12345678', '123456789', '1234567890', 'qwertyuiop', 'qwerty123', '11111111', '00000000', 'iloveyou1', 'tencent123']);
-function passwordProblem(password, confirm, email = '') {
-    if (password.length < 10) return 'Your password must be at least 10 characters.';
-    if (Buffer.byteLength(password) > 72) return 'Your password is too long. Please use 72 characters or fewer.';
-    if (COMMON_PASSWORDS.has(password.toLowerCase()) || (email && password.toLowerCase() === email.toLowerCase())) return 'That password is too easy to guess. Please choose a different one.';
-    if (password !== confirm) return 'The two passwords do not match.';
-    return '';
-}
-
-// Lockout: 6 wrong passwords for the same email within 15 minutes locks sign-in for that email for 15 minutes.
-// Unknown emails are counted the same way, so the lock message never reveals whether an account exists.
-// Resetting the password through the emailed link clears the lock.
-const LOCK_AFTER = 6, LOCK_MS = 15 * 60 * 1000;
-const loginFails = new Map();   // email -> { count, first, lockedUntil }
-function lockedMinutes(email) {
-    const f = loginFails.get(email);
-    return f && f.lockedUntil > Date.now() ? Math.ceil((f.lockedUntil - Date.now()) / 60000) : 0;
-}
-function recordLoginFailure(email) {
-    const now = Date.now();
-    let f = loginFails.get(email);
-    if (!f || now - f.first > LOCK_MS) f = { count: 0, first: now, lockedUntil: 0 };
-    f.count += 1;
-    if (f.count >= LOCK_AFTER) f.lockedUntil = now + LOCK_MS;
-    loginFails.set(email, f);
-}
-const clearLoginFailures = email => loginFails.delete(email);
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, f] of loginFails) if (now - f.first > LOCK_MS && f.lockedUntil < now) loginFails.delete(k);
-    for (const [k, t] of emailCooldown) if (now - t > 10 * 60 * 1000) emailCooldown.delete(k);
-}, 10 * 60 * 1000).unref();
-
-// One-time links sent by email (confirm email, reset password). Only a hash is stored, so a database leak cannot be used to take over accounts.
-const emailCooldown = new Map();   // "kind:userId" -> last send time
-const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
-const TOKEN_FORMAT = /^[A-Za-z0-9_-]{43}$/;
-async function createAuthToken(userId, kind, ttlMs) {
-    const raw = crypto.randomBytes(32).toString('base64url');
-    await pool.query('DELETE FROM auth_tokens WHERE user_id = $1 AND kind = $2', [userId, kind]);   // only the newest link works
-    await pool.query('INSERT INTO auth_tokens (user_id, kind, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)',
-        [userId, kind, sha256(raw), Date.now() + ttlMs, Date.now()]);
-    return raw;
-}
-async function peekAuthToken(raw, kind) {
-    if (!TOKEN_FORMAT.test(String(raw || ''))) return null;
-    const r = await pool.query('SELECT user_id FROM auth_tokens WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3', [sha256(raw), kind, Date.now()]);
-    return r.rows[0] ? r.rows[0].user_id : null;
-}
-async function useAuthToken(raw, kind) {   // atomic: a link can only be used once, even if clicked twice at the same moment
-    if (!TOKEN_FORMAT.test(String(raw || ''))) return null;
-    const r = await pool.query('UPDATE auth_tokens SET used_at = $3 WHERE token_hash = $1 AND kind = $2 AND used_at IS NULL AND expires_at > $3 RETURNING user_id', [sha256(raw), kind, Date.now()]);
-    return r.rows[0] ? r.rows[0].user_id : null;
-}
-function cooldownOk(kind, userId, ms) {
-    const key = kind + ':' + userId, now = Date.now();
-    if (now - (emailCooldown.get(key) || 0) < ms) return false;
-    emailCooldown.set(key, now);
-    return true;
-}
-// Links in emails always use your own address from PUBLIC_BASE_URL, never the Host header (that would let an attacker poison reset links)
-function emailLink(path) {
-    if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL is not set, so account emails cannot be sent');
-    return PUBLIC_BASE_URL + path;
-}
-const mailShell = (heading, bodyHtml) => `<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#17323a;line-height:1.5;"><h2 style="margin:0 0 12px;">${heading}</h2>${bodyHtml}<p style="color:#5b7078;font-size:13px;margin-top:24px;">Tencent Innovations, Rangwe, Homa Bay County. Calls 0740 311 014</p></div>`;
-const mailButton = (href, label) => `<p style="margin:20px 0;"><a href="${esc(href)}" style="display:inline-block;background:#f4b400;color:#2a1f00;padding:11px 20px;border-radius:6px;text-decoration:none;font-weight:bold;">${esc(label)}</a></p><p style="font-size:13px;color:#5b7078;">If the button does not work, copy this link into your browser:<br>${esc(href)}</p>`;
-
-async function sendVerificationEmail(user) {
-    const link = emailLink('/verify-email?token=' + await createAuthToken(user.id, 'verify', 24 * 60 * 60 * 1000));
-    await sendMail({
-        to: user.email,
-        subject: 'Confirm your email address - Tencent Innovations',
-        html: mailShell('Confirm your email', `<p>Hello ${esc(user.name)}, please confirm your email address so we can send your receipts here and let you book services.</p>${mailButton(link, 'Confirm my email')}<p style="font-size:13px;">This link works for 24 hours. If you did not create an account, you can ignore this email.</p>`),
-        text: `Hello ${user.name},\n\nConfirm your email address so we can send your receipts here and let you book services:\n${link}\n\nThis link works for 24 hours. If you did not create an account, ignore this email.\n`
-    });
-}
-async function sendResetEmail(user) {
-    const link = emailLink('/reset-password?token=' + await createAuthToken(user.id, 'reset', 60 * 60 * 1000));
-    await sendMail({
-        to: user.email,
-        subject: 'Reset your password - Tencent Innovations',
-        html: mailShell('Reset your password', `<p>Hello ${esc(user.name)}, we received a request to reset your password.</p>${mailButton(link, 'Choose a new password')}<p style="font-size:13px;">This link works for 1 hour and can be used once. If you did not ask for this, ignore this email; your password stays the same.</p>`),
-        text: `Hello ${user.name},\n\nReset your password here (valid for 1 hour, one use):\n${link}\n\nIf you did not ask for this, ignore this email; your password stays the same.\n`
-    });
-}
-async function sendPasswordChangedEmail(user) {
-    await sendMail({
-        to: user.email,
-        subject: 'Your password was changed - Tencent Innovations',
-        html: mailShell('Password changed', `<p>Hello ${esc(user.name)}, the password for your Tencent Innovations account was just changed and you were signed out everywhere.</p><p>If this was not you, call us right away on 0740 311 014 and reset your password again.</p>`),
-        text: `Hello ${user.name},\n\nThe password for your Tencent Innovations account was just changed and you were signed out everywhere.\nIf this was not you, call 0740 311 014 and reset your password again.\n`
-    });
-}
-const quietly = (label, promise) => promise.catch(err => console.error(label + ':', err.message));
-
-// ---------------------------------------------------------------
-// 6. Email (receipts and alerts) and Telegram
-// ---------------------------------------------------------------
-// Render's free plan blocks normal email (SMTP), so the main route is Brevo, which works over HTTPS:
-//   BREVO_API_KEY, MAIL_FROM_EMAIL (verified sender in Brevo), MAIL_FROM_NAME (optional)
-// Gmail (GMAIL_USER + GMAIL_APP_PASSWORD) still works as a fallback on plans that allow SMTP.
-const MAIL = {
-    brevoKey: process.env.BREVO_API_KEY || '',
-    brevoUrl: process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email',   // BREVO_API_URL exists so tests can use a mock
-    fromEmail: process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || '',
-    fromName: process.env.MAIL_FROM_NAME || 'Tencent Innovations',
-    adminTo: process.env.NOTIFY_TO || process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || ''
-};
-let smtp = null;
-function getSmtp() {
-    if (!smtp && process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
-        smtp = nodemailer.createTransport({
-            service: 'gmail',
-            connectionTimeout: 8000, greetingTimeout: 8000, socketTimeout: 10000,
-            auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
-        });
+    // ----- owners can turn on a two-step code (authenticator app); once on, every POS visit needs it -----
+    async function ownerGate(req, res, next) {
+        const sec = (await q('SELECT enabled FROM pos_owner_security WHERE user_id = $1', [req.session.user.id])).rows[0];
+        req.has2fa = Boolean(sec && sec.enabled);
+        if (!req.has2fa || (req.session.pos2faAt && Date.now() - req.session.pos2faAt < OTP_VALID_MS) || /^\/2fa(\/|$)/.test(req.path)) return next();
+        if (isApi(req)) return res.status(401).json({ error: 'Your two-step code is needed. Reload the page.' });
+        return res.redirect('/pos/2fa');
     }
-    return smtp;
-}
-
-// attachments: [{ filename, content: Buffer, contentType }]
-async function sendMail({ to, subject, html, text, attachments = [] }) {
-    if (MAIL.brevoKey && MAIL.fromEmail) {
-        const body = { sender: { name: MAIL.fromName, email: MAIL.fromEmail }, to: [{ email: to }], subject, htmlContent: html, textContent: text };
-        if (attachments.length) body.attachment = attachments.map(a => ({ name: a.filename, content: a.content.toString('base64') }));
-        const resp = await fetch(MAIL.brevoUrl, {
-            method: 'POST',
-            headers: { 'api-key': MAIL.brevoKey, 'content-type': 'application/json', accept: 'application/json' },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(20000)
-        });
-        if (!resp.ok) throw new Error(`Brevo HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-        return 'brevo';
+    // checks a code from the authenticator app (or a one-time recovery code). Five wrong tries lock it for 15 minutes.
+    async function verifyOwnerOtp(req, input) {
+        const uid = req.session.user.id, kUser = '2fa:' + uid, kIp = '2fa-ip:' + String(req.ip || '');
+        if (await failLocked([kUser, kIp])) return { ok: false, locked: true };
+        const row = (await q('SELECT secret, last_counter, recovery, enabled FROM pos_owner_security WHERE user_id = $1', [uid])).rows[0];
+        let ok = false;
+        const code = String(input || '').trim();
+        if (row && row.enabled && vault.enabled) {
+            if (/^\d{3}\s?\d{3}$/.test(code)) {
+                const counter = SEC.checkTotp(vault.open(row.secret, '2fa:' + uid).s, code, row.last_counter);
+                if (counter) ok = (await q('UPDATE pos_owner_security SET last_counter = $2 WHERE user_id = $1 AND last_counter < $2 RETURNING 1', [uid, counter])).rowCount > 0;   // a code works once
+            } else if (code.length >= 10) {
+                const h = SEC.hashRecovery(code), list = Array.isArray(row.recovery) ? row.recovery : [];
+                if (list.includes(h)) ok = (await q('UPDATE pos_owner_security SET recovery = $2::jsonb WHERE user_id = $1 AND recovery = $3::jsonb RETURNING 1', [uid, JSON.stringify(list.filter(x => x !== h)), JSON.stringify(list)])).rowCount > 0;
+            }
+        }
+        if (!ok) { await Promise.all([failHit(kUser, 5, 900, 900), failHit(kIp, 20, 900, 900)]); await audit(req, '2fa.failed', ''); return { ok: false }; }
+        await failClear([kUser]);
+        req.session.posStepAt = Date.now();
+        return { ok: true };
     }
-    const transport = getSmtp();
-    if (transport) {
-        await transport.sendMail({
-            from: `"${MAIL.fromName}" <${process.env.GMAIL_USER}>`, to, subject, html, text,
-            attachments: attachments.map(a => ({ filename: a.filename, content: a.content, contentType: a.contentType }))
-        });
-        return 'smtp';
+    const otpForm = (error = '') => `<h1>Two-step check</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}<form action="/pos/2fa" method="POST">
+        <div class="field"><label for="o">6-digit code from your authenticator app</label><input id="o" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" autofocus><small>Lost your phone? Type one of your recovery codes instead.</small></div>
+        <button class="btn" type="submit" style="width:100%">Continue</button></form></div>`;
+    router.get('/2fa', (req, res) => {
+        if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
+        send(req, res, { title: 'Two-step check', bare: true, body: otpForm() });
+    });
+    router.post('/2fa', ah(async (req, res) => {
+        if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
+        const r = await verifyOwnerOtp(req, req.body.otp);
+        if (!r.ok) return send(req, res, { title: 'Two-step check', bare: true, body: otpForm(r.locked ? 'Too many wrong codes. Please wait 15 minutes.' : 'That code is not right. Try the newest code.') }, r.locked ? 429 : 401);
+        req.session.pos2faAt = Date.now();
+        await saveSess(req);
+        res.redirect('/pos/app');
+    }));
+
+    async function loadShop(req) {   // the owner's head office
+        const r = await q('SELECT * FROM pos_shops WHERE owner_id = $1 AND parent_id IS NULL', [req.session.user.id]);
+        return r.rows[0] || null;
     }
-    throw new Error('No email service is set up (add BREVO_API_KEY and MAIL_FROM_EMAIL in Render)');
-}
 
-// Alerts to YOU only (Telegram + email). Customers never receive these.
-async function notify(subject, fields) {
-    const cleanSubject = String(subject).replace(/[\r\n]+/g, ' ').slice(0, 150);
-    const rows = Object.entries(fields).map(([label, val]) => {
-        const safe = esc(flat(val));
-        const display = /^https:\/\//.test(safe) ? `<a href="${safe}">Tap to open</a>`
-            : /phone/i.test(label) ? `<a href="tel:${safe}">${safe}</a>` : safe;
-        return `<p><strong>${esc(label)}:</strong> ${display}</p>`;
-    }).join('');
-    const time = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
+    const setupForm = (req, error = '', v = {}) => `
+        <h1>Set up your business</h1>
+        <div class="panel" style="max-width:560px;">
+            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+            <form action="/pos/setup" method="POST">
+                <div class="field"><label for="n">Business name</label><input id="n" name="name" required maxlength="120" value="${esc(v.name || '')}" placeholder="e.g. Mama Achieng Shop"></div>
+                <div class="field"><label for="p">Business phone</label><input id="p" name="phone" maxlength="40" value="${esc(v.phone || req.session.user.phone || '')}"></div>
+                <div class="field"><label for="a">Address / location</label><input id="a" name="address" maxlength="200" value="${esc(v.address || '')}" placeholder="e.g. Rangwe Market"></div>
+                <button class="btn" type="submit">Create my business account</button>
+            </form>
+        </div>`;
+    router.get('/setup', ah(async (req, res) => {
+        if (req.actor.kind === 'staff' || await loadShop(req)) return res.redirect('/pos/app');
+        send(req, res, { title: 'Set up your business', body: setupForm(req) });
+    }));
+    router.post('/setup', ah(async (req, res) => {
+        if (req.actor.kind === 'staff' || await loadShop(req)) return res.redirect('/pos/app');
+        const v = { name: str(req.body.name).slice(0, 120), phone: str(req.body.phone).slice(0, 40), address: str(req.body.address).slice(0, 200) };
+        if (v.name.length < 2) return send(req, res, { title: 'Set up your business', body: setupForm(req, 'Please enter your business name.', v) }, 400);
+        const ins = await q('INSERT INTO pos_shops (owner_id, name, phone, address) VALUES ($1, $2, $3, $4) ON CONFLICT (owner_id) WHERE parent_id IS NULL DO NOTHING RETURNING id', [req.session.user.id, v.name, v.phone, v.address]);
+        if (ins.rows[0]) await assignCode(pool(), ins.rows[0].id);
+        res.redirect('/pos/app');
+    }));
 
-    // The log says what happened but not who, so customer details do not pile up in Render's logs
-    console.log('LEAD:', cleanSubject.split(/[:-]/)[0].trim(), time);
+    // ----- who may open what -----
+    const CASHIER_PAGES = [['GET', /^\/(app|terminal|sales|account|install|api\/items)$/], ['GET', /^\/sales\/\d+\/receipt$/], ['GET', /^\/api\/pay\/[a-f0-9]{24}$/], ['POST', /^\/(api\/sales|api\/pay\/start|account\/password)$/]];
+    const OWNER_ONLY = /^\/(branches|gateways|subscribe|settings|voids|audit|security|payments|2fa)(\/|$)/;
+    function roleAllows(role, method, p) {
+        if (role === 'owner') return true;
+        if (OWNER_ONLY.test(p)) return false;
+        if (role === 'manager') return true;
+        return CASHIER_PAGES.some(([m, re]) => m === method && re.test(p));
+    }
+    const deny = (req, res) => isApi(req) ? res.status(403).json({ error: 'Your account does not have access to that.' })
+        : send(req, res, { title: 'Not allowed', body: '<h1>Not allowed</h1><div class="panel"><p>Your account does not have access to this page.</p><a class="btn" href="/pos/start">Go back</a></div>' }, 403);
 
-    const sendTelegram = async () => {
-        if (!process.env.TELEGRAM_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
-        const lines = Object.entries(fields).map(([label, val]) => `${label}: ${flat(val)}`);
-        const text = `${cleanSubject}\n\n${lines.join('\n')}\n\n${time} (EAT)`.slice(0, 4000);
-        const resp = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text }),
-            signal: AbortSignal.timeout(8000)
-        });
-        if (!resp.ok) throw new Error(`Telegram HTTP ${resp.status}`);
+    // every route after this has req.actor, req.biz (the business) and req.shop (the shop or branch being worked on)
+    router.use(ah(async (req, res, next) => {
+        const a = req.actor;
+        let biz, shop;
+        if (a.kind === 'owner') {
+            biz = await loadShop(req);
+            if (!biz) return res.redirect('/pos/setup');
+            req.branches = (await q('SELECT id, name, active FROM pos_shops WHERE id = $1 OR parent_id = $1 ORDER BY (parent_id IS NULL) DESC, name', [biz.id])).rows;
+            const want = Number(req.session.posShopId), pick = req.branches.find(b => b.id === want && b.active) || req.branches[0];
+            shop = pick.id === biz.id ? biz : (await q('SELECT * FROM pos_shops WHERE id = $1', [pick.id])).rows[0];
+        } else {
+            shop = (await q('SELECT * FROM pos_shops WHERE id = $1', [a.shopId])).rows[0];
+            biz = shop && shop.parent_id ? (await q('SELECT * FROM pos_shops WHERE id = $1', [shop.parent_id])).rows[0] : shop;
+            if (!shop || !biz || biz.id !== a.businessId) { delete req.session.posStaff; return res.redirect('/pos/staff/login'); }
+        }
+        req.biz = biz; req.shop = shop;
+        if (!biz.active) return send(req, res, { title: 'Account paused', body: '<h1>Your POS account is paused</h1><div class="panel"><p>Please contact Tencent Innovations on 0740 311 014 to reactivate it.</p></div>' }, 403);
+        if (!shop.active) return send(req, res, { title: 'Branch paused', body: '<h1>This branch is paused</h1><div class="panel"><p>Please ask the business owner to switch it back on.</p></div>' }, 403);
+        if (!roleAllows(a.role, req.method, req.path)) return deny(req, res);
+        if (a.role === 'cashier' && req.path === '/app') return res.redirect('/pos/terminal');
+        req.subActive = Boolean(biz.sub_until && new Date(biz.sub_until) > new Date());
+        if (!req.subActive && !(a.role === 'owner' && /^\/subscribe(\/|$)/.test(req.path))) {
+            if (isApi(req)) return res.status(402).json({ error: 'The POS subscription has ended. The owner must renew it.' });
+            if (a.role === 'owner') return res.redirect('/pos/subscribe');
+            return send(req, res, { title: 'Subscription ended', body: '<h1>The POS subscription has ended</h1><div class="panel"><p>Please ask the business owner to renew it. Your sales are safe and will be here when it is back on.</p></div>' }, 402);
+        }
+        if (a.role === 'owner' && req.method === 'GET' && !isApi(req)) req.pendingVoids = Number((await q(`SELECT count(*) n FROM pos_void_requests v JOIN pos_shops x ON x.id = v.shop_id WHERE v.status = 'pending' AND (x.id = $1 OR x.parent_id = $1)`, [biz.id])).rows[0].n);
+        if (req.subActive) await runRecurring(shop.id).catch(e => console.error('Recurring expenses failed:', e.message));
+        next();
+    }));
+
+    // ----- dashboard -----
+    router.get('/app', ah(async (req, res) => {
+        const sid = req.shop.id, today = todayNairobi(), monthStart = today.slice(0, 8) + '01', yearStart = today.slice(0, 5) + '01-01';
+        const [m, inv, low, exp, expY, assets, sup, moves, recentExp] = await Promise.all([
+            q(`SELECT count(*)::int n, COALESCE(sum(total_cents),0)::bigint total FROM pos_sales WHERE shop_id=$1 AND status='completed' AND (created_at AT TIME ZONE '${TZ}')::date >= $2`, [sid, monthStart]),
+            q(`SELECT count(*)::int n, COALESCE(sum(stock * cost_cents) FILTER (WHERE track_stock),0)::bigint value FROM pos_items WHERE shop_id=$1 AND active`, [sid]),
+            q(`SELECT count(*)::int n FROM pos_items WHERE shop_id=$1 AND active AND track_stock AND stock <= reorder_level`, [sid]),
+            q(`SELECT COALESCE(sum(amount_cents),0)::bigint total FROM pos_expenses WHERE shop_id=$1 AND spent_on >= $2`, [sid, monthStart]),
+            q(`SELECT COALESCE(sum(amount_cents),0)::bigint total FROM pos_expenses WHERE shop_id=$1 AND spent_on >= $2`, [sid, yearStart]),
+            q(`SELECT * FROM pos_assets WHERE shop_id=$1`, [sid]),
+            q(`SELECT count(*)::int n FROM pos_suppliers WHERE shop_id=$1`, [sid]),
+            q(`SELECT m.change, m.balance, m.reason, m.created_at, i.name FROM pos_stock_moves m JOIN pos_items i ON i.id=m.item_id WHERE m.shop_id=$1 ORDER BY m.created_at DESC, m.id DESC LIMIT 6`, [sid]),
+            q(`SELECT category, amount_cents, spent_on FROM pos_expenses WHERE shop_id=$1 ORDER BY spent_on DESC, id DESC LIMIT 6`, [sid])
+        ]);
+        const M = m.rows[0], I = inv.rows[0];
+        const assetValue = assets.rows.reduce((a, x) => a + assetBookValue(x, today), 0);
+        const label = { stock_in: 'Stock in', stock_out: 'Stock out', adjust: 'Count', sale: 'Sale', void: 'Voided' };
+        const body = `
+        <h1>Dashboard</h1>${notice(req)}
+        <div class="cards">
+            <div class="stat c1"><span>Total items</span><b>${I.n}</b></div>
+            <div class="stat c2"><span>Inventory value (cost)</span><b>${kes(I.value)}</b></div>
+            <div class="stat c3"><span>Sales this month</span><b>${kes(M.total)}</b><span>${M.n} sale${M.n === 1 ? '' : 's'}</span></div>
+            <div class="stat c4"><span>Expenses this month</span><b>${kes(exp.rows[0].total)}</b></div>
+            <div class="stat ${low.rows[0].n ? 'c9' : 'c2'}"><span>Low stock alerts</span><b>${low.rows[0].n}</b><a href="/pos/stock/low" style="color:#fff">View</a></div>
+            <div class="stat c5"><span>Total assets</span><b>${assets.rows.length}</b></div>
+            <div class="stat c7"><span>Assets value</span><b>${kes(assetValue)}</b></div>
+            <div class="stat c8"><span>Suppliers</span><b>${sup.rows[0].n}</b></div>
+            <div class="stat c6"><span>Expenses this year</span><b>${kes(expY.rows[0].total)}</b></div>
+        </div>
+        <div class="panel"><h2>Quick actions</h2><div class="row" style="align-items:center">
+            <a class="btn ok" href="/pos/terminal" style="flex:0 0 auto">POS Terminal</a><a class="btn" href="/pos/items/new" style="flex:0 0 auto">Add item</a>
+            <a class="btn ghost" href="/pos/stock?type=in" style="flex:0 0 auto">Stock in</a><a class="btn ghost" href="/pos/stock?type=out" style="flex:0 0 auto">Stock out</a>
+            <a class="btn ghost" href="/pos/expenses" style="flex:0 0 auto">Add expense</a><a class="btn ghost" href="/pos/purchase-orders/new" style="flex:0 0 auto">New purchase order</a>
+            <a class="btn ghost" href="/pos/assets" style="flex:0 0 auto">Add asset</a><a class="btn ghost" href="/pos/stock?type=set" style="flex:0 0 auto">Stock adjustment</a>
+            <a class="btn ghost" href="/pos/items.csv" style="flex:0 0 auto">Export CSV</a></div></div>
+        <div class="grid2" style="align-items:start">
+            <div class="panel"><h2>Recent stock movements</h2>${moves.rows.length ? `<table>${moves.rows.map(x => `<tr><td>${esc(x.name)}<br><small class="muted">${esc(label[x.reason] || x.reason)} · ${esc(timeFmt(x.created_at))}</small></td><td class="num"><b style="color:${x.change < 0 ? '#dc2626' : '#16a34a'}">${x.change > 0 ? '+' : ''}${x.change}</b></td></tr>`).join('')}</table>` : '<p class="muted">No movements yet.</p>'}</div>
+            <div class="panel"><h2>Recent expenses</h2>${recentExp.rows.length ? `<table>${recentExp.rows.map(x => `<tr><td>${esc(x.category)}<br><small class="muted">${esc(dateFmt(isoDate(x.spent_on) + 'T12:00:00+03:00'))}</small></td><td class="num">${fmt(x.amount_cents)}</td></tr>`).join('')}</table>` : '<p class="muted">No expenses yet.</p>'}</div>
+        </div>`;
+        send(req, res, { title: 'Dashboard', nav: 'app', body });
+    }));
+
+    // ----- categories -----
+    router.get('/categories', ah(async (req, res) => {
+        const r = await q(`SELECT c.id, c.name, count(i.id)::int n FROM pos_categories c LEFT JOIN pos_items i ON i.category_id = c.id AND i.active WHERE c.shop_id=$1 GROUP BY c.id ORDER BY c.name`, [req.shop.id]);
+        const err = req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 120))}</div>` : '';
+        send(req, res, { title: 'Categories', nav: 'categories', body: `<h1>Categories</h1>${notice(req)}${err}
+        <div class="panel"><form action="/pos/categories" method="POST" class="row"><div><label for="c">New category</label><input id="c" name="name" required maxlength="80" placeholder="e.g. Drinks"></div><button class="btn" type="submit">Add</button></form></div>
+        <div class="panel">${r.rows.length ? `<table><tr><th>Name</th><th class="num">Items</th><th></th></tr>${r.rows.map(c => `<tr><td>${esc(c.name)}</td><td class="num">${c.n}</td><td class="right"><form action="/pos/categories/${c.id}/delete" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form></td></tr>`).join('')}</table>` : '<p class="muted">No categories yet.</p>'}</div>` });
+    }));
+    router.post('/categories', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 80);
+        if (!name) return res.redirect('/pos/categories?err=' + encodeURIComponent('Please enter a name.'));
+        const r = await q('INSERT INTO pos_categories (shop_id, name) VALUES ($1, $2) ON CONFLICT (shop_id, name) DO NOTHING', [req.shop.id, name]);
+        res.redirect(r.rowCount ? '/pos/categories?ok=' + encodeURIComponent('Category added.') : '/pos/categories?err=' + encodeURIComponent('That category already exists.'));
+    }));
+    router.post('/categories/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_categories WHERE id = $1 AND shop_id = $2', [id, req.shop.id]);
+        res.redirect('/pos/categories?ok=' + encodeURIComponent('Category deleted. Its items are now uncategorised.'));
+    }));
+
+    // ----- items -----
+    const categoriesOf = async shopId => (await q('SELECT id, name FROM pos_categories WHERE shop_id=$1 ORDER BY name', [shopId])).rows;
+    router.get('/items', ah(async (req, res) => {
+        const search = str(req.query.q).slice(0, 60), showAll = req.query.all === '1';
+        const r = await q(`SELECT i.*, c.name AS cat FROM pos_items i LEFT JOIN pos_categories c ON c.id = i.category_id
+            WHERE i.shop_id=$1 ${showAll ? '' : 'AND i.active'} AND ($2 = '' OR i.name ILIKE '%' || $2 || '%' OR i.barcode = $2) ORDER BY i.name LIMIT 500`, [req.shop.id, search.replace(/[%_\\]/g, ' ')]);
+        const body = `<h1>Items</h1>${notice(req)}
+        <div class="panel"><form method="GET" class="row"><div><label for="q">Search name or barcode</label><input id="q" name="q" value="${esc(search)}"></div><div style="flex:0 0 auto"><label><input type="checkbox" name="all" value="1" ${showAll ? 'checked' : ''} style="width:auto"> Show archived</label></div><button class="btn dark" type="submit">Search</button><a class="btn" href="/pos/items/new">Add item</a></form></div>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Item</th><th>Category</th><th>Barcode</th><th class="num">Price</th><th class="num">Cost</th><th class="num">Stock</th><th></th></tr>${r.rows.map(i => `<tr><td>${esc(i.name)}${i.active ? '' : ' <span class="tag gray">archived</span>'}</td><td>${esc(i.cat || '')}</td><td>${esc(i.barcode || '')}</td><td class="num">${fmt(i.price_cents)}</td><td class="num">${fmt(i.cost_cents)}</td><td class="num">${i.track_stock ? `<span class="tag ${i.stock <= 0 ? 'bad' : i.stock <= i.reorder_level ? 'warn' : 'ok'}">${i.stock}</span>` : '<span class="muted">not tracked</span>'}</td><td class="right nowrap"><a class="btn small ghost" href="/pos/items/${i.id}/edit">Edit</a></td></tr>`).join('')}</table>` : '<p class="muted">No items found. <a href="/pos/items/new">Add your first item</a>.</p>'}</div>`;
+        send(req, res, { title: 'Items', nav: 'items', body });
+    }));
+
+    async function itemForm(req, { item = {}, error = '', isNew = true }) {
+        const cats = await categoriesOf(req.shop.id);
+        const action = isNew ? '/pos/items/new' : `/pos/items/${item.id}/edit`;
+        const priceVal = item.price_cents != null ? (item.price_cents / 100).toFixed(2) : (item._price || '');
+        const costVal = item.cost_cents != null ? (item.cost_cents / 100).toFixed(2) : (item._cost || '');
+        return `<h1>${isNew ? 'Add item' : 'Edit item'}</h1>
+        <div class="panel" style="max-width:720px">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
+        <form action="${action}" method="POST">
+            <div class="grid2">
+                <div class="field"><label for="n">Item name</label><input id="n" name="name" required maxlength="120" value="${esc(item.name || '')}"></div>
+                <div class="field"><label for="c">Category</label><select id="c" name="category_id"><option value="">No category</option>${cats.map(c => `<option value="${c.id}" ${String(item.category_id) === String(c.id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select><small><a href="/pos/categories">Manage categories</a></small></div>
+                <div class="field"><label for="p">Selling price (KES, includes ${VAT_RATE}% VAT)</label><input id="p" name="price" required inputmode="decimal" value="${esc(priceVal)}" placeholder="e.g. 150"></div>
+                <div class="field"><label for="k">Buying cost (KES)</label><input id="k" name="cost" inputmode="decimal" value="${esc(costVal)}" placeholder="e.g. 100"><small>Used to work out your profit.</small></div>
+                <div class="field"><label for="b">Barcode (optional)</label><input id="b" name="barcode" maxlength="60" value="${esc(item.barcode || '')}"><small>Scan it here, or leave blank.</small></div>
+                ${isNew ? `<div class="field"><label for="s">Opening stock</label><input id="s" name="stock" inputmode="numeric" value="${esc(item._stock != null ? item._stock : '0')}"></div>` : ''}
+                <div class="field"><label for="r">Warn me when stock is at or below</label><input id="r" name="reorder_level" inputmode="numeric" value="${esc(item.reorder_level != null ? item.reorder_level : 5)}"></div>
+                <div class="field"><label><input type="checkbox" name="track_stock" value="1" ${item.track_stock === false ? '' : 'checked'} style="width:auto"> Track stock for this item</label><small>Turn off for services or things you do not count.</small></div>
+            </div>
+            <button class="btn" type="submit">Save item</button> <a class="btn ghost" href="/pos/items">Cancel</a>
+        </form></div>
+        ${isNew ? '' : `<form action="/pos/items/${item.id}/archive" method="POST" style="max-width:720px"><button class="btn ghost" type="submit">${item.active ? 'Archive this item (hide from the POS)' : 'Restore this item'}</button></form>`}`;
+    }
+    async function readItemBody(req, isNew) {
+        const price = parseMoney(req.body.price), cost = str(req.body.cost) === '' ? 0 : parseMoney(req.body.cost);
+        const v = { name: str(req.body.name).slice(0, 120), barcode: str(req.body.barcode).slice(0, 60) || null, category_id: parseCount(req.body.category_id, { min: 1 }), track_stock: req.body.track_stock === '1', reorder_level: parseCount(req.body.reorder_level, { min: 0, max: 100000 }), _price: str(req.body.price), _cost: str(req.body.cost), _stock: str(req.body.stock) };
+        let error = '';
+        if (v.name.length < 1) error = 'Please enter the item name.';
+        else if (price === null || price <= 0) error = 'Please enter a selling price, for example 150 or 150.50.';
+        else if (cost === null) error = 'The buying cost must be a number, for example 100.';
+        else if (v.reorder_level === null) error = 'The low-stock warning level must be a whole number.';
+        let stock = 0;
+        if (!error && isNew) { stock = parseCount(req.body.stock || '0', { min: 0, max: 10000000 }); if (stock === null) error = 'Opening stock must be a whole number.'; }
+        if (!error && v.category_id) {
+            const c = await q('SELECT 1 FROM pos_categories WHERE id=$1 AND shop_id=$2', [v.category_id, req.shop.id]);
+            if (!c.rowCount) v.category_id = null;   // another shop's category id is ignored
+        }
+        return { v: { ...v, price_cents: price, cost_cents: cost }, error, stock };
+    }
+    router.get('/items/new', ah(async (req, res) => send(req, res, { title: 'Add item', nav: 'items', body: await itemForm(req, {}) })));
+    router.post('/items/new', ah(async (req, res) => {
+        const { v, error, stock } = await readItemBody(req, true);
+        if (error) return send(req, res, { title: 'Add item', nav: 'items', body: await itemForm(req, { item: v, error }) }, 400);
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const r = await client.query(`INSERT INTO pos_items (shop_id, category_id, name, barcode, price_cents, cost_cents, stock, track_stock, reorder_level) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+                [req.shop.id, v.category_id, v.name, v.barcode, v.price_cents, v.cost_cents, v.track_stock ? stock : 0, v.track_stock, v.reorder_level]);
+            if (v.track_stock && stock > 0) await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note) VALUES ($1,$2,$3,$3,'stock_in','Opening stock')`, [req.shop.id, r.rows[0].id, stock]);
+            await client.query('COMMIT');
+        } catch (err) {
+            await client.query('ROLLBACK').catch(() => {});
+            if (err.code === '23505') return send(req, res, { title: 'Add item', nav: 'items', body: await itemForm(req, { item: v, error: 'Another item already uses that barcode.' }) }, 400);
+            throw err;
+        } finally { client.release(); }
+        res.redirect('/pos/items?ok=' + encodeURIComponent('Item added.'));
+    }));
+    const getItem = async (req, idParam) => {
+        const id = parseCount(idParam, { min: 1 });
+        if (!id) return null;
+        return (await q('SELECT * FROM pos_items WHERE id=$1 AND shop_id=$2', [id, req.shop.id])).rows[0] || null;
     };
-    const sendAdminEmail = async () => {
-        if (!MAIL.adminTo) return;
-        await sendMail({
-            to: MAIL.adminTo,
-            subject: cleanSubject,
-            html: `<h3>${esc(cleanSubject)}</h3>${rows}<p style="color:#888">Received ${esc(time)} (EAT)</p>`,
-            text: `${cleanSubject}\n\n${Object.entries(fields).map(([l, v]) => `${l}: ${flat(v)}`).join('\n')}\n\n${time} (EAT)`
-        });
-    };
-    const results = await Promise.allSettled([sendTelegram(), sendAdminEmail()]);
-    if (results[0].status === 'rejected') console.error('Telegram failed:', results[0].reason && results[0].reason.message);
-    if (results[1].status === 'rejected') console.error('Admin email failed:', results[1].reason && results[1].reason.message);
-}
+    router.get('/items/:id/edit', ah(async (req, res) => {
+        const item = await getItem(req, req.params.id);
+        if (!item) return send(req, res, { title: 'Not found', nav: 'items', body: '<h1>Item not found</h1><a href="/pos/items">Back to items</a>' }, 404);
+        send(req, res, { title: 'Edit item', nav: 'items', body: await itemForm(req, { item, isNew: false }) });
+    }));
+    router.post('/items/:id/edit', ah(async (req, res) => {
+        const item = await getItem(req, req.params.id);
+        if (!item) return res.redirect('/pos/items');
+        const { v, error } = await readItemBody(req, false);
+        if (error) return send(req, res, { title: 'Edit item', nav: 'items', body: await itemForm(req, { item: { ...item, ...v, id: item.id, price_cents: undefined, cost_cents: undefined }, error, isNew: false }) }, 400);
+        try {
+            await q(`UPDATE pos_items SET name=$3, category_id=$4, barcode=$5, price_cents=$6, cost_cents=$7, track_stock=$8, reorder_level=$9 WHERE id=$1 AND shop_id=$2`,
+                [item.id, req.shop.id, v.name, v.category_id, v.barcode, v.price_cents, v.cost_cents, v.track_stock, v.reorder_level]);
+        } catch (err) {
+            if (err.code === '23505') return send(req, res, { title: 'Edit item', nav: 'items', body: await itemForm(req, { item: { ...item, ...v, id: item.id, price_cents: undefined, cost_cents: undefined }, error: 'Another item already uses that barcode.', isNew: false }) }, 400);
+            throw err;
+        }
+        res.redirect('/pos/items?ok=' + encodeURIComponent('Item saved.'));
+    }));
+    router.post('/items/:id/archive', ah(async (req, res) => {
+        const item = await getItem(req, req.params.id);
+        if (item) await q('UPDATE pos_items SET active = NOT active WHERE id=$1 AND shop_id=$2', [item.id, req.shop.id]);
+        res.redirect('/pos/items?ok=' + encodeURIComponent('Item updated.'));
+    }));
 
-// ---------------------------------------------------------------
-// 7. M-Pesa (Daraja)
-// ---------------------------------------------------------------
-const MPESA = {
-    production: process.env.MPESA_ENV === 'production',
-    key: process.env.MPESA_CONSUMER_KEY,
-    secret: process.env.MPESA_CONSUMER_SECRET,
-    shortcode: process.env.MPESA_SHORTCODE,
-    passkey: process.env.MPESA_PASSKEY,
-    callbackSecret: process.env.MPESA_CALLBACK_SECRET,
-    publicBaseUrl: PUBLIC_BASE_URL
-};
-MPESA.baseUrl = process.env.MPESA_BASE_URL ||
-    (MPESA.production ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke');
+    // ----- stock -----
+    router.get('/stock', ah(async (req, res) => {
+        const items = (await q('SELECT id, name, stock FROM pos_items WHERE shop_id=$1 AND active AND track_stock ORDER BY name', [req.shop.id])).rows;
+        const err = req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 160))}</div>` : '';
+        send(req, res, { title: 'Stock In / Out', nav: 'stock', body: `<h1>Stock In / Out</h1>${notice(req)}${err}
+        <div class="panel" style="max-width:640px">${items.length ? `<form action="/pos/stock" method="POST">
+            <div class="field"><label for="i">Item</label><select id="i" name="item_id" required>${items.map(i => `<option value="${i.id}">${esc(i.name)} (now ${i.stock})</option>`).join('')}</select></div>
+            <div class="field"><label for="t">What happened?</label><select id="t" name="type"><option value="in" ${req.query.type === 'in' ? 'selected' : ''}>Stock in: received more stock</option><option value="out" ${req.query.type === 'out' ? 'selected' : ''}>Stock out: damaged, expired, used or lost</option><option value="set" ${req.query.type === 'set' ? 'selected' : ''}>Stock count: set the exact number on the shelf</option></select></div>
+            <div class="field"><label for="q">Quantity</label><input id="q" name="qty" required inputmode="numeric" placeholder="e.g. 24"></div>
+            <div class="field"><label for="nt">Note (optional)</label><input id="nt" name="note" maxlength="200" placeholder="e.g. Delivery from supplier"></div>
+            <button class="btn" type="submit">Save</button></form>` : '<p class="muted">You have no tracked items yet. <a href="/pos/items/new">Add an item</a> first.</p>'}</div>` });
+    }));
+    router.post('/stock', ah(async (req, res) => {
+        const itemId = parseCount(req.body.item_id, { min: 1 });
+        const type = ['in', 'out', 'set'].includes(req.body.type) ? req.body.type : '';
+        const qty = parseCount(req.body.qty, { min: 0, max: 10000000 });
+        const note = str(req.body.note).slice(0, 200);
+        const fail = m => res.redirect('/pos/stock?err=' + encodeURIComponent(m));
+        if (!itemId || !type || qty === null || (type !== 'set' && qty < 1)) return fail('Please choose an item and enter a whole-number quantity.');
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const it = (await client.query('SELECT id, stock FROM pos_items WHERE id=$1 AND shop_id=$2 AND track_stock FOR UPDATE', [itemId, req.shop.id])).rows[0];
+            if (!it) { await client.query('ROLLBACK'); return fail('Item not found.'); }
+            const change = type === 'in' ? qty : type === 'out' ? -qty : qty - it.stock;
+            const balance = it.stock + change;
+            if (balance < 0) { await client.query('ROLLBACK'); return fail(`You only have ${it.stock} in stock, so you cannot remove ${qty}.`); }
+            await client.query('UPDATE pos_items SET stock=$2 WHERE id=$1', [it.id, balance]);
+            await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note) VALUES ($1,$2,$3,$4,$5,$6)`, [req.shop.id, it.id, change, balance, type === 'in' ? 'stock_in' : type === 'out' ? 'stock_out' : 'adjust', note]);
+            await client.query('COMMIT');
+        } catch (err) { await client.query('ROLLBACK').catch(() => {}); throw err; } finally { client.release(); }
+        await audit(req, 'stock.' + type, `item #${itemId} qty ${qty}${note ? ': ' + note : ''}`);
+        res.redirect('/pos/stock?ok=' + encodeURIComponent('Stock updated.'));
+    }));
+    router.get('/stock/history', ah(async (req, res) => {
+        const r = await q(`SELECT m.*, i.name FROM pos_stock_moves m JOIN pos_items i ON i.id = m.item_id WHERE m.shop_id=$1 ORDER BY m.created_at DESC, m.id DESC LIMIT 300`, [req.shop.id]);
+        const label = { stock_in: 'Stock in', stock_out: 'Stock out', adjust: 'Stock count', sale: 'Sale', void: 'Sale voided' };
+        send(req, res, { title: 'Stock History', nav: 'history', body: `<h1>Stock History</h1><div class="panel tablewrap">${r.rows.length ? `<table><tr><th>When</th><th>Item</th><th>Type</th><th class="num">Change</th><th class="num">Balance</th><th>Note</th></tr>${r.rows.map(m => `<tr><td class="nowrap">${esc(timeFmt(m.created_at))}</td><td>${esc(m.name)}</td><td>${esc(label[m.reason] || m.reason)}</td><td class="num"><b style="color:${m.change < 0 ? '#dc2626' : '#16a34a'}">${m.change > 0 ? '+' : ''}${m.change}</b></td><td class="num">${m.balance}</td><td>${esc(m.note)}</td></tr>`).join('')}</table>` : '<p class="muted">No stock movements yet.</p>'}</div>` });
+    }));
+    router.get('/stock/low', ah(async (req, res) => {
+        const r = await q(`SELECT id, name, stock, reorder_level FROM pos_items WHERE shop_id=$1 AND active AND track_stock AND stock <= reorder_level ORDER BY stock ASC, name`, [req.shop.id]);
+        send(req, res, { title: 'Low Stock Alerts', nav: 'low', body: `<h1>Low Stock Alerts</h1><div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Item</th><th class="num">In stock</th><th class="num">Warning level</th><th></th></tr>${r.rows.map(i => `<tr><td>${esc(i.name)}</td><td class="num"><span class="tag ${i.stock <= 0 ? 'bad' : 'warn'}">${i.stock}</span></td><td class="num">${i.reorder_level}</td><td class="right"><a class="btn small" href="/pos/stock">Add stock</a></td></tr>`).join('')}</table>` : '<p class="muted">All good. Nothing is at or below its warning level.</p>'}</div>` });
+    }));
 
-function mpesaConfigured() {
-    return Boolean(
-        MPESA.key && MPESA.secret && MPESA.shortcode && MPESA.passkey &&
-        MPESA.callbackSecret && MPESA.callbackSecret.length >= 16 &&
-        MPESA.publicBaseUrl.startsWith('https://')
-    );
-}
+    // ----- POS terminal -----
+    router.get('/api/items', ah(async (req, res) => {
+        const r = await q(`SELECT i.id, i.name, i.barcode, i.price_cents, i.stock, i.track_stock, c.name AS category FROM pos_items i LEFT JOIN pos_categories c ON c.id = i.category_id WHERE i.shop_id=$1 AND i.active ORDER BY i.name LIMIT 2000`, [req.shop.id]);
+        res.set('Cache-Control', 'no-store').json(r.rows.map(i => ({ id: i.id, name: i.name, barcode: i.barcode || '', price: i.price_cents, stock: i.track_stock ? i.stock : null, category: i.category || '' })));
+    }));
+    const LIVE_PROVIDERS = PAYSTACK_ON ? ['mpesa', 'paystack'] : ['mpesa'];
+    const hasGateway = async bizId => vault.enabled && (await q('SELECT 1 FROM pos_gateways WHERE business_id=$1 AND active AND provider = ANY($2::text[]) LIMIT 1', [bizId, LIVE_PROVIDERS])).rowCount > 0;
+    router.get('/terminal', ah(async (req, res) => {
+        const stkOn = await hasGateway(req.biz.id), vatOn = Boolean(req.biz.vat_enabled);
+        const body = `<h1 class="noprint">POS Terminal</h1>
+        <div class="pos-wrap">
+            <div>
+                <div class="panel" style="margin-bottom:0"><label for="find">Search items, or scan a barcode and press Enter</label><input id="find" type="search" autocomplete="off" autofocus placeholder="Type a name or scan..."><div class="chips" id="chips"></div></div>
+                <div class="pos-items" id="grid" aria-live="polite"></div>
+            </div>
+            <div class="panel cart">
+                <h2>Current sale</h2>
+                <div class="lines" id="lines"><p class="muted" style="padding:10px 2px">Tap an item to add it.</p></div>
+                <div class="tot"><span>Subtotal</span><span id="sub">0.00</span></div>
+                <div class="tot"><span>Discount (KES)</span><input id="disc" inputmode="decimal" style="width:110px;text-align:right" placeholder="0"></div>
+                <div class="tot big"><span>Total</span><span id="total">0.00</span></div>
+                ${vatOn ? `<div class="tot muted"><small>Includes VAT ${VAT_RATE}%</small><small id="vat">0.00</small></div>` : ''}
+                <div class="pay" style="grid-template-columns:repeat(${stkOn ? 3 : 2},1fr)"><button type="button" id="m-cash" class="on">Cash</button><button type="button" id="m-mpesa">M-Pesa code</button>${stkOn ? '<button type="button" id="m-stk">Phone prompt</button>' : ''}</div>
+                <div id="cashbox" class="field"><label for="tender">Cash received (KES)</label><input id="tender" inputmode="decimal" placeholder="0"><div class="tot" style="margin-top:6px"><span>Change</span><b id="change">0.00</b></div></div>
+                <div id="mpesabox" class="field" style="display:none"><label for="mref">M-Pesa code (from the customer's SMS)</label><input id="mref" maxlength="14" autocapitalize="characters" placeholder="e.g. SHK4A1B2C3"></div>
+                <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer M-Pesa number</label><input id="sphone" type="tel" placeholder="0712345678"><small>The customer gets a prompt on their phone and types their PIN.</small></div>
+                <div class="field" id="cpbox"><label for="cphone">Customer phone (optional, to share the receipt)</label><input id="cphone" type="tel" placeholder="0712345678"></div>
+                <div id="err" class="alert" role="alert" style="display:none"></div>
+                <button class="btn ok" id="done" type="button" style="width:100%;padding:13px;font-size:1rem" disabled>Complete sale</button>
+                <button class="btn ghost" id="clear" type="button" style="width:100%;margin-top:8px">Clear sale</button>
+            </div>
+        </div>
+        <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="mtitle"><div class="box"><h2 id="mtitle">Sale complete</h2><p id="mtext" style="font-size:1.1rem"></p>
+            <div class="row" style="justify-content:center"><a class="btn" id="mprint" target="_blank" rel="noopener">Print receipt</a><a class="btn ghost" id="mwa" target="_blank" rel="noopener" style="display:none">Send on WhatsApp</a></div>
+            <button class="btn ok" id="mnew" type="button" style="margin-top:14px;width:100%">New sale</button></div></div>
+        <div class="modal" id="wait" role="dialog" aria-modal="true" aria-labelledby="wtitle"><div class="box"><h2 id="wtitle">Waiting for payment</h2><p id="wtext" style="font-size:1.05rem">Ask the customer to check their phone and enter their M-Pesa PIN.</p>
+            <button class="btn ghost" id="wcancel" type="button" style="margin-top:10px;width:100%">Stop waiting</button></div></div>
+        <script nonce="${req.nonce || ''}">
+        (function () {
+            var VAT_ON = ${vatOn ? 'true' : 'false'}, VAT_RATE = ${VAT_RATE};
+            var items = [], cart = [], cat = '', method = 'cash', busy = false, timer = null;
+            var $ = function (id) { return document.getElementById(id); };
+            function fmt(c) { return (c / 100).toLocaleString('en-KE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+            function money(v) { var s = String(v || '').replace(/,/g, '').trim(); if (!/^[0-9]{1,9}([.][0-9]{1,2})?$/.test(s)) return 0; return Math.round(parseFloat(s) * 100); }
+            function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+            function showErr(m) { var e = $('err'); e.textContent = m || ''; e.style.display = m ? 'block' : 'none'; }
+            function load() {
+                fetch('/pos/api/items', { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) { items = d; chips(); draw(); }).catch(function () { showErr('Could not load your items. Check your connection and refresh.'); });
+            }
+            function chips() {
+                var c = $('chips'); c.textContent = ''; var cats = ['']; items.forEach(function (i) { if (i.category && cats.indexOf(i.category) < 0) cats.push(i.category); });
+                if (cats.length < 2) return;
+                cats.forEach(function (n) { var b = el('button', 'chip' + (n === cat ? ' on' : ''), n || 'All'); b.type = 'button'; b.addEventListener('click', function () { cat = n; chips(); draw(); }); c.appendChild(b); });
+            }
+            function draw() {
+                var f = $('find').value.trim().toLowerCase(), g = $('grid'); g.textContent = '';
+                var list = items.filter(function (i) { return (!cat || i.category === cat) && (!f || i.name.toLowerCase().indexOf(f) >= 0 || (i.barcode && i.barcode.toLowerCase() === f)); }).slice(0, 120);
+                if (!list.length) { g.appendChild(el('p', 'muted', items.length ? 'No matching items.' : 'You have no items yet. Add items first.')); return; }
+                list.forEach(function (i) {
+                    var out = i.stock !== null && i.stock <= 0;
+                    var b = el('button', 'pos-item' + (out ? ' out' : '')); b.type = 'button';
+                    b.appendChild(el('b', '', i.name)); b.appendChild(el('span', 'p', 'KES ' + fmt(i.price)));
+                    b.appendChild(el('span', 's', i.stock === null ? '' : (out ? 'Out of stock' : i.stock + ' in stock')));
+                    b.addEventListener('click', function () { add(i); }); g.appendChild(b);
+                });
+            }
+            function add(i) {
+                var l = cart.filter(function (x) { return x.id === i.id; })[0];
+                if (i.stock !== null && (l ? l.qty : 0) + 1 > i.stock) { showErr('Only ' + i.stock + ' of "' + i.name + '" in stock.'); return; }
+                showErr(''); if (l) l.qty++; else cart.push({ id: i.id, name: i.name, price: i.price, qty: 1, stock: i.stock });
+                render();
+            }
+            function totals() { var s = 0; cart.forEach(function (l) { s += l.price * l.qty; }); var d = Math.min(money($('disc').value), s); var t = s - d; return { sub: s, disc: d, total: t, vat: VAT_ON ? Math.round(t * VAT_RATE / (100 + VAT_RATE)) : 0 }; }
+            function render() {
+                var box = $('lines'); box.textContent = '';
+                if (!cart.length) box.appendChild(el('p', 'muted', 'Tap an item to add it.'));
+                cart.forEach(function (l, idx) {
+                    var r = el('div', 'cline'), nm = el('div'); nm.appendChild(el('div', '', l.name)); nm.appendChild(el('small', 'muted', 'KES ' + fmt(l.price) + ' each'));
+                    var q = el('div', 'qty'), mi = el('button', '', '-'), n = el('span', '', String(l.qty)), pl = el('button', '', '+'); mi.type = pl.type = 'button';
+                    mi.setAttribute('aria-label', 'Less ' + l.name); pl.setAttribute('aria-label', 'More ' + l.name);
+                    mi.addEventListener('click', function () { l.qty--; if (l.qty <= 0) cart.splice(idx, 1); render(); });
+                    pl.addEventListener('click', function () { if (l.stock !== null && l.qty + 1 > l.stock) { showErr('Only ' + l.stock + ' of "' + l.name + '" in stock.'); return; } showErr(''); l.qty++; render(); });
+                    q.appendChild(mi); q.appendChild(n); q.appendChild(pl);
+                    r.appendChild(nm); r.appendChild(q); r.appendChild(el('b', '', fmt(l.price * l.qty))); box.appendChild(r);
+                });
+                var t = totals(); $('sub').textContent = fmt(t.sub); $('total').textContent = fmt(t.total); if ($('vat')) $('vat').textContent = fmt(t.vat);
+                var tend = money($('tender').value); $('change').textContent = fmt(Math.max(0, tend - t.total));
+                $('done').disabled = busy || !cart.length;
+            }
+            function setMethod(m) {
+                method = m; $('m-cash').className = m === 'cash' ? 'on' : ''; $('m-mpesa').className = m === 'mpesa' ? 'on' : ''; if ($('m-stk')) $('m-stk').className = m === 'stk' ? 'on' : '';
+                $('cashbox').style.display = m === 'cash' ? '' : 'none'; $('mpesabox').style.display = m === 'mpesa' ? '' : 'none'; $('stkbox').style.display = m === 'stk' ? '' : 'none'; $('cpbox').style.display = m === 'stk' ? 'none' : '';
+                $('done').textContent = m === 'stk' ? 'Send M-Pesa prompt' : 'Complete sale'; showErr('');
+            }
+            function reset() { cart = []; $('disc').value = ''; $('tender').value = ''; $('mref').value = ''; $('cphone').value = ''; if ($('sphone')) $('sphone').value = ''; showErr(''); setMethod('cash'); render(); $('find').value = ''; draw(); load(); $('find').focus(); }
+            function lines() { return cart.map(function (l) { return { id: l.id, qty: l.qty }; }); }
+            function finished(d) {
+                $('mtext').textContent = 'Receipt #' + d.receiptNo + ' - KES ' + fmt(d.total) + (d.change ? ' - Change KES ' + fmt(d.change) : '');
+                $('mprint').href = d.receiptUrl; var wa = $('mwa'); if (d.whatsapp) { wa.href = d.whatsapp; wa.style.display = ''; } else wa.style.display = 'none';
+                $('modal').classList.add('show'); $('mnew').focus();
+            }
+            function stopWait() { if (timer) { clearInterval(timer); timer = null; } $('wait').classList.remove('show'); busy = false; render(); }
+            function poll(id) {
+                var tries = 0;
+                timer = setInterval(function () {
+                    tries++;
+                    fetch('/pos/api/pay/' + id, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
+                        if (d.status === 'paid') { stopWait(); finished(d); }
+                        else if (d.status === 'failed' || d.status === 'review') { stopWait(); showErr(d.status === 'review' ? 'The payment needs checking by the owner (see Payment Gateways). Do not give goods until it is confirmed.' : (d.error || 'The customer did not complete the payment.')); }
+                        else if (tries >= 45) { $('wtext').textContent = 'No answer yet. If the customer already paid, the sale is saved automatically: check Sales History. You can keep waiting or stop.'; }
+                    }).catch(function () {});
+                }, 3000);
+            }
+            function startStk() {
+                var phone = $('sphone').value.trim(); if (!phone) { showErr("Enter the customer's M-Pesa number."); return; }
+                busy = true; $('done').disabled = true; showErr('');
+                fetch('/pos/api/pay/start', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: lines(), discount: $('disc').value, phone: phone }) })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+                .then(function (x) {
+                    if (!x.ok) { busy = false; showErr(x.d.error || 'The prompt could not be sent.'); render(); return; }
+                    $('wtext').textContent = 'KES ' + x.d.amountKes.toLocaleString('en-KE') + ': ask the customer to check their phone and enter their M-Pesa PIN.'; $('wait').classList.add('show'); poll(x.d.id);
+                }).catch(function () { busy = false; showErr('Connection problem. The prompt may not have been sent.'); render(); });
+            }
+            $('find').addEventListener('input', draw);
+            $('find').addEventListener('keydown', function (e) {
+                if (e.key !== 'Enter') return; e.preventDefault(); var f = $('find').value.trim().toLowerCase(); if (!f) return;
+                var hit = items.filter(function (i) { return i.barcode && i.barcode.toLowerCase() === f; })[0]; if (!hit) { var m = items.filter(function (i) { return i.name.toLowerCase().indexOf(f) >= 0; }); if (m.length === 1) hit = m[0]; }
+                if (hit) { add(hit); $('find').value = ''; draw(); } else showErr('No item matches "' + $('find').value.trim() + '".');
+            });
+            ['disc', 'tender'].forEach(function (id) { $(id).addEventListener('input', render); });
+            $('m-cash').addEventListener('click', function () { setMethod('cash'); }); $('m-mpesa').addEventListener('click', function () { setMethod('mpesa'); }); if ($('m-stk')) $('m-stk').addEventListener('click', function () { setMethod('stk'); });
+            $('wcancel').addEventListener('click', stopWait);
+            $('clear').addEventListener('click', reset); $('mnew').addEventListener('click', function () { $('modal').classList.remove('show'); reset(); });
+            $('done').addEventListener('click', function () {
+                if (busy || !cart.length) return; var t = totals();
+                if (method === 'stk') { startStk(); return; }
+                if (method === 'cash' && money($('tender').value) < t.total) { showErr('The cash received is less than the total.'); return; }
+                if (method === 'mpesa' && !/^[A-Za-z0-9]{8,14}$/.test($('mref').value.trim())) { showErr("Enter the M-Pesa code from the customer's SMS."); return; }
+                busy = true; $('done').disabled = true; $('done').textContent = 'Saving...'; showErr('');
+                fetch('/pos/api/sales', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+                    lines: lines(), discount: $('disc').value, method: method, tendered: $('tender').value, mpesaRef: $('mref').value.trim(), customerPhone: $('cphone').value.trim() }) })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+                .then(function (x) {
+                    busy = false; $('done').textContent = 'Complete sale';
+                    if (!x.ok) { showErr(x.d.error || 'The sale could not be saved.'); render(); return; }
+                    finished(x.d);
+                }).catch(function () { busy = false; $('done').textContent = 'Complete sale'; showErr('Connection problem. The sale may not have been saved: check Sales History before trying again.'); render(); });
+            });
+            setMethod('cash'); render(); load();
+        })();
+        </script>`;
+        send(req, res, { title: 'POS Terminal', nav: 'terminal', body });
+    }));
 
-// Prices are set here on the server and never taken from the form
-const SERVICE_PRICES = {
-    'Site Survey & Quotation': 3000,
-    'WiFi Setup': 3000,
-    'CCTV Installation': 3000,
-    'Smart Locks': 2500,
-    'Electric Fence': 5000,
-    'Solar Consultation': 4000
-};
+    // ----- saving a sale -----
+    const saleLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests. Please wait a moment.' } });
+    const pollLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 1500, standardHeaders: true, legacyHeaders: false, message: { status: 'pending' } });
+    const cashierOf = req => ({ staffId: req.actor.kind === 'staff' ? req.actor.staffId : null, name: String(req.actor.name || '').slice(0, 80) });
+    const kePhone = raw => { const m = String(raw || '').replace(/[\s-]/g, '').match(/^(?:\+?254|0)([17]\d{8})$/); return m ? '254' + m[1] : ''; };
 
-// ---------------------------------------------------------------
-// Location- and urgency-based pricing
-// The service price above is the base fee. A travel fare (by distance from Rangwe) and an
-// urgency fee are added on top. Everything is worked out here on the server, never in the browser.
-// Change the numbers in Render (Environment) without touching the code:
-//   TRAVEL_FREE_KM        km from Rangwe that carry no travel fare            (default 5)
-//   TRAVEL_RATE_PER_KM    KES charged for each km beyond the free distance    (default 40)
-//   TRAVEL_MAX_KM         furthest distance bookable online                   (default 80)
-//   URGENCY_NEXT_DAY_FEE  extra KES for next-day service                      (default 500)
-//   URGENCY_SAME_DAY_FEE  extra KES for same-day service                      (default 1000)
-// ---------------------------------------------------------------
-const envNum = (name, fallback) => {
-    const v = Number(process.env[name]);
-    return process.env[name] !== undefined && process.env[name] !== '' && Number.isFinite(v) && v >= 0 ? v : fallback;
-};
-const PRICING = {
-    base: { lat: -0.6003, lng: 34.5835 },   // Rangwe
-    roadFactor: 1.3,                          // roads are longer than the straight line
-    roundTo: 50,                              // travel fare is rounded up to the next KES 50
-    freeKm: envNum('TRAVEL_FREE_KM', 5),
-    ratePerKm: envNum('TRAVEL_RATE_PER_KM', 40),
-    maxKm: envNum('TRAVEL_MAX_KM', 80),
-    urgency: {
-        standard: { label: 'Standard (within the week)', fee: 0 },
-        'next-day': { label: 'Next day', fee: envNum('URGENCY_NEXT_DAY_FEE', 500) },
-        'same-day': { label: 'Same day', fee: envNum('URGENCY_SAME_DAY_FEE', 1000) }
+    // reads the cart from the request: { want: Map(itemId -> qty), discountIn } or { error }
+    function readCart(b) {
+        if (!Array.isArray(b.lines) || !b.lines.length || b.lines.length > 100) return { error: 'The sale has no items.' };
+        const want = new Map();
+        for (const l of b.lines) {
+            const id = parseCount(l && l.id, { min: 1 }), qty = parseCount(l && l.qty, { min: 1, max: 100000 });
+            if (!id || !qty) return { error: 'One of the items is not valid.' };
+            want.set(id, (want.get(id) || 0) + qty);
+        }
+        const discountIn = String(b.discount || '').trim() === '' ? 0 : parseMoney(b.discount);
+        if (discountIn === null) return { error: 'The discount must be a number.' };
+        return { want, discountIn };
     }
-};
-// For customers who do not want to share their phone location. Coordinates are approximate town centres.
-const PLACES = {
-    rangwe: { label: 'Rangwe town', lat: -0.6003, lng: 34.5835 },
-    'homa-bay': { label: 'Homa Bay town', lat: -0.5273, lng: 34.4571 },
-    'kendu-bay': { label: 'Kendu Bay', lat: -0.3603, lng: 34.6439 },
-    oyugis: { label: 'Oyugis', lat: -0.5078, lng: 34.7358 },
-    rongo: { label: 'Rongo', lat: -0.7567, lng: 34.6 },
-    mbita: { label: 'Mbita', lat: -0.4219, lng: 34.2022 },
-    kisumu: { label: 'Kisumu', lat: -0.0917, lng: 34.7679 }
-};
-function distanceKm(lat, lng) {
-    const rad = d => d * Math.PI / 180;
-    const dLat = rad(lat - PRICING.base.lat), dLng = rad(lng - PRICING.base.lng);
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(PRICING.base.lat)) * Math.cos(rad(lat)) * Math.sin(dLng / 2) ** 2;
-    return Math.ceil(2 * 6371 * Math.asin(Math.sqrt(a)) * PRICING.roadFactor);
-}
-// input: { service, urgency, place, lat, lng } straight from the form. Returns { ok:true, ... } or { ok:false, error }.
-function computeQuote(input) {
-    const service = String(input.service || '');
-    if (!Object.hasOwn(SERVICE_PRICES, service)) return { ok: false, error: 'Please choose a valid service.' };
-    const urgencyKey = Object.hasOwn(PRICING.urgency, input.urgency) ? input.urgency : 'standard';
-    let lat = Number(input.lat), lng = Number(input.lng);
-    let source = 'gps';
-    if (input.lat === undefined || input.lat === '' || !Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
-        const place = Object.hasOwn(PLACES, input.place) ? PLACES[input.place] : null;
-        if (!place) return { ok: false, error: 'Please choose your area or share your location so we can work out the travel fare.' };
-        lat = place.lat; lng = place.lng; source = 'area';
+    // prices come from the database, never from the browser
+    async function priceCart(db, shopId, want, lock) {
+        const ids = [...want.keys()];
+        const found = (await db.query(`SELECT id, name, price_cents, cost_cents, stock, track_stock FROM pos_items WHERE shop_id=$1 AND active AND id = ANY($2::int[]) ORDER BY id${lock ? ' FOR UPDATE' : ''}`, [shopId, ids])).rows;
+        if (found.length !== ids.length) return { error: 'An item in the cart is no longer available. Refresh and try again.', code: 409 };
+        const lines = [];
+        for (const it of found) {
+            const qty = want.get(it.id);
+            if (it.track_stock && it.stock < qty) return { error: `Not enough stock for "${it.name}": ${it.stock} left.`, code: 409 };
+            lines.push({ id: it.id, name: it.name, qty, price: Number(it.price_cents), cost: Number(it.cost_cents) });
+        }
+        return { lines };
     }
-    const km = distanceKm(lat, lng);
-    if (km > PRICING.maxKm) return { ok: false, error: `That location is about ${km} km from Rangwe, which is too far to book online. Please call us on 0740 311 014 for a quote.` };
-    const chargeable = Math.max(0, km - PRICING.freeKm);
-    const travel = chargeable === 0 ? 0 : Math.ceil(chargeable * PRICING.ratePerKm / PRICING.roundTo) * PRICING.roundTo;
-    const base = SERVICE_PRICES[service];
-    const urgencyFee = PRICING.urgency[urgencyKey].fee;
-    return {
-        ok: true, service, urgency: urgencyKey, urgencyLabel: PRICING.urgency[urgencyKey].label, source,
-        lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)),
-        km, base, travel, urgencyFee, total: base + travel + urgencyFee
-    };
-}
-
-function normalizePhone(raw) {
-    let p = String(raw || '').replace(/[\s\-()]/g, '');
-    if (p.startsWith('+')) p = p.slice(1);
-    if (/^0[17]\d{8}$/.test(p)) p = '254' + p.slice(1);
-    else if (/^[17]\d{8}$/.test(p)) p = '254' + p;
-    return /^254[17]\d{8}$/.test(p) ? p : null;
-}
-
-const phoneAttempts = new Map();     // phone -> [timestamps]
-const lastStatusQuery = new Map();   // booking id -> when we last asked Safaricom
-function phoneAttemptAllowed(phone) {
-    const now = Date.now();
-    const recent = (phoneAttempts.get(phone) || []).filter(t => now - t < 60 * 60 * 1000);
-    if (recent.length >= 3) { phoneAttempts.set(phone, recent); return false; }
-    recent.push(now);
-    phoneAttempts.set(phone, recent);
-    return true;
-}
-setInterval(() => {   // tidy the in-memory maps so they cannot grow forever
-    const now = Date.now();
-    for (const [p, arr] of phoneAttempts) {
-        const recent = arr.filter(t => now - t < 60 * 60 * 1000);
-        if (recent.length) phoneAttempts.set(p, recent); else phoneAttempts.delete(p);
+    // writes the sale, its lines, VAT and stock movements inside the caller's transaction
+    async function insertSale(client, shop, biz, d) {
+        const subtotal = d.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(d.discount, subtotal), total = subtotal - discount;
+        const vat = biz.vat_enabled ? vatOf(total) : 0;   // prices already include VAT, so this is the VAT inside the total
+        const no = (await client.query('UPDATE pos_shops SET next_receipt = next_receipt + 1 WHERE id=$1 RETURNING next_receipt - 1 AS no', [shop.id])).rows[0].no;
+        const paid = d.paid == null ? total : d.paid;
+        const sale = (await client.query(`INSERT INTO pos_sales (shop_id, receipt_no, subtotal_cents, discount_cents, total_cents, vat_cents, paid_cents, change_cents, method, mpesa_ref, customer_phone, staff_id, cashier_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+            [shop.id, no, subtotal, discount, total, vat, paid, d.change || 0, d.method, d.mref || null, d.phone || '', d.staffId || null, d.cashierName || ''])).rows[0];
+        const oversold = [];
+        for (const l of d.lines) {
+            await client.query('INSERT INTO pos_sale_items (sale_id, item_id, name, qty, unit_price_cents, unit_cost_cents) VALUES ($1,$2,$3,$4,$5,$6)', [sale.id, l.id, l.name, l.qty, l.price, l.cost]);
+            const st = (await client.query('UPDATE pos_items SET stock = CASE WHEN track_stock THEN stock - $2 ELSE stock END WHERE id=$1 AND shop_id=$3 RETURNING stock, track_stock', [l.id, l.qty, shop.id])).rows[0];
+            if (st && st.track_stock && st.stock < 0) oversold.push(l.name);   // only possible for a payment that arrived after the stock was gone
+            if (st && st.track_stock) await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note, sale_id) VALUES ($1,$2,$3,$4,'sale',$5,$6)`, [shop.id, l.id, -l.qty, st.stock, 'Receipt #' + no, sale.id]);
+        }
+        return { id: sale.id, no, total, change: d.change || 0, oversold };
     }
-    for (const [id, t] of lastStatusQuery) if (now - t > 60 * 60 * 1000) lastStatusQuery.delete(id);
-}, 30 * 60 * 1000).unref();
+    const whatsappLink = (shop, phone, no, total, method) => phone ? `https://wa.me/${phone}?text=${encodeURIComponent(`Thank you for shopping at ${shop.name}. Receipt #${no}: KES ${fmt(total)} paid by ${method === 'cash' ? 'cash' : 'M-Pesa'}.`)}` : '';
 
-let tokenCache = { value: null, expiresAt: 0 };
-async function getAccessToken() {
-    if (tokenCache.value && Date.now() < tokenCache.expiresAt) return tokenCache.value;
-    const auth = Buffer.from(`${MPESA.key}:${MPESA.secret}`).toString('base64');
-    const resp = await fetch(`${MPESA.baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
-        headers: { Authorization: `Basic ${auth}` },
-        signal: AbortSignal.timeout(15000)
-    });
-    if (!resp.ok) throw new Error(`Daraja authentication failed (HTTP ${resp.status})`);
-    const data = await resp.json();
-    tokenCache = { value: data.access_token, expiresAt: Date.now() + (Number(data.expires_in || 3599) - 60) * 1000 };
-    return tokenCache.value;
-}
-const darajaTimestamp = () => new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
-const darajaPassword = ts => Buffer.from(`${MPESA.shortcode}${MPESA.passkey}${ts}`).toString('base64');
+    router.post('/api/sales', saleLimiter, ah(async (req, res) => {
+        const bad = (m, code = 400) => res.status(code).json({ error: m });
+        const b = req.body || {};
+        const method = b.method === 'mpesa' ? 'mpesa' : b.method === 'cash' ? 'cash' : '';
+        if (!method) return bad('Choose cash or M-Pesa.');
+        const cart = readCart(b);
+        if (cart.error) return bad(cart.error);
+        const mref = method === 'mpesa' ? String(b.mpesaRef || '').trim().toUpperCase() : '';
+        if (method === 'mpesa' && !/^[A-Z0-9]{8,14}$/.test(mref)) return bad("Enter the M-Pesa code from the customer's SMS.");
+        const phoneRaw = String(b.customerPhone || '').replace(/[\s-]/g, ''), phone = kePhone(phoneRaw);
+        if (phoneRaw && !phone) return bad('The customer phone number is not valid.');
+        const who = cashierOf(req);
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const priced = await priceCart(client, req.shop.id, cart.want, true);
+            if (priced.error) { await client.query('ROLLBACK'); return bad(priced.error, priced.code); }
+            const subtotal = priced.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(cart.discountIn, subtotal), total = subtotal - discount;
+            let paid = total, change = 0;
+            if (method === 'cash') {
+                const tendered = String(b.tendered || '').trim() === '' ? null : parseMoney(b.tendered);
+                if (tendered === null || tendered < total) { await client.query('ROLLBACK'); return bad('The cash received is less than the total.'); }
+                paid = tendered; change = tendered - total;
+            }
+            const sale = await insertSale(client, req.shop, req.biz, { lines: priced.lines, discount, method, mref, phone, paid, change, staffId: who.staffId, cashierName: who.name });
+            await client.query('COMMIT');
+            res.json({ ok: true, saleId: sale.id, receiptNo: sale.no, total: sale.total, change, receiptUrl: `/pos/sales/${sale.id}/receipt`, whatsapp: whatsappLink(req.shop, phone, sale.no, sale.total, method) });
+        } catch (err) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw err;
+        } finally { client.release(); }
+    }));
 
-async function darajaPost(apiPath, payload) {
-    const token = await getAccessToken();
-    const resp = await fetch(`${MPESA.baseUrl}${apiPath}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(20000)
-    });
-    let data = {};
-    try { data = await resp.json(); } catch (_) { /* non-JSON body */ }
-    if (!resp.ok) {
-        if (resp.status === 401) tokenCache = { value: null, expiresAt: 0 };
-        const err = new Error(data.errorMessage || data.ResultDesc || `Daraja HTTP ${resp.status}`);
-        err.status = resp.status;
-        throw err;
+    // ----- phone prompt (STK push) through the business's own gateway -----
+    async function loadGateway(where, params) {   // returns the gateway with its secrets decrypted, or null
+        const row = (await q(`SELECT * FROM pos_gateways WHERE ${where} LIMIT 1`, params)).rows[0];
+        if (!row || !vault.enabled) return null;
+        try { return { id: row.id, businessId: row.business_id, provider: row.provider, cfg: row.cfg || {}, secrets: vault.open(row.secrets, `${row.business_id}:${row.provider}`), token: String(row.callback_token).trim(), active: row.active, isDefault: row.is_default }; }
+        catch (e) { console.error('Could not read gateway', row.id + ':', e.message); return null; }
     }
-    return data;
-}
+    const callbackUrlFor = gw => `${publicBaseUrl}/pos/${gw.provider === 'mpesa' ? 'mpesa/cb' : 'paystack/hook'}/${gw.token}`;
 
-async function stkPush(booking) {
-    const timestamp = darajaTimestamp();
-    const data = await darajaPost('/mpesa/stkpush/v1/processrequest', {
-        BusinessShortCode: MPESA.shortcode,
-        Password: darajaPassword(timestamp),
-        Timestamp: timestamp,
-        TransactionType: 'CustomerPayBillOnline',
-        Amount: booking.amount,
-        PartyA: booking.phone,
-        PartyB: MPESA.shortcode,
-        PhoneNumber: booking.phone,
-        CallBackURL: `${MPESA.publicBaseUrl}/payments/cb/${MPESA.callbackSecret}`,
-        AccountReference: booking.accountRef,   // max 12 characters
-        TransactionDesc: booking.desc || 'Survey fee'
-    });
-    if (String(data.ResponseCode) !== '0') throw new Error(data.ResponseDescription || 'STK push was rejected');
-    return data;
-}
+    router.post('/api/pay/start', saleLimiter, ah(async (req, res) => {
+        const bad = (m, code = 400) => res.status(code).json({ error: m });
+        const b = req.body || {};
+        const gw = await loadGateway('business_id=$1 AND active AND provider = ANY($2::text[]) ORDER BY is_default DESC, id', [req.biz.id, LIVE_PROVIDERS]);
+        if (!gw) return bad('Phone prompts are not set up. The owner can add payment credentials under Payment Gateways.');
+        if (!publicBaseUrl.startsWith('https://')) return bad('Phone prompts need the site address (PUBLIC_BASE_URL) to be set to an https address.', 503);
+        const phone = kePhone(b.phone);
+        if (!phone) return bad("The customer's phone number is not valid. Use a Safaricom number such as 0712345678.");
+        const cart = readCart(b);
+        if (cart.error) return bad(cart.error);
+        const priced = await priceCart({ query: q }, req.shop.id, cart.want, false);
+        if (priced.error) return bad(priced.error, priced.code);
+        const subtotal = priced.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(cart.discountIn, subtotal), total = subtotal - discount;
+        const amountKes = Math.ceil(total / 100);   // M-Pesa takes whole shillings
+        if (amountKes < 1) return bad('The total is too small to charge.');
+        const who = cashierOf(req), id = crypto.randomBytes(12).toString('hex');
+        await q('INSERT INTO pos_payments (id, shop_id, gateway_id, staff_id, cashier_name, amount_kes, phone, status, cart) VALUES ($1,$2,$3,$4,$5,$6,$7,\'pending\',$8::jsonb)',
+            [id, req.shop.id, gw.id, who.staffId, who.name, amountKes, phone, JSON.stringify({ lines: priced.lines, discount, customerPhone: phone })]);
+        try {
+            const r = await GW.PROVIDERS[gw.provider].charge(gw, { amountKes, phone, ref: gw.provider === 'mpesa' ? id.slice(0, 12).toUpperCase() : id, desc: 'Sale payment', callbackUrl: callbackUrlFor(gw), email: (req.session.user && req.session.user.email) || 'pos@tencent.invalid' });
+            await q('UPDATE pos_payments SET provider_ref=$2, updated_at=now() WHERE id=$1', [id, r.providerRef]);
+        } catch (e) {
+            console.error('POS prompt failed:', e.message);
+            await q(`UPDATE pos_payments SET status='failed', fail_reason=$2, updated_at=now() WHERE id=$1`, [id, String(e.message).slice(0, 160)]);
+            return bad('The prompt could not be sent: ' + String(e.message).slice(0, 120), 502);
+        }
+        res.json({ ok: true, id, amountKes });
+    }));
 
-async function stkQuery(checkoutRequestId) {
-    const timestamp = darajaTimestamp();
-    return darajaPost('/mpesa/stkpushquery/v1/query', {
-        BusinessShortCode: MPESA.shortcode,
-        Password: darajaPassword(timestamp),
-        Timestamp: timestamp,
-        CheckoutRequestID: checkoutRequestId
-    });
-}
+    const lastCheck = new Map();   // payment id -> when we last asked the gateway
+    router.get('/api/pay/:id', pollLimiter, ah(async (req, res) => {
+        let p = (await q('SELECT * FROM pos_payments WHERE id=$1 AND shop_id=$2', [req.params.id, req.shop.id])).rows[0];
+        if (!p) return res.status(404).json({ status: 'unknown' });
+        if (p.status === 'pending' && p.provider_ref && Date.now() - new Date(p.created_at).getTime() > 20000 && Date.now() - (lastCheck.get(p.id) || 0) > 8000) {
+            lastCheck.set(p.id, Date.now());
+            const gw = await loadGateway('id=$1', [p.gateway_id]);
+            if (gw) {
+                const v = await GW.PROVIDERS[gw.provider].verify(gw, p.provider_ref).catch(() => ({ state: 'pending' }));
+                await applyVerdict(p, v);
+                p = (await q('SELECT * FROM pos_payments WHERE id=$1', [p.id])).rows[0];
+            }
+        }
+        const out = { status: p.status, error: p.fail_reason || '' };
+        if (p.status === 'paid' && p.sale_id) {
+            const s = (await q('SELECT id, receipt_no, total_cents, change_cents, customer_phone FROM pos_sales WHERE id=$1', [p.sale_id])).rows[0];
+            if (s) Object.assign(out, { saleId: s.id, receiptNo: s.receipt_no, total: Number(s.total_cents), change: Number(s.change_cents), receiptUrl: `/pos/sales/${s.id}/receipt`, whatsapp: whatsappLink(req.shop, s.customer_phone, s.receipt_no, Number(s.total_cents), 'mpesa') });
+        }
+        res.set('Cache-Control', 'no-store').json(out);
+    }));
 
-// ---------------------------------------------------------------
-// 8. Bookings in the database
-// ---------------------------------------------------------------
-// One shape used everywhere (the database uses snake_case, the code uses camelCase)
-function rowToBooking(r) {
-    if (!r) return null;
-    return {
-        id: r.id,
-        userId: r.user_id,
-        name: r.name,
-        email: r.email || '',
-        phone: r.phone,
-        service: r.service,
-        location: r.location,
-        amount: Number(r.amount),
-        status: r.status,
-        accountRef: r.account_ref,
-        checkoutRequestId: r.checkout_request_id || '',
-        receipt: r.receipt || '',
-        createdAt: Number(r.created_at),
-        paidAt: r.paid_at ? Number(r.paid_at) : null,
-        receiptSent: Boolean(r.receipt_sent),
-        verified: Boolean(r.verified),
-        baseAmount: r.base_amount == null ? null : Number(r.base_amount),
-        travelKm: r.travel_km == null ? null : Number(r.travel_km),
-        travelFee: r.travel_fee == null ? null : Number(r.travel_fee),
-        urgency: r.urgency || '',
-        urgencyFee: r.urgency_fee == null ? null : Number(r.urgency_fee),
-        geo: r.geo || ''
+    // Turns a confirmed payment into a sale exactly once, from the cart saved when the prompt was sent
+    // (so the sale matches what the customer was charged, even if the cashier has left the screen).
+    async function finalizePayment(id, receipt) {
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const p = (await client.query('SELECT * FROM pos_payments WHERE id=$1 FOR UPDATE', [id])).rows[0];
+            if (!p || p.sale_id) { await client.query('ROLLBACK'); return; }
+            const shop = (await client.query('SELECT * FROM pos_shops WHERE id=$1', [p.shop_id])).rows[0];
+            const biz = shop.parent_id ? (await client.query('SELECT * FROM pos_shops WHERE id=$1', [shop.parent_id])).rows[0] : shop;
+            const cart = p.cart, mref = String(receipt || '').slice(0, 20) || null;
+            const sale = await insertSale(client, shop, biz, { lines: cart.lines, discount: cart.discount, method: 'mpesa', mref, phone: cart.customerPhone || '', paid: p.amount_kes * 100, change: 0, staffId: p.staff_id, cashierName: p.cashier_name });
+            await client.query(`UPDATE pos_payments SET status='paid', receipt=$2, sale_id=$3, updated_at=now() WHERE id=$1`, [id, String(receipt || '').slice(0, 40), sale.id]);
+            await client.query('COMMIT');
+            if (sale.oversold.length) await auditRaw(shop.parent_id || shop.id, shop.id, 'system', null, '', 'stock.negative', 'Paid sale after stock ran out: ' + sale.oversold.join(', '), '');
+            await auditRaw(shop.parent_id || shop.id, shop.id, 'system', null, '', 'payment.sale', `receipt #${sale.no} code ${mref || ''}`, '');
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+    }
+    const setPaymentState = (id, status, reason) => q(`UPDATE pos_payments SET status=$2, fail_reason=$3, updated_at=now() WHERE id=$1 AND status IN ('pending','review')`, [id, status, String(reason || '').slice(0, 160)]);
+    async function applyVerdict(p, v) {   // v comes from the gateway's own "check this payment" call
+        if (v.state === 'paid') {
+            if ((v.amountKes != null && v.amountKes !== p.amount_kes) || (v.currency && v.currency !== 'KES')) { await setPaymentState(p.id, 'review', 'Amount paid does not match the sale'); return; }
+            await finalizePayment(p.id, v.receipt || '');
+        } else if (v.state === 'failed') await setPaymentState(p.id, 'failed', v.reason || 'Payment not completed');
+    }
+    async function gatewayCallback(provider, token, body) {
+        if (!/^[a-f0-9]{48}$/.test(String(token))) return;
+        const gw = await loadGateway('callback_token=$1 AND provider=$2', [token, provider]);
+        if (!gw) return;
+        const prov = GW.PROVIDERS[provider], cb = prov.parseCallback(body);
+        if (!cb) return;
+        const p = (await q('SELECT * FROM pos_payments WHERE provider_ref=$1 AND gateway_id=$2', [cb.providerRef, gw.id])).rows[0];
+        if (!p || p.status === 'paid') return;
+        if (cb.hintOnly) return applyVerdict(p, await prov.verify(gw, p.provider_ref));   // webhook is only a nudge: ask the gateway for the truth
+        if (!cb.succeeded) return setPaymentState(p.id, 'failed', cb.reason || 'Payment not completed');
+        if (cb.amountKes !== null && cb.amountKes !== p.amount_kes) return setPaymentState(p.id, 'review', 'Amount paid does not match the sale');
+        // The callback address contains a secret, but a leaked secret must not be enough to fake a payment:
+        // a sale is only saved when the payment company itself confirms it. If it cannot confirm yet, the payment
+        // stays pending and the background check keeps asking (see sweep).
+        const v = await prov.verify(gw, p.provider_ref).catch(() => ({ state: 'pending' }));
+        if (v.state === 'failed') return setPaymentState(p.id, 'review', 'Callback and status check disagree');
+        if (v.state !== 'paid') return;
+        await finalizePayment(p.id, cb.receipt || v.receipt);
+    }
+
+    // ----- sales history, receipts, void -----
+    router.get('/sales', ah(async (req, res) => {
+        const mine = req.actor.role === 'cashier';
+        const from = validDate(req.query.from) ? req.query.from : addDays(todayNairobi(), -6), to = validDate(req.query.to) ? req.query.to : todayNairobi();
+        const params = [req.shop.id, from, to]; if (mine) params.push(req.actor.staffId);
+        const r = await q(`SELECT id, receipt_no, total_cents, method, mpesa_ref, status, cashier_name, created_at FROM pos_sales WHERE shop_id=$1 AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3${mine ? ' AND staff_id=$4' : ''} ORDER BY created_at DESC LIMIT 500`, params);
+        const sum = r.rows.filter(s => s.status === 'completed').reduce((a, s) => a + Number(s.total_cents), 0);
+        send(req, res, { title: mine ? 'My Sales' : 'Sales History', nav: 'sales', body: `<h1>${mine ? 'My Sales' : 'Sales History'}</h1>${notice(req)}
+        <div class="panel"><form method="GET" class="row"><div><label for="f">From</label><input id="f" type="date" name="from" value="${from}"></div><div><label for="t">To</label><input id="t" type="date" name="to" value="${to}"></div><button class="btn dark" type="submit">Show</button></form><p class="muted" style="margin:10px 0 0">${r.rows.length} sale${r.rows.length === 1 ? '' : 's'}, completed total <b>${kes(sum)}</b></p></div>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Receipt</th><th>When</th><th>Method</th>${mine ? '' : '<th>Cashier</th>'}<th class="num">Total</th><th>Status</th><th></th></tr>${r.rows.map(s => `<tr><td>#${s.receipt_no}</td><td class="nowrap">${esc(timeFmt(s.created_at))}</td><td>${s.method === 'mpesa' ? 'M-Pesa ' + esc(s.mpesa_ref || '') : 'Cash'}</td>${mine ? '' : `<td>${esc(s.cashier_name || '')}</td>`}<td class="num">${fmt(s.total_cents)}</td><td>${s.status === 'voided' ? '<span class="tag bad">voided</span>' : '<span class="tag ok">completed</span>'}</td><td class="right"><a class="btn small ghost" href="/pos/sales/${s.id}/receipt">Receipt</a></td></tr>`).join('')}</table>` : '<p class="muted">No sales in this period.</p>'}</div>` });
+    }));
+    const getSale = async (req, idParam) => {
+        const id = parseCount(idParam, { min: 1 });
+        if (!id) return null;
+        const s = (await q('SELECT * FROM pos_sales WHERE id=$1 AND shop_id=$2 AND ($3::int IS NULL OR staff_id = $3)', [id, req.shop.id, req.actor.role === 'cashier' ? req.actor.staffId : null])).rows[0];
+        if (!s) return null;
+        s.lines = (await q('SELECT name, qty, unit_price_cents FROM pos_sale_items WHERE sale_id=$1 ORDER BY id', [s.id])).rows;
+        return s;
     };
-}
-const BOOKING_SELECT = `SELECT b.*, COALESCE(u.email, '') AS email FROM bookings b LEFT JOIN users u ON u.id = b.user_id`;
-const getBooking = async id => rowToBooking((await pool.query(`${BOOKING_SELECT} WHERE b.id = $1`, [id])).rows[0]);
-const getBookingByCheckout = async cid => rowToBooking((await pool.query(`${BOOKING_SELECT} WHERE b.checkout_request_id = $1`, [cid])).rows[0]);
-const getBookingForUser = async (id, userId) => rowToBooking((await pool.query(`${BOOKING_SELECT} WHERE b.id = $1 AND b.user_id = $2`, [id, userId])).rows[0]);
-const listBookings = async userId => (await pool.query(`${BOOKING_SELECT} WHERE b.user_id = $1 ORDER BY b.created_at DESC LIMIT 100`, [userId])).rows.map(rowToBooking);
-const validBookingId = id => /^[0-9a-f-]{8,64}$/i.test(String(id || ''));
+    router.get('/sales/:id/receipt', ah(async (req, res) => {
+        const s = await getSale(req, req.params.id);
+        if (!s) return send(req, res, { title: 'Not found', nav: 'sales', body: '<h1>Receipt not found</h1><a href="/pos/sales">Back to sales</a>' }, 404);
+        const sh = req.shop, biz = req.biz, isBranch = sh.id !== biz.id, canVoid = req.actor.role !== 'cashier';
+        const logo = biz.logo && LOGO_OK.test(biz.logo) ? `<img src="${biz.logo}" alt="" style="max-height:72px;max-width:230px;margin-bottom:6px"><br>` : '';
+        const vat = Number(s.vat_cents), net = Number(s.total_cents) - vat, phone = sh.phone || biz.phone;
+        const body = `<div class="noprint" style="margin-bottom:14px"><button class="btn" id="prt" type="button">Print / Save as PDF</button> <a class="btn ghost" href="/pos/sales">Back to sales</a> ${canVoid && s.status === 'completed' ? `<form action="/pos/sales/${s.id}/void" method="POST" style="display:inline"><input name="reason" placeholder="Reason for voiding" maxlength="200" required style="width:220px;display:inline-block"> <button class="btn bad small" type="submit">Void sale</button></form>` : ''}</div>
+        <div class="panel" style="max-width:380px;margin:0 auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.88rem">
+            <div style="text-align:center">${logo}<b style="font-size:1.1rem">${esc(biz.name)}</b>${isBranch ? '<br><b>' + esc(sh.name) + '</b>' : ''}<br>${esc(sh.address)}${phone ? '<br>Tel ' + esc(phone) : ''}${biz.tax_pin ? '<br>PIN ' + esc(biz.tax_pin) : ''}</div>
+            <hr><div>Receipt #${s.receipt_no}${s.status === 'voided' ? ' <b>(VOIDED)</b>' : ''}<br>${esc(timeFmt(s.created_at))}${s.cashier_name ? '<br>Served by: ' + esc(s.cashier_name) : ''}</div><hr>
+            <table style="font-size:.88rem">${s.lines.map(l => `<tr><td style="border:0;padding:3px 0">${esc(l.name)}<br><span class="muted">${l.qty} x ${fmt(l.unit_price_cents)}</span></td><td class="num" style="border:0;padding:3px 0">${fmt(Number(l.unit_price_cents) * l.qty)}</td></tr>`).join('')}</table><hr>
+            <div class="tot"><span>Subtotal</span><span>${fmt(s.subtotal_cents)}</span></div>${Number(s.discount_cents) ? `<div class="tot"><span>Discount</span><span>-${fmt(s.discount_cents)}</span></div>` : ''}
+            <div class="tot big"><span>TOTAL</span><span>KES ${fmt(s.total_cents)}</span></div>
+            ${vat > 0 ? `<div class="tot"><span>Amount excluding VAT</span><span>${fmt(net)}</span></div><div class="tot"><span>VAT ${VAT_RATE}% (included)</span><span>${fmt(vat)}</span></div>` : ''}
+            <div class="tot"><span>Paid (${s.method === 'mpesa' ? 'M-Pesa' : 'Cash'})</span><span>${fmt(s.paid_cents)}</span></div>${s.method === 'mpesa' ? `<div class="tot"><span>M-Pesa code</span><span>${esc(s.mpesa_ref || '')}</span></div>` : ''}${Number(s.change_cents) ? `<div class="tot"><span>Change</span><span>${fmt(s.change_cents)}</span></div>` : ''}
+            ${s.status === 'voided' ? `<hr><div>Voided: ${esc(s.void_reason || '')}</div>` : ''}<hr><div style="text-align:center">${esc(sh.receipt_footer)}</div>
+            <div style="text-align:center;margin-top:8px;font-size:.75rem" class="muted">Powered by Tencent POS</div>
+        </div>
+        <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>`;
+        send(req, res, { title: 'Receipt #' + s.receipt_no, nav: 'sales', body });
+    }));
+    // Voiding a sale puts the stock back. Managers can only ASK: the owner approves.
+    async function voidSale(shopId, id, reason) {
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const s = (await client.query(`UPDATE pos_sales SET status='voided', void_reason=$3, voided_at=now() WHERE id=$1 AND shop_id=$2 AND status='completed' RETURNING id, receipt_no`, [id, shopId, reason])).rows[0];
+            if (s) {
+                const lines = (await client.query(`SELECT si.item_id, si.qty FROM pos_sale_items si JOIN pos_items i ON i.id = si.item_id AND i.shop_id=$2 AND i.track_stock WHERE si.sale_id=$1 ORDER BY si.item_id`, [id, shopId])).rows;
+                for (const l of lines) {
+                    const nb = (await client.query('UPDATE pos_items SET stock = stock + $2 WHERE id=$1 AND shop_id=$3 RETURNING stock', [l.item_id, l.qty, shopId])).rows[0].stock;
+                    await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note, sale_id) VALUES ($1,$2,$3,$4,'void',$5,$6)`, [shopId, l.item_id, l.qty, nb, 'Voided receipt #' + s.receipt_no, id]);
+                }
+            }
+            await client.query('COMMIT');
+            return s || null;
+        } catch (err) { await client.query('ROLLBACK').catch(() => {}); throw err; } finally { client.release(); }
+    }
+    router.post('/sales/:id/void', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const reason = str(req.body.reason).slice(0, 200) || 'No reason given';
+        if (!id) return res.redirect('/pos/sales');
+        const sale = (await q(`SELECT id, receipt_no, status FROM pos_sales WHERE id=$1 AND shop_id=$2`, [id, req.shop.id])).rows[0];
+        if (!sale || sale.status !== 'completed') return res.redirect('/pos/sales');
+        if (req.actor.role === 'owner') {
+            await voidSale(req.shop.id, id, reason);
+            await audit(req, 'sale.void', `receipt #${sale.receipt_no}: ${reason}`);
+            return res.redirect(`/pos/sales/${id}/receipt`);
+        }
+        try {
+            await q(`INSERT INTO pos_void_requests (shop_id, sale_id, reason, requested_by, staff_id) VALUES ($1,$2,$3,$4,$5)`, [req.shop.id, id, reason, req.actor.name || '', req.actor.staffId]);
+            await audit(req, 'void.request', `receipt #${sale.receipt_no}: ${reason}`);
+        } catch (e) { if (e.code !== '23505') throw e; }   // already waiting for the owner
+        res.redirect(`/pos/sales/${id}/receipt?ok=` + encodeURIComponent('Sent to the owner for approval. The sale stays as it is until then.'));
+    }));
+    router.get('/voids', ah(async (req, res) => {
+        const rows = (await q(`SELECT v.id, v.reason, v.requested_by, v.status, v.created_at, v.decided_by, s.receipt_no, s.total_cents, sh.name AS shop FROM pos_void_requests v JOIN pos_sales s ON s.id = v.sale_id JOIN pos_shops sh ON sh.id = v.shop_id WHERE sh.id=$1 OR sh.parent_id=$1 ORDER BY (v.status='pending') DESC, v.id DESC LIMIT 60`, [req.biz.id])).rows;
+        send(req, res, { title: 'Void Requests', nav: 'voids', body: `<h1>Void Requests</h1>${notice(req)}<p class="muted">Managers cannot cancel a sale on their own: they ask here, and the stock goes back only after you approve.</p>
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>When</th><th>Branch</th><th>Receipt</th><th class="num">Total</th><th>Asked by</th><th>Reason</th><th></th></tr>${rows.map(v => `<tr><td class="nowrap">${esc(timeFmt(v.created_at))}</td><td>${esc(v.shop)}</td><td>#${v.receipt_no}</td><td class="num">${fmt(v.total_cents)}</td><td>${esc(v.requested_by)}</td><td>${esc(v.reason)}</td><td class="right nowrap">${v.status === 'pending' ? `<form action="/pos/voids/${v.id}/approve" method="POST" style="display:inline"><button class="btn small ok">Approve</button></form> <form action="/pos/voids/${v.id}/reject" method="POST" style="display:inline"><button class="btn small ghost">Reject</button></form>` : `<span class="tag ${v.status === 'approved' ? 'ok' : 'gray'}">${esc(v.status)}</span>`}</td></tr>`).join('')}</table>` : '<p class="muted">No requests.</p>'}</div>` });
+    }));
+    const decideVoid = (name, status) => router.post('/voids/:id/' + name, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const v = id && (await q(`UPDATE pos_void_requests SET status=$3, decided_at=now(), decided_by=$4 WHERE id=$1 AND status='pending' AND shop_id IN (SELECT id FROM pos_shops WHERE id=$2 OR parent_id=$2) RETURNING shop_id, sale_id, reason`, [id, req.biz.id, status, req.actor.name || 'Owner'])).rows[0];
+        if (v && status === 'approved') await voidSale(v.shop_id, v.sale_id, v.reason + ' (approved by owner)');
+        if (v) await audit(req, 'void.' + status, 'request #' + id);
+        res.redirect('/pos/voids?ok=' + encodeURIComponent(v ? 'Done.' : 'That request was already handled.'));
+    }));
+    decideVoid('approve', 'approved'); decideVoid('reject', 'rejected');
 
-function bookingFields(b, extra = {}) {
-    return {
-        Name: b.name,
-        Phone: b.phone,
-        Email: b.email || '',
-        Service: b.service,
-        Location: b.location,
-        Amount: `KES ${b.amount}`,
-        ...(b.baseAmount == null ? {} : {
-            'Service fee': `KES ${b.baseAmount}`,
-            'Travel fare': `KES ${b.travelFee || 0} (about ${b.travelKm} km from Rangwe)`,
-            Urgency: `${b.urgency || 'standard'}${b.urgencyFee ? ' (+KES ' + b.urgencyFee + ')' : ''}`
-        }),
-        ...(b.geo ? { 'Map pin': `https://www.google.com/maps?q=${b.geo}` } : {}),
-        Reference: b.accountRef,
-        ...extra
+    // ----- audit log page -----
+    router.get('/audit', ah(async (req, res) => {
+        const pageNo = Math.max(1, parseCount(req.query.page || '1', { min: 1, max: 100000 }) || 1), per = 100;
+        const pre = str(req.query.action).replace(/[^a-z0-9._]/g, '').slice(0, 30);
+        const rows = (await q(`SELECT created_at, actor_kind, actor_name, action, detail, ip, shop_id FROM pos_audit WHERE business_id=$1 AND ($2 = '' OR action LIKE $2 || '%') ORDER BY id DESC LIMIT $3 OFFSET $4`, [req.biz.id, pre, per + 1, (pageNo - 1) * per])).rows;
+        send(req, res, { title: 'Audit Log', nav: 'audit', body: `<h1>Audit Log</h1><p class="muted">A permanent record of sensitive actions. Nobody, including you, can edit or delete it.</p>
+        <div class="panel"><form method="GET" class="row"><div><label for="a">Show only</label><select id="a" name="action"><option value="">Everything</option>${['sale', 'void', 'staff', 'gateway', 'payment', '2fa', 'branch', 'settings', 'sub', 'stock'].map(x => `<option value="${x}" ${pre === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div><button class="btn dark" type="submit">Filter</button></form></div>
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>When</th><th>Who</th><th>Action</th><th>Details</th><th>Network</th></tr>${rows.slice(0, per).map(r => `<tr><td class="nowrap">${esc(timeFmt(r.created_at))}</td><td>${esc(r.actor_name || r.actor_kind)}<br><small class="muted">${esc(r.actor_kind)}</small></td><td>${esc(r.action)}</td><td>${esc(r.detail)}</td><td><small>${esc(r.ip)}</small></td></tr>`).join('')}</table>` : '<p class="muted">Nothing recorded yet.</p>'}
+        <p>${pageNo > 1 ? `<a class="btn small ghost" href="/pos/audit?page=${pageNo - 1}&action=${esc(pre)}">Newer</a> ` : ''}${rows.length > per ? `<a class="btn small ghost" href="/pos/audit?page=${pageNo + 1}&action=${esc(pre)}">Older</a>` : ''}</p></div>` });
+    }));
+
+    // ----- two-step login: set-up page -----
+    router.get('/security', ah(async (req, res) => {
+        const uid = req.session.user.id, row = (await q('SELECT secret, enabled FROM pos_owner_security WHERE user_id=$1', [uid])).rows[0];
+        let body;
+        if (!vault.enabled) body = '<div class="alert" role="alert">Two-step login needs POS_CRED_KEY to be set on the server first.</div>';
+        else if (row && row.enabled) body = `<div class="panel" style="max-width:620px"><h2>Two-step login is ON <span class="tag ok">protected</span></h2><p>Every time you open the POS you type a code from your authenticator app. Payment settings need a fresh code.</p>
+            <form action="/pos/security/disable" method="POST" class="row"><div><label for="o">To turn it off, enter a current code</label><input id="o" name="otp" inputmode="numeric" required maxlength="20" autocomplete="one-time-code"></div><button class="btn bad" type="submit">Turn off</button></form></div>`;
+        else if (row) {
+            const sec = vault.open(row.secret, '2fa:' + uid).s;
+            body = `<div class="panel" style="max-width:620px"><h2>Finish setting up</h2><ol style="line-height:1.8"><li>Install an authenticator app (Google Authenticator, Microsoft Authenticator or Authy).</li><li>Add an account and choose <i>Enter a setup key</i>. Account: <b>${esc(req.session.user.email || 'Tencent POS')}</b>, key: <b style="letter-spacing:.08em;word-break:break-all">${esc(sec.match(/.{1,4}/g).join(' '))}</b>, type: time based.</li><li>Type the 6-digit code it shows below.</li></ol>
+            <form action="/pos/security/enable" method="POST" class="row"><div><label for="c">6-digit code</label><input id="c" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code"></div><button class="btn ok" type="submit">Turn on</button></form>
+            <p class="muted">Phone with the key? On the phone itself you can tap this link to add it: <a href="${esc(SEC.otpauthUri(req.session.user.email || 'owner', sec))}">open in authenticator</a>.</p></div>`;
+        } else body = '<div class="panel" style="max-width:620px"><h2>Two-step login is OFF</h2><p>A stolen or guessed password would give a stranger your whole business, including where your M-Pesa money is sent. Two-step login stops that. It is required to change payment settings.</p><form action="/pos/security/start" method="POST"><button class="btn ok" type="submit">Set up two-step login</button></form></div>';
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Security</h1>${notice(req)}${errBox(req)}${body}` });
+    }));
+    router.post('/security/start', ah(async (req, res) => {
+        if (!vault.enabled || req.has2fa) return back(res, '/pos/security', '', req.has2fa ? 'Already on.' : 'Two-step login needs POS_CRED_KEY to be set on the server.');
+        const uid = req.session.user.id;
+        await q(`INSERT INTO pos_owner_security (user_id, secret, enabled) VALUES ($1,$2,FALSE) ON CONFLICT (user_id) DO UPDATE SET secret=EXCLUDED.secret, enabled=FALSE, last_counter=0, recovery='[]'::jsonb`, [uid, vault.seal({ s: SEC.newTotpSecret() }, '2fa:' + uid)]);
+        res.redirect('/pos/security');
+    }));
+    router.post('/security/enable', ah(async (req, res) => {
+        const uid = req.session.user.id, kUser = '2fa:' + uid;
+        if (await failLocked([kUser])) return back(res, '/pos/security', '', 'Too many wrong codes. Wait 15 minutes.');
+        const row = (await q('SELECT secret, enabled FROM pos_owner_security WHERE user_id=$1', [uid])).rows[0];
+        const counter = row && !row.enabled ? SEC.checkTotp(vault.open(row.secret, '2fa:' + uid).s, req.body.otp, 0) : null;
+        if (!counter) { await failHit(kUser, 5, 900, 900); return back(res, '/pos/security', '', 'That code is not right. Check the phone clock is automatic and try the newest code.'); }
+        const codes = SEC.newRecoveryCodes(8);
+        await q('UPDATE pos_owner_security SET enabled=TRUE, last_counter=$2, recovery=$3::jsonb WHERE user_id=$1', [uid, counter, JSON.stringify(codes.map(SEC.hashRecovery))]);
+        req.session.pos2faAt = Date.now(); req.session.posStepAt = Date.now();
+        await saveSess(req);
+        await audit(req, '2fa.enabled', '');
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Two-step login is on</h1><div class="panel" style="max-width:620px"><h2>Save your recovery codes</h2><p>If you lose your phone, each of these codes works once instead of the app code. <b>They are shown only now.</b> Write them down and keep them somewhere safe.</p><pre style="font-size:1.1rem;line-height:1.8">${codes.map(esc).join('\n')}</pre><a class="btn" href="/pos/security">I have saved them</a></div>` });
+    }));
+    router.post('/security/disable', ah(async (req, res) => {
+        const r = await verifyOwnerOtp(req, req.body.otp);
+        if (!r.ok) return back(res, '/pos/security', '', r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.');
+        await q('DELETE FROM pos_owner_security WHERE user_id=$1', [req.session.user.id]);
+        await audit(req, '2fa.disabled', '');
+        back(res, '/pos/security', 'Two-step login turned off.');
+    }));
+
+    // ----- daily report (Z-report) -----
+    async function periodSummary(shopId, from, to) {
+        const f = `(created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3`;
+        const [s, v, p, e, top] = await Promise.all([
+            q(`SELECT count(*)::int n, COALESCE(sum(subtotal_cents),0)::bigint gross, COALESCE(sum(discount_cents),0)::bigint disc, COALESCE(sum(total_cents),0)::bigint total, COALESCE(sum(vat_cents),0)::bigint vat,
+                      COALESCE(sum(total_cents) FILTER (WHERE method='cash'),0)::bigint cash, COALESCE(sum(total_cents) FILTER (WHERE method='mpesa'),0)::bigint mpesa
+               FROM pos_sales WHERE shop_id=$1 AND status='completed' AND ${f}`, [shopId, from, to]),
+            q(`SELECT count(*)::int n, COALESCE(sum(total_cents),0)::bigint total FROM pos_sales WHERE shop_id=$1 AND status='voided' AND ${f}`, [shopId, from, to]),
+            q(`SELECT COALESCE(sum((si.unit_price_cents - si.unit_cost_cents) * si.qty),0)::bigint profit, COALESCE(sum(si.qty),0)::int units FROM pos_sale_items si JOIN pos_sales s ON s.id = si.sale_id WHERE s.shop_id=$1 AND s.status='completed' AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3`, [shopId, from, to]),
+            q(`SELECT COALESCE(sum(amount_cents),0)::bigint total FROM pos_expenses WHERE shop_id=$1 AND spent_on BETWEEN $2 AND $3`, [shopId, from, to]),
+            q(`SELECT si.name, sum(si.qty)::int qty, sum(si.qty * si.unit_price_cents)::bigint revenue FROM pos_sale_items si JOIN pos_sales s ON s.id = si.sale_id WHERE s.shop_id=$1 AND s.status='completed' AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 GROUP BY si.name ORDER BY qty DESC, revenue DESC LIMIT 10`, [shopId, from, to])
+        ]);
+        const S = s.rows[0], P = p.rows[0], E = e.rows[0];
+        // profit is measured after discounts and without VAT (the VAT inside the prices belongs to KRA, not to the shop)
+        const gross = Number(P.profit) - Number(S.disc) - Number(S.vat);
+        return { S, V: v.rows[0], units: P.units, gross, expenses: Number(E.total), net: gross - Number(E.total), top: top.rows };
+    }
+    router.get('/daily', ah(async (req, res) => {
+        const day = validDate(req.query.date) ? req.query.date : todayNairobi();
+        const r = await periodSummary(req.shop.id, day, day);
+        const row = (k, v, strong) => `<tr><td>${strong ? '<b>' + k + '</b>' : k}</td><td class="num">${strong ? '<b>' + v + '</b>' : v}</td></tr>`;
+        send(req, res, { title: 'Daily Sales', nav: 'daily', body: `<h1>Daily Sales (Z-Report)</h1>
+        <div class="panel noprint"><form method="GET" class="row"><div><label for="d">Date</label><input id="d" type="date" name="date" value="${day}"></div><button class="btn dark" type="submit">Show</button><button class="btn" type="button" id="prt">Print</button></form></div>
+        <div class="panel" style="max-width:560px"><h2>${esc(req.shop.name)}: ${esc(dateFmt(day + 'T12:00:00+03:00'))}</h2><table>
+            ${row('Number of sales', r.S.n)}${row('Items sold', r.units)}${row('Sales before discounts', kes(r.S.gross))}${row('Discounts given', '-' + kes(r.S.disc))}${row('Total sales', kes(r.S.total), true)}${row('Sales excluding VAT', kes(Number(r.S.total) - Number(r.S.vat)))}${row('VAT collected (' + VAT_RATE + '%, included in prices)', kes(r.S.vat))}
+            ${row('Cash sales (expected in the drawer)', kes(r.S.cash))}${row('M-Pesa sales', kes(r.S.mpesa))}${row('Voided sales (' + r.V.n + ')', kes(r.V.total))}
+            ${row('Gross profit', kes(r.gross))}${row('Expenses', kes(r.expenses))}${row('Net profit', (r.net < 0 ? '-' : '') + kes(Math.abs(r.net)), true)}</table></div>
+        <div class="panel" style="max-width:560px"><h2>Best sellers</h2>${r.top.length ? `<table><tr><th>Item</th><th class="num">Qty</th><th class="num">Sales</th></tr>${r.top.map(t => `<tr><td>${esc(t.name)}</td><td class="num">${t.qty}</td><td class="num">${fmt(t.revenue)}</td></tr>`).join('')}</table>` : '<p class="muted">No sales on this day.</p>'}</div>
+        <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>` });
+    }));
+
+    // ----- expenses -----
+    router.get('/expenses', ah(async (req, res) => {
+        const from = validDate(req.query.from) ? req.query.from : todayNairobi().slice(0, 8) + '01', to = validDate(req.query.to) ? req.query.to : todayNairobi();
+        const [rows, cats] = await Promise.all([
+            q('SELECT id, category, amount_cents, note, spent_on FROM pos_expenses WHERE shop_id=$1 AND spent_on BETWEEN $2 AND $3 ORDER BY spent_on DESC, id DESC LIMIT 500', [req.shop.id, from, to]),
+            q('SELECT DISTINCT category FROM pos_expenses WHERE shop_id=$1 ORDER BY category LIMIT 50', [req.shop.id])
+        ]);
+        const total = rows.rows.reduce((a, e) => a + Number(e.amount_cents), 0);
+        const err = req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 160))}</div>` : '';
+        send(req, res, { title: 'Expenses', nav: 'expenses', body: `<h1>Expenses</h1>${notice(req)}${err}
+        <div class="panel"><h2>Add an expense</h2><form action="/pos/expenses" method="POST"><div class="grid2">
+            <div class="field"><label for="c">Category</label><input id="c" name="category" list="cl" required maxlength="60" placeholder="e.g. Rent, Transport, Electricity"><datalist id="cl">${['Rent', 'Transport', 'Electricity', 'Wages', 'Licences', 'Packaging', 'Airtime', 'Other'].concat(cats.rows.map(c => c.category)).map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
+            <div class="field"><label for="a">Amount (KES)</label><input id="a" name="amount" required inputmode="decimal"></div>
+            <div class="field"><label for="d">Date</label><input id="d" type="date" name="date" value="${todayNairobi()}" required></div>
+            <div class="field"><label for="n">Note (optional)</label><input id="n" name="note" maxlength="200"></div></div><button class="btn" type="submit">Save expense</button></form></div>
+        <div class="panel"><form method="GET" class="row"><div><label for="f">From</label><input id="f" type="date" name="from" value="${from}"></div><div><label for="t">To</label><input id="t" type="date" name="to" value="${to}"></div><button class="btn dark" type="submit">Show</button></form><p class="muted" style="margin:10px 0 0">Total for this period: <b>${kes(total)}</b></p></div>
+        <div class="panel tablewrap">${rows.rows.length ? `<table><tr><th>Date</th><th>Category</th><th>Note</th><th class="num">Amount</th><th></th></tr>${rows.rows.map(e => `<tr><td class="nowrap">${esc(dateFmt(String(e.spent_on instanceof Date ? e.spent_on.toISOString().slice(0, 10) : e.spent_on).slice(0, 10) + 'T12:00:00+03:00'))}</td><td>${esc(e.category)}</td><td>${esc(e.note)}</td><td class="num">${fmt(e.amount_cents)}</td><td class="right"><form action="/pos/expenses/${e.id}/delete" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form></td></tr>`).join('')}</table>` : '<p class="muted">No expenses in this period.</p>'}</div>` });
+    }));
+    router.post('/expenses', ah(async (req, res) => {
+        const category = str(req.body.category).slice(0, 60), amount = parseMoney(req.body.amount), date = req.body.date;
+        if (!category || amount === null || amount <= 0 || !validDate(date)) return res.redirect('/pos/expenses?err=' + encodeURIComponent('Please enter a category, a valid amount and a date.'));
+        await q('INSERT INTO pos_expenses (shop_id, category, amount_cents, note, spent_on) VALUES ($1,$2,$3,$4,$5)', [req.shop.id, category, amount, str(req.body.note).slice(0, 200), date]);
+        res.redirect('/pos/expenses?ok=' + encodeURIComponent('Expense saved.'));
+    }));
+    router.post('/expenses/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_expenses WHERE id=$1 AND shop_id=$2', [id, req.shop.id]);
+        res.redirect('/pos/expenses?ok=' + encodeURIComponent('Expense deleted.'));
+    }));
+
+    // ----- reports -----
+    router.get('/reports', ah(async (req, res) => {
+        const today = todayNairobi();
+        const from = validDate(req.query.from) ? req.query.from : today.slice(0, 8) + '01', to = validDate(req.query.to) ? req.query.to : today;
+        const [r, days] = await Promise.all([
+            periodSummary(req.shop.id, from, to),
+            q(`SELECT (created_at AT TIME ZONE '${TZ}')::date AS d, count(*)::int n, sum(total_cents)::bigint total FROM pos_sales WHERE shop_id=$1 AND status='completed' AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 GROUP BY 1 ORDER BY 1 DESC LIMIT 366`, [req.shop.id, from, to])
+        ]);
+        const isoDay = d => (d instanceof Date ? new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString() : String(d)).slice(0, 10);
+        send(req, res, { title: 'Reports', nav: 'reports', body: `<h1>Reports</h1>
+        <div class="panel"><form method="GET" class="row"><div><label for="f">From</label><input id="f" type="date" name="from" value="${from}"></div><div><label for="t">To</label><input id="t" type="date" name="to" value="${to}"></div><button class="btn dark" type="submit">Show</button><a class="btn ghost" href="/pos/reports.csv?from=${from}&to=${to}">Download CSV</a></form></div>
+        <div class="cards"><div class="stat c1"><span>Total sales</span><b>${kes(r.S.total)}</b><span>${r.S.n} sales</span></div><div class="stat c3"><span>Gross profit</span><b>${kes(r.gross)}</b></div><div class="stat c4"><span>Expenses</span><b>${kes(r.expenses)}</b></div><div class="stat ${r.net >= 0 ? 'c2' : 'c9'}"><span>Net profit</span><b>${r.net < 0 ? '-' : ''}${kes(Math.abs(r.net))}</b></div><div class="stat c6"><span>VAT collected</span><b>${kes(r.S.vat)}</b></div><div class="stat c7"><span>Cash</span><b>${kes(r.S.cash)}</b></div><div class="stat c5"><span>M-Pesa</span><b>${kes(r.S.mpesa)}</b></div></div>
+        <div class="grid2" style="align-items:start"><div class="panel"><h2>Best sellers</h2>${r.top.length ? `<table><tr><th>Item</th><th class="num">Qty</th><th class="num">Sales</th></tr>${r.top.map(t => `<tr><td>${esc(t.name)}</td><td class="num">${t.qty}</td><td class="num">${fmt(t.revenue)}</td></tr>`).join('')}</table>` : '<p class="muted">No sales in this period.</p>'}</div>
+        <div class="panel"><h2>Sales by day</h2>${days.rows.length ? `<div class="tablewrap"><table><tr><th>Day</th><th class="num">Sales</th><th class="num">Total</th></tr>${days.rows.map(d => `<tr><td>${esc(dateFmt(isoDay(d.d) + 'T12:00:00+03:00'))}</td><td class="num">${d.n}</td><td class="num">${fmt(d.total)}</td></tr>`).join('')}</table></div>` : '<p class="muted">No sales in this period.</p>'}</div></div>` });
+    }));
+    router.get('/reports.csv', ah(async (req, res) => {
+        const today = todayNairobi();
+        const from = validDate(req.query.from) ? req.query.from : today.slice(0, 8) + '01', to = validDate(req.query.to) ? req.query.to : today;
+        const r = await q(`SELECT s.receipt_no, s.created_at, s.method, s.mpesa_ref, s.subtotal_cents, s.discount_cents, s.total_cents, s.vat_cents, s.cashier_name, s.status, string_agg(si.name || ' x' || si.qty, '; ' ORDER BY si.id) AS items
+            FROM pos_sales s LEFT JOIN pos_sale_items si ON si.sale_id = s.id WHERE s.shop_id=$1 AND (s.created_at AT TIME ZONE '${TZ}')::date BETWEEN $2 AND $3 GROUP BY s.id ORDER BY s.created_at`, [req.shop.id, from, to]);
+        const lines = [['Receipt', 'Date', 'Method', 'M-Pesa code', 'Subtotal', 'Discount', 'Total', 'VAT included', 'Cashier', 'Status', 'Items'].map(csvCell).join(',')];
+        for (const s of r.rows) lines.push([s.receipt_no, timeFmt(s.created_at), s.method, s.mpesa_ref || '', (s.subtotal_cents / 100).toFixed(2), (s.discount_cents / 100).toFixed(2), (s.total_cents / 100).toFixed(2), (s.vat_cents / 100).toFixed(2), s.cashier_name || '', s.status, s.items || ''].map(csvCell).join(','));
+        res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="sales-${from}-to-${to}.csv"`, 'Cache-Control': 'no-store' }).send('﻿' + lines.join('\r\n'));
+    }));
+
+    // ----- settings (owner only) -----
+    router.get('/settings', ah(async (req, res) => {
+        const s = req.shop, b = req.biz, isBranch = s.id !== b.id;
+        const logo = b.logo && LOGO_OK.test(b.logo) ? b.logo : '';
+        send(req, res, { title: 'Shop Settings', nav: 'settings', body: `<h1>Shop Settings</h1>${notice(req)}${errBox(req)}
+        <div class="panel" style="max-width:620px"><h2>${isBranch ? 'This branch' : 'Your shop'}</h2>${isBranch ? '<p class="muted">You are editing the branch chosen at the top of the menu. The name and address print on this branch\'s receipts.</p>' : ''}<form action="/pos/settings" method="POST">
+            <div class="field"><label for="n">${isBranch ? 'Branch name' : 'Business name (printed on receipts)'}</label><input id="n" name="name" required maxlength="120" value="${esc(s.name)}"></div>
+            <div class="field"><label for="p">Phone</label><input id="p" name="phone" maxlength="40" value="${esc(s.phone)}"></div>
+            <div class="field"><label for="a">Address</label><input id="a" name="address" maxlength="200" value="${esc(s.address)}"></div>
+            <div class="field"><label for="f">Receipt footer message</label><input id="f" name="footer" maxlength="200" value="${esc(s.receipt_footer)}"></div>
+            <button class="btn" type="submit">Save</button></form></div>
+        <div class="panel" style="max-width:620px"><h2>Business-wide (all branches)</h2><form action="/pos/settings/business" method="POST">
+            <div class="field"><label for="k">KRA PIN (printed on receipts)</label><input id="k" name="tax_pin" maxlength="40" value="${esc(b.tax_pin)}"></div>
+            <div class="field"><label><input type="checkbox" name="vat" value="1" ${b.vat_enabled ? 'checked' : ''} style="width:auto"> My prices include ${VAT_RATE}% VAT (receipts show the VAT amount)</label><small>Switch this off only if the business is not registered for VAT.</small></div>
+            <button class="btn" type="submit">Save</button></form></div>
+        <div class="panel" style="max-width:620px"><h2>Receipt logo</h2>
+            <p>${logo ? `<img src="${logo}" alt="Your logo" style="max-height:90px;max-width:260px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:4px">` : '<span class="muted">No logo yet.</span>'}</p>
+            <div class="field"><label for="logo-file">Choose a logo (PNG or JPG)</label><input id="logo-file" type="file" accept="image/png,image/jpeg"><small>It is shrunk to fit automatically and printed at the top of every receipt.</small></div>
+            <p><img id="logo-prev" alt="Preview" style="display:none;max-height:90px;max-width:260px;border:1px dashed var(--line);border-radius:6px;padding:4px"></p>
+            <div id="logo-msg" class="muted" role="status"></div>
+            <button class="btn" id="logo-save" type="button" disabled>Save logo</button>
+            ${logo ? '<form action="/pos/settings/logo/remove" method="POST" style="display:inline"><button class="btn ghost" type="submit">Remove logo</button></form>' : ''}</div>
+        <script nonce="${req.nonce || ''}">
+        (function () {
+            var f = document.getElementById('logo-file'), pv = document.getElementById('logo-prev'), msg = document.getElementById('logo-msg'), btn = document.getElementById('logo-save'), data = '';
+            f.addEventListener('change', function () {
+                var file = f.files[0]; if (!file) return; btn.disabled = true; data = '';
+                if (file.type !== 'image/png' && file.type !== 'image/jpeg') { msg.textContent = 'Please choose a PNG or JPG picture.'; return; }
+                var rd = new FileReader();
+                rd.onerror = function () { msg.textContent = 'Could not read that picture.'; };
+                rd.onload = function () {
+                    var img = new Image();
+                    img.onerror = function () { msg.textContent = 'Could not read that picture.'; };
+                    img.onload = function () {
+                        var s = Math.min(1, 256 / Math.max(img.width, img.height)), w = Math.max(1, Math.round(img.width * s)), h = Math.max(1, Math.round(img.height * s)), c = document.createElement('canvas');
+                        function enc(type, quality) { c.width = w; c.height = h; var x = c.getContext('2d'); if (type === 'image/jpeg') { x.fillStyle = '#fff'; x.fillRect(0, 0, w, h); } x.drawImage(img, 0, 0, w, h); return c.toDataURL(type, quality); }
+                        var out = enc('image/png', 0.92), steps = [0.85, 0.7, 0.55], i = 0;
+                        while (out.length > 38000 && i < 6) { if (i < 3) out = enc('image/jpeg', steps[i]); else { w = Math.round(w * 0.75); h = Math.round(h * 0.75); out = enc('image/jpeg', 0.7); } i++; }
+                        if (out.length > 38000) { msg.textContent = 'That picture is too detailed. Try a simpler logo.'; return; }
+                        data = out; pv.src = out; pv.style.display = ''; btn.disabled = false; msg.textContent = 'This is how it will look. Press Save logo.';
+                    };
+                    img.src = rd.result;
+                };
+                rd.readAsDataURL(file);
+            });
+            btn.addEventListener('click', function () {
+                if (!data) return; btn.disabled = true; msg.textContent = 'Saving...';
+                fetch('/pos/settings/logo', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dataUrl: data }) })
+                .then(function (r) { return r.json(); }).then(function (d) { if (d.ok) location.href = '/pos/settings?ok=' + encodeURIComponent('Logo saved.'); else { msg.textContent = d.error || 'Could not save the logo.'; btn.disabled = false; } })
+                .catch(function () { msg.textContent = 'Connection problem. Try again.'; btn.disabled = false; });
+            });
+        })();
+        </script>` });
+    }));
+    router.post('/settings', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 120);
+        if (name.length < 2) return res.redirect('/pos/settings?err=' + encodeURIComponent('Please enter a name.'));
+        await q('UPDATE pos_shops SET name=$2, phone=$3, address=$4, receipt_footer=$5 WHERE id=$1', [req.shop.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200), str(req.body.footer).slice(0, 200)]);
+        res.redirect('/pos/settings?ok=' + encodeURIComponent('Saved.'));
+    }));
+    router.post('/settings/business', ah(async (req, res) => {
+        await q('UPDATE pos_shops SET tax_pin=$2, vat_enabled=$3 WHERE id=$1', [req.biz.id, str(req.body.tax_pin).slice(0, 40), req.body.vat === '1']);
+        await audit(req, 'settings.business', 'VAT ' + (req.body.vat === '1' ? 'on' : 'off') + ', KRA PIN updated');
+        res.redirect('/pos/settings?ok=' + encodeURIComponent('Saved.'));
+    }));
+    router.post('/settings/logo', ah(async (req, res) => {
+        const d = String((req.body && req.body.dataUrl) || '');
+        if (d.length > 41000 || !LOGO_OK.test(d)) return res.status(400).json({ error: 'That picture could not be used. Choose a PNG or JPG.' });
+        const bytes = Buffer.from(d.slice(d.indexOf(',') + 1), 'base64');
+        const png = bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47, jpg = bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+        if (bytes.length > 30000 || !(png || jpg) || (png && !d.startsWith('data:image/png')) || (jpg && !d.startsWith('data:image/jpeg'))) return res.status(400).json({ error: 'That picture could not be used. Choose a PNG or JPG that is not too large.' });
+        await q('UPDATE pos_shops SET logo=$2 WHERE id=$1', [req.biz.id, d]);
+        await audit(req, 'settings.logo', 'logo changed');
+        res.json({ ok: true });
+    }));
+    router.post('/settings/logo/remove', ah(async (req, res) => {
+        await q('UPDATE pos_shops SET logo=NULL WHERE id=$1', [req.biz.id]);
+        res.redirect('/pos/settings?ok=' + encodeURIComponent('Logo removed.'));
+    }));
+
+    // ======================= EXTRA PAGES =======================
+    const errBox = req => req.query.err ? `<div class="alert" role="alert">${esc(String(req.query.err).slice(0, 160))}</div>` : '';
+    const back = (res, path, ok, err) => res.redirect(path + '?' + (err ? 'err=' + encodeURIComponent(err) : 'ok=' + encodeURIComponent(ok)));
+    const delBtn = action => `<form action="${action}" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form>`;
+    const itemOptions = items => '<option value="">-</option>' + items.map(i => `<option value="${i.id}">${esc(i.name)}</option>`).join('');
+    // reads rows item_1/qty_1/price_1 .. item_10; blank price uses the item's own default
+    async function readLines(req, priceField) {
+        const ids = [];
+        for (let n = 1; n <= 10; n++) { const id = parseCount(req.body['item_' + n], { min: 1 }); if (id) ids.push(id); }
+        if (!ids.length) return { error: 'Add at least one item.' };
+        const items = new Map((await q('SELECT id, name, price_cents, cost_cents FROM pos_items WHERE shop_id=$1 AND id = ANY($2::int[])', [req.shop.id, ids])).rows.map(i => [i.id, i]));
+        const lines = [];
+        for (let n = 1; n <= 10; n++) {
+            const id = parseCount(req.body['item_' + n], { min: 1 });
+            if (!id) continue;
+            const it = items.get(id), qty = parseCount(req.body['qty_' + n], { min: 1, max: 1000000 });
+            if (!it) return { error: 'One of the items was not found.' };
+            if (!qty) return { error: `Enter a whole-number quantity for ${it.name}.` };
+            const raw = str(req.body['price_' + n]);
+            const price = raw === '' ? Number(it[priceField]) : parseMoney(raw);
+            if (price === null) return { error: `The price for ${it.name} is not a number.` };
+            lines.push({ item_id: id, name: it.name, qty, cents: price });
+        }
+        return { lines };
+    }
+    const lineRows = (items, label) => Array.from({ length: 6 }, (_, k) => `<tr><td><select name="item_${k + 1}" aria-label="Item ${k + 1}">${itemOptions(items)}</select></td><td><input name="qty_${k + 1}" inputmode="numeric" aria-label="Quantity" style="width:80px" placeholder="Qty"></td><td><input name="price_${k + 1}" inputmode="decimal" aria-label="${label}" style="width:110px" placeholder="default"></td></tr>`).join('');
+    const activeItems = async req => (await q('SELECT id, name FROM pos_items WHERE shop_id=$1 AND active ORDER BY name LIMIT 2000', [req.shop.id])).rows;
+
+    // ----- suppliers -----
+    router.get('/suppliers', ah(async (req, res) => {
+        const r = await q('SELECT * FROM pos_suppliers WHERE shop_id=$1 ORDER BY name', [req.shop.id]);
+        send(req, res, { title: 'Suppliers', nav: 'suppliers', body: `<h1>Suppliers</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><form action="/pos/suppliers" method="POST"><div class="grid2">
+            <div class="field"><label for="n">Supplier name</label><input id="n" name="name" required maxlength="120"></div>
+            <div class="field"><label for="p">Phone</label><input id="p" name="phone" maxlength="40"></div>
+            <div class="field"><label for="e">Email</label><input id="e" name="email" type="email" maxlength="160"></div>
+            <div class="field"><label for="a">Address</label><input id="a" name="address" maxlength="200"></div></div><button class="btn" type="submit">Add supplier</button></form></div>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Name</th><th>Phone</th><th>Email</th><th>Address</th><th></th></tr>${r.rows.map(s => `<tr><td>${esc(s.name)}</td><td>${esc(s.phone)}</td><td>${esc(s.email)}</td><td>${esc(s.address)}</td><td class="right">${delBtn('/pos/suppliers/' + s.id + '/delete')}</td></tr>`).join('')}</table>` : '<p class="muted">No suppliers yet.</p>'}</div>` });
+    }));
+    router.post('/suppliers', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 120);
+        if (!name) return back(res, '/pos/suppliers', '', 'Please enter the supplier name.');
+        await q('INSERT INTO pos_suppliers (shop_id, name, phone, email, address) VALUES ($1,$2,$3,$4,$5)', [req.shop.id, name, str(req.body.phone).slice(0, 40), str(req.body.email).slice(0, 160), str(req.body.address).slice(0, 200)]);
+        back(res, '/pos/suppliers', 'Supplier added.');
+    }));
+    router.post('/suppliers/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_suppliers WHERE id=$1 AND shop_id=$2', [id, req.shop.id]);
+        back(res, '/pos/suppliers', 'Supplier deleted.');
+    }));
+
+    // ----- purchase orders -----
+    router.get('/purchase-orders', ah(async (req, res) => {
+        const r = await q(`SELECT p.id, p.po_no, p.status, p.created_at, s.name AS supplier, COALESCE(sum(l.qty * l.cost_cents),0)::bigint total FROM pos_purchase_orders p LEFT JOIN pos_suppliers s ON s.id=p.supplier_id LEFT JOIN pos_po_lines l ON l.po_id=p.id WHERE p.shop_id=$1 GROUP BY p.id, s.name ORDER BY p.created_at DESC LIMIT 200`, [req.shop.id]);
+        const tag = { open: 'warn', received: 'ok', cancelled: 'gray' };
+        send(req, res, { title: 'Purchase Orders', nav: 'po', body: `<h1>Purchase Orders</h1>${notice(req)}${errBox(req)}<p><a class="btn" href="/pos/purchase-orders/new">New purchase order</a></p>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>PO</th><th>Date</th><th>Supplier</th><th class="num">Total</th><th>Status</th><th></th></tr>${r.rows.map(p => `<tr><td>#${p.po_no}</td><td>${esc(dateFmt(p.created_at))}</td><td>${esc(p.supplier || '-')}</td><td class="num">${fmt(p.total)}</td><td><span class="tag ${tag[p.status]}">${esc(p.status)}</span></td><td class="right"><a class="btn small ghost" href="/pos/purchase-orders/${p.id}">Open</a></td></tr>`).join('')}</table>` : '<p class="muted">No purchase orders yet.</p>'}</div>` });
+    }));
+    router.get('/purchase-orders/new', ah(async (req, res) => {
+        const [items, sup] = await Promise.all([activeItems(req), q('SELECT id, name FROM pos_suppliers WHERE shop_id=$1 ORDER BY name', [req.shop.id])]);
+        send(req, res, { title: 'New purchase order', nav: 'po', body: `<h1>New purchase order</h1>${errBox(req)}<div class="panel"><form action="/pos/purchase-orders/new" method="POST">
+            <div class="field" style="max-width:380px"><label for="s">Supplier</label><select id="s" name="supplier_id"><option value="">No supplier</option>${sup.rows.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select></div>
+            <div class="tablewrap"><table><tr><th>Item</th><th>Qty</th><th>Unit cost (KES)</th></tr>${lineRows(items, 'Unit cost')}</table></div>
+            <div class="field" style="margin-top:12px"><label for="n">Note</label><input id="n" name="note" maxlength="200"></div>
+            <button class="btn" type="submit">Save order</button> <a class="btn ghost" href="/pos/purchase-orders">Cancel</a></form></div>` });
+    }));
+    router.post('/purchase-orders/new', ah(async (req, res) => {
+        const { lines, error } = await readLines(req, 'cost_cents');
+        if (error) return back(res, '/pos/purchase-orders/new', '', error);
+        let supplier = parseCount(req.body.supplier_id, { min: 1 });
+        if (supplier && !(await q('SELECT 1 FROM pos_suppliers WHERE id=$1 AND shop_id=$2', [supplier, req.shop.id])).rowCount) supplier = null;
+        const client = await pool().connect();
+        let id;
+        try {
+            await client.query('BEGIN');
+            const no = (await client.query('UPDATE pos_shops SET next_po = next_po + 1 WHERE id=$1 RETURNING next_po - 1 AS no', [req.shop.id])).rows[0].no;
+            id = (await client.query('INSERT INTO pos_purchase_orders (shop_id, supplier_id, po_no, note) VALUES ($1,$2,$3,$4) RETURNING id', [req.shop.id, supplier, no, str(req.body.note).slice(0, 200)])).rows[0].id;
+            for (const l of lines) await client.query('INSERT INTO pos_po_lines (po_id, item_id, qty, cost_cents) VALUES ($1,$2,$3,$4)', [id, l.item_id, l.qty, l.cents]);
+            await client.query('COMMIT');
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+        res.redirect('/pos/purchase-orders/' + id);
+    }));
+    router.get('/purchase-orders/:id', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const p = id && (await q(`SELECT p.*, s.name AS supplier FROM pos_purchase_orders p LEFT JOIN pos_suppliers s ON s.id=p.supplier_id WHERE p.id=$1 AND p.shop_id=$2`, [id, req.shop.id])).rows[0];
+        if (!p) return send(req, res, { title: 'Not found', nav: 'po', body: '<h1>Purchase order not found</h1><a href="/pos/purchase-orders">Back</a>' }, 404);
+        const lines = (await q('SELECT l.qty, l.cost_cents, i.name FROM pos_po_lines l JOIN pos_items i ON i.id=l.item_id WHERE l.po_id=$1 ORDER BY l.id', [id])).rows;
+        const total = lines.reduce((a, l) => a + l.qty * Number(l.cost_cents), 0);
+        send(req, res, { title: 'Purchase order #' + p.po_no, nav: 'po', body: `<h1>Purchase order #${p.po_no}</h1>${notice(req)}${errBox(req)}
+        <div class="panel noprint"><span class="tag ${p.status === 'open' ? 'warn' : p.status === 'received' ? 'ok' : 'gray'}">${esc(p.status)}</span>
+            ${p.status === 'open' ? `<form action="/pos/purchase-orders/${id}/receive" method="POST" style="display:inline;margin-left:10px"><button class="btn ok small" type="submit">Mark received (adds the stock)</button></form> <form action="/pos/purchase-orders/${id}/cancel" method="POST" style="display:inline"><button class="btn ghost small" type="submit">Cancel order</button></form>` : ''}
+            <button class="btn small" id="prt" type="button" style="margin-left:10px">Print</button> <a class="btn small ghost" href="/pos/purchase-orders">Back</a></div>
+        <div class="panel"><p><b>${esc(req.shop.name)}</b><br>Supplier: ${esc(p.supplier || '-')}<br>Date: ${esc(dateFmt(p.created_at))}${p.note ? '<br>Note: ' + esc(p.note) : ''}</p>
+        <table><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit cost</th><th class="num">Line total</th></tr>${lines.map(l => `<tr><td>${esc(l.name)}</td><td class="num">${l.qty}</td><td class="num">${fmt(l.cost_cents)}</td><td class="num">${fmt(l.qty * Number(l.cost_cents))}</td></tr>`).join('')}<tr><td colspan="3"><b>Total</b></td><td class="num"><b>${fmt(total)}</b></td></tr></table></div>
+        <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>` });
+    }));
+    router.post('/purchase-orders/:id/receive', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (!id) return res.redirect('/pos/purchase-orders');
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const p = (await client.query(`UPDATE pos_purchase_orders SET status='received', received_at=now() WHERE id=$1 AND shop_id=$2 AND status='open' RETURNING po_no`, [id, req.shop.id])).rows[0];
+            if (p) {
+                const lines = (await client.query('SELECT item_id, qty, cost_cents FROM pos_po_lines WHERE po_id=$1 ORDER BY item_id', [id])).rows;
+                for (const l of lines) {
+                    const it = (await client.query('UPDATE pos_items SET stock = CASE WHEN track_stock THEN stock + $2 ELSE stock END, cost_cents=$4 WHERE id=$1 AND shop_id=$3 RETURNING stock, track_stock', [l.item_id, l.qty, req.shop.id, l.cost_cents])).rows[0];
+                    if (it && it.track_stock) await client.query(`INSERT INTO pos_stock_moves (shop_id, item_id, change, balance, reason, note) VALUES ($1,$2,$3,$4,'stock_in',$5)`, [req.shop.id, l.item_id, l.qty, it.stock, 'Purchase order #' + p.po_no]);
+                }
+            }
+            await client.query('COMMIT');
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+        back(res, '/pos/purchase-orders/' + id, 'Order received and stock updated.');
+    }));
+    router.post('/purchase-orders/:id/cancel', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q(`UPDATE pos_purchase_orders SET status='cancelled' WHERE id=$1 AND shop_id=$2 AND status='open'`, [id, req.shop.id]);
+        res.redirect('/pos/purchase-orders/' + (id || ''));
+    }));
+
+    // ----- quotes -----
+    router.get('/quotes', ah(async (req, res) => {
+        const r = await q(`SELECT c.id, c.quote_no, c.customer_name, c.status, c.created_at, COALESCE(sum(l.qty * l.unit_price_cents),0)::bigint total FROM pos_quotes c LEFT JOIN pos_quote_lines l ON l.quote_id=c.id WHERE c.shop_id=$1 GROUP BY c.id ORDER BY c.created_at DESC LIMIT 200`, [req.shop.id]);
+        send(req, res, { title: 'Quotes', nav: 'quotes', body: `<h1>Quotes</h1>${notice(req)}<p><a class="btn" href="/pos/quotes/new">New quote</a></p>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Quote</th><th>Date</th><th>Customer</th><th class="num">Total</th><th>Status</th><th></th></tr>${r.rows.map(c => `<tr><td>#${c.quote_no}</td><td>${esc(dateFmt(c.created_at))}</td><td>${esc(c.customer_name || '-')}</td><td class="num">${fmt(c.total)}</td><td><span class="tag ${c.status === 'accepted' ? 'ok' : c.status === 'open' ? 'warn' : 'gray'}">${esc(c.status)}</span></td><td class="right"><a class="btn small ghost" href="/pos/quotes/${c.id}">Open</a></td></tr>`).join('')}</table>` : '<p class="muted">No quotes yet.</p>'}</div>` });
+    }));
+    router.get('/quotes/new', ah(async (req, res) => {
+        const items = await activeItems(req);
+        send(req, res, { title: 'New quote', nav: 'quotes', body: `<h1>New quote</h1>${errBox(req)}<div class="panel"><form action="/pos/quotes/new" method="POST"><div class="grid2">
+            <div class="field"><label for="c">Customer name</label><input id="c" name="customer_name" maxlength="120"></div>
+            <div class="field"><label for="p">Customer phone</label><input id="p" name="customer_phone" maxlength="40"></div>
+            <div class="field"><label for="v">Valid until</label><input id="v" type="date" name="valid_until" value="${addDays(todayNairobi(), 14)}"></div></div>
+            <div class="tablewrap"><table><tr><th>Item</th><th>Qty</th><th>Unit price (KES)</th></tr>${lineRows(items, 'Unit price')}</table></div>
+            <div class="field" style="margin-top:12px"><label for="n">Note</label><input id="n" name="note" maxlength="200"></div>
+            <button class="btn" type="submit">Save quote</button> <a class="btn ghost" href="/pos/quotes">Cancel</a></form></div>` });
+    }));
+    router.post('/quotes/new', ah(async (req, res) => {
+        const { lines, error } = await readLines(req, 'price_cents');
+        if (error) return back(res, '/pos/quotes/new', '', error);
+        const valid = validDate(req.body.valid_until) ? req.body.valid_until : null;
+        const client = await pool().connect();
+        let id;
+        try {
+            await client.query('BEGIN');
+            const no = (await client.query('UPDATE pos_shops SET next_quote = next_quote + 1 WHERE id=$1 RETURNING next_quote - 1 AS no', [req.shop.id])).rows[0].no;
+            id = (await client.query('INSERT INTO pos_quotes (shop_id, quote_no, customer_name, customer_phone, valid_until, note) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id', [req.shop.id, no, str(req.body.customer_name).slice(0, 120), str(req.body.customer_phone).slice(0, 40), valid, str(req.body.note).slice(0, 200)])).rows[0].id;
+            for (const l of lines) await client.query('INSERT INTO pos_quote_lines (quote_id, name, qty, unit_price_cents) VALUES ($1,$2,$3,$4)', [id, l.name, l.qty, l.cents]);
+            await client.query('COMMIT');
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+        res.redirect('/pos/quotes/' + id);
+    }));
+    router.get('/quotes/:id', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const c = id && (await q('SELECT * FROM pos_quotes WHERE id=$1 AND shop_id=$2', [id, req.shop.id])).rows[0];
+        if (!c) return send(req, res, { title: 'Not found', nav: 'quotes', body: '<h1>Quote not found</h1><a href="/pos/quotes">Back</a>' }, 404);
+        const lines = (await q('SELECT name, qty, unit_price_cents FROM pos_quote_lines WHERE quote_id=$1 ORDER BY id', [id])).rows;
+        const total = lines.reduce((a, l) => a + l.qty * Number(l.unit_price_cents), 0), sh = req.shop;
+        send(req, res, { title: 'Quote #' + c.quote_no, nav: 'quotes', body: `<div class="noprint" style="margin-bottom:14px"><button class="btn" id="prt" type="button">Print / Save as PDF</button> <a class="btn ghost" href="/pos/quotes">Back</a>
+            ${c.status === 'open' ? `<form action="/pos/quotes/${id}/status" method="POST" style="display:inline"><button class="btn ok small" name="status" value="accepted">Mark accepted</button> <button class="btn ghost small" name="status" value="cancelled">Cancel quote</button></form>` : ''}</div>${notice(req)}
+        <div class="panel" style="max-width:720px"><h1 style="margin-bottom:4px">Quotation #${c.quote_no}</h1><p>${req.biz.logo && LOGO_OK.test(req.biz.logo) ? `<img src="${req.biz.logo}" alt="" style="max-height:64px;max-width:200px"><br>` : ''}<b>${esc(req.biz.name)}</b>${sh.id !== req.biz.id ? '<br>' + esc(sh.name) : ''}<br>${esc(sh.address)}${sh.phone ? '<br>Tel ' + esc(sh.phone) : ''}${req.biz.tax_pin ? '<br>PIN ' + esc(req.biz.tax_pin) : ''}</p>
+        <p>Date: ${esc(dateFmt(c.created_at))}${c.valid_until ? '<br>Valid until: ' + esc(dateFmt(isoDate(c.valid_until) + 'T12:00:00+03:00')) : ''}<br>Customer: ${esc(c.customer_name || '-')} ${esc(c.customer_phone)}<br>Status: ${esc(c.status)}</p>
+        <table><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit price</th><th class="num">Total</th></tr>${lines.map(l => `<tr><td>${esc(l.name)}</td><td class="num">${l.qty}</td><td class="num">${fmt(l.unit_price_cents)}</td><td class="num">${fmt(l.qty * Number(l.unit_price_cents))}</td></tr>`).join('')}<tr><td colspan="3"><b>Total (KES)</b></td><td class="num"><b>${fmt(total)}</b></td></tr></table>${req.biz.vat_enabled ? '<p class="muted">All prices include VAT at ' + VAT_RATE + '%.</p>' : ''}${c.note ? '<p>' + esc(c.note) + '</p>' : ''}</div>
+        <script nonce="${req.nonce || ''}">document.getElementById('prt').addEventListener('click',function(){window.print();});</script>` });
+    }));
+    router.post('/quotes/:id/status', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 }), st = ['accepted', 'cancelled'].includes(req.body.status) ? req.body.status : '';
+        if (id && st) await q(`UPDATE pos_quotes SET status=$3 WHERE id=$1 AND shop_id=$2 AND status='open'`, [id, req.shop.id, st]);
+        res.redirect('/pos/quotes/' + (id || ''));
+    }));
+
+    // ----- cash drawer -----
+    router.get('/drawer', ah(async (req, res) => {
+        const sid = req.shop.id;
+        const cur = (await q('SELECT * FROM pos_drawer WHERE shop_id=$1 AND closed_at IS NULL', [sid])).rows[0];
+        const past = (await q('SELECT * FROM pos_drawer WHERE shop_id=$1 AND closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 15', [sid])).rows;
+        let panel;
+        if (cur) {
+            const [cash, mv] = await Promise.all([
+                q(`SELECT COALESCE(sum(total_cents),0)::bigint t FROM pos_sales WHERE shop_id=$1 AND status='completed' AND method='cash' AND created_at >= $2`, [sid, cur.opened_at]),
+                q('SELECT * FROM pos_drawer_moves WHERE drawer_id=$1 ORDER BY id', [cur.id])
+            ]);
+            const inn = mv.rows.filter(m => m.kind === 'in').reduce((a, m) => a + Number(m.amount_cents), 0), out = mv.rows.filter(m => m.kind === 'out').reduce((a, m) => a + Number(m.amount_cents), 0);
+            const expected = Number(cur.opening_cents) + Number(cash.rows[0].t) + inn - out;
+            panel = `<div class="panel"><h2>Drawer is open</h2><p class="muted">Opened ${esc(timeFmt(cur.opened_at))}</p><table>
+                <tr><td>Opening float</td><td class="num">${fmt(cur.opening_cents)}</td></tr><tr><td>Cash sales since opening</td><td class="num">${fmt(cash.rows[0].t)}</td></tr>
+                <tr><td>Cash added</td><td class="num">${fmt(inn)}</td></tr><tr><td>Cash taken out</td><td class="num">-${fmt(out)}</td></tr><tr><td><b>Expected in drawer</b></td><td class="num"><b>${fmt(expected)}</b></td></tr></table></div>
+            <div class="grid2" style="align-items:start"><div class="panel"><h2>Cash in / out</h2><form action="/pos/drawer/move" method="POST"><div class="field"><label for="k">Type</label><select id="k" name="kind"><option value="in">Cash added to drawer</option><option value="out">Cash taken out (e.g. paid a supplier)</option></select></div><div class="field"><label for="a">Amount (KES)</label><input id="a" name="amount" required inputmode="decimal"></div><div class="field"><label for="n">Note</label><input id="n" name="note" maxlength="200"></div><button class="btn" type="submit">Save</button></form>
+                ${mv.rows.length ? `<table style="margin-top:12px">${mv.rows.map(m => `<tr><td>${m.kind === 'in' ? 'In' : 'Out'}: ${esc(m.note)}</td><td class="num">${fmt(m.amount_cents)}</td></tr>`).join('')}</table>` : ''}</div>
+            <div class="panel"><h2>Close drawer</h2><form action="/pos/drawer/close" method="POST"><div class="field"><label for="c">Cash counted (KES)</label><input id="c" name="counted" required inputmode="decimal"></div><div class="field"><label for="cn">Note</label><input id="cn" name="note" maxlength="200"></div><button class="btn bad" type="submit">Close drawer</button></form></div></div>`;
+        } else {
+            panel = `<div class="panel" style="max-width:480px"><h2>Open the drawer</h2><form action="/pos/drawer/open" method="POST"><div class="field"><label for="f">Opening cash float (KES)</label><input id="f" name="opening" required inputmode="decimal" value="0"></div><button class="btn ok" type="submit">Open drawer</button></form></div>`;
+        }
+        send(req, res, { title: 'Cash Drawer', nav: 'drawer', body: `<h1>Cash Drawer</h1>${notice(req)}${errBox(req)}${panel}
+        <div class="panel tablewrap"><h2>Past sessions</h2>${past.length ? `<table><tr><th>Closed</th><th class="num">Expected</th><th class="num">Counted</th><th class="num">Difference</th></tr>${past.map(d => { const diff = Number(d.counted_cents) - Number(d.expected_cents); return `<tr><td>${esc(timeFmt(d.closed_at))}</td><td class="num">${fmt(d.expected_cents)}</td><td class="num">${fmt(d.counted_cents)}</td><td class="num"><span class="tag ${diff === 0 ? 'ok' : 'bad'}">${diff > 0 ? '+' : diff < 0 ? '-' : ''}${fmt(Math.abs(diff))}</span></td></tr>`; }).join('')}</table>` : '<p class="muted">No closed sessions yet.</p>'}</div>` });
+    }));
+    router.post('/drawer/open', ah(async (req, res) => {
+        const amt = parseMoney(req.body.opening);
+        if (amt === null) return back(res, '/pos/drawer', '', 'Enter the opening amount as a number.');
+        const r = await q('INSERT INTO pos_drawer (shop_id, opening_cents) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.shop.id, amt]);
+        back(res, '/pos/drawer', r.rowCount ? 'Drawer opened.' : 'The drawer is already open.');
+    }));
+    router.post('/drawer/move', ah(async (req, res) => {
+        const amt = parseMoney(req.body.amount), kind = req.body.kind === 'out' ? 'out' : 'in';
+        if (amt === null || amt <= 0) return back(res, '/pos/drawer', '', 'Enter an amount.');
+        await q(`INSERT INTO pos_drawer_moves (shop_id, drawer_id, kind, amount_cents, note) SELECT $1, id, $2, $3, $4 FROM pos_drawer WHERE shop_id=$1 AND closed_at IS NULL`, [req.shop.id, kind, amt, str(req.body.note).slice(0, 200)]);
+        back(res, '/pos/drawer', 'Saved.');
+    }));
+    router.post('/drawer/close', ah(async (req, res) => {
+        const counted = parseMoney(req.body.counted), sid = req.shop.id;
+        if (counted === null) return back(res, '/pos/drawer', '', 'Enter the counted cash as a number.');
+        const client = await pool().connect();
+        try {
+            await client.query('BEGIN');
+            const cur = (await client.query('SELECT * FROM pos_drawer WHERE shop_id=$1 AND closed_at IS NULL FOR UPDATE', [sid])).rows[0];
+            if (cur) {
+                const cash = (await client.query(`SELECT COALESCE(sum(total_cents),0)::bigint t FROM pos_sales WHERE shop_id=$1 AND status='completed' AND method='cash' AND created_at >= $2`, [sid, cur.opened_at])).rows[0].t;
+                const mv = (await client.query(`SELECT COALESCE(sum(CASE WHEN kind='in' THEN amount_cents ELSE -amount_cents END),0)::bigint t FROM pos_drawer_moves WHERE drawer_id=$1`, [cur.id])).rows[0].t;
+                await client.query('UPDATE pos_drawer SET closed_at=now(), counted_cents=$2, expected_cents=$3, note=$4 WHERE id=$1', [cur.id, counted, Number(cur.opening_cents) + Number(cash) + Number(mv), str(req.body.note).slice(0, 200)]);
+            }
+            await client.query('COMMIT');
+        } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
+        back(res, '/pos/drawer', 'Drawer closed.');
+    }));
+
+    // ----- expense categories, recurring, budgets -----
+    router.get('/expense-categories', ah(async (req, res) => {
+        const r = await q('SELECT id, name FROM pos_expense_cats WHERE shop_id=$1 ORDER BY name', [req.shop.id]);
+        send(req, res, { title: 'Expense Categories', nav: 'ecats', body: `<h1>Expense Categories</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><form action="/pos/expense-categories" method="POST" class="row"><div><label for="c">New category</label><input id="c" name="name" required maxlength="60"></div><button class="btn" type="submit">Add</button></form></div>
+        <div class="panel">${r.rows.length ? `<table>${r.rows.map(c => `<tr><td>${esc(c.name)}</td><td class="right">${delBtn('/pos/expense-categories/' + c.id + '/delete')}</td></tr>`).join('')}</table>` : '<p class="muted">No custom categories yet. Common ones (Rent, Transport, Electricity...) are always offered.</p>'}</div>` });
+    }));
+    router.post('/expense-categories', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 60);
+        if (name) await q('INSERT INTO pos_expense_cats (shop_id, name) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.shop.id, name]);
+        back(res, '/pos/expense-categories', 'Category added.');
+    }));
+    router.post('/expense-categories/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_expense_cats WHERE id=$1 AND shop_id=$2', [id, req.shop.id]);
+        back(res, '/pos/expense-categories', 'Category deleted.');
+    }));
+    const catList = async shopId => {
+        const r = await q('SELECT name FROM pos_expense_cats WHERE shop_id=$1 UNION SELECT category FROM pos_expenses WHERE shop_id=$1 ORDER BY 1 LIMIT 100', [shopId]);
+        return [...new Set(['Rent', 'Transport', 'Electricity', 'Wages', 'Licences', 'Packaging', 'Airtime', 'Other'].concat(r.rows.map(x => x.name)))];
     };
-}
+    router.get('/recurring', ah(async (req, res) => {
+        const [r, cats] = await Promise.all([q('SELECT * FROM pos_recurring WHERE shop_id=$1 ORDER BY day_of_month, id', [req.shop.id]), catList(req.shop.id)]);
+        send(req, res, { title: 'Recurring Expenses', nav: 'recurring', body: `<h1>Recurring Expenses</h1>${notice(req)}${errBox(req)}
+        <p class="muted">These are added to your expenses automatically every month, on the day you choose.</p>
+        <div class="panel"><form action="/pos/recurring" method="POST"><div class="grid2">
+            <div class="field"><label for="c">Category</label><input id="c" name="category" list="cl" required maxlength="60"><datalist id="cl">${cats.map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
+            <div class="field"><label for="a">Amount (KES)</label><input id="a" name="amount" required inputmode="decimal"></div>
+            <div class="field"><label for="d">Day of month (1 to 28)</label><input id="d" name="day" required inputmode="numeric" value="1"></div>
+            <div class="field"><label for="n">Note</label><input id="n" name="note" maxlength="200"></div></div><button class="btn" type="submit">Add</button></form></div>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Category</th><th>Day</th><th class="num">Amount</th><th>Note</th><th></th></tr>${r.rows.map(x => `<tr><td>${esc(x.category)}</td><td>${x.day_of_month}</td><td class="num">${fmt(x.amount_cents)}</td><td>${esc(x.note)}</td><td class="right">${delBtn('/pos/recurring/' + x.id + '/delete')}</td></tr>`).join('')}</table>` : '<p class="muted">None yet.</p>'}</div>` });
+    }));
+    router.post('/recurring', ah(async (req, res) => {
+        const cat = str(req.body.category).slice(0, 60), amt = parseMoney(req.body.amount), day = parseCount(req.body.day, { min: 1, max: 28 });
+        if (!cat || amt === null || amt <= 0 || !day) return back(res, '/pos/recurring', '', 'Enter a category, an amount and a day from 1 to 28.');
+        await q('INSERT INTO pos_recurring (shop_id, category, amount_cents, note, day_of_month) VALUES ($1,$2,$3,$4,$5)', [req.shop.id, cat, amt, str(req.body.note).slice(0, 200), day]);
+        await runRecurring(req.shop.id);
+        back(res, '/pos/recurring', 'Saved.');
+    }));
+    router.post('/recurring/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_recurring WHERE id=$1 AND shop_id=$2', [id, req.shop.id]);
+        back(res, '/pos/recurring', 'Deleted.');
+    }));
+    // adds this month's expense once the day has arrived; the UPDATE ... RETURNING makes sure it only happens once
+    async function runRecurring(shopId) {
+        const today = todayNairobi(), ym = today.slice(0, 7);
+        const r = await q(`UPDATE pos_recurring SET last_run = make_date($2::int, $3::int, day_of_month) WHERE shop_id=$1 AND day_of_month <= $4 AND (last_run IS NULL OR to_char(last_run,'YYYY-MM') < $5) RETURNING category, amount_cents, note, last_run`,
+            [shopId, Number(ym.slice(0, 4)), Number(ym.slice(5, 7)), Number(today.slice(8, 10)), ym]);
+        for (const x of r.rows) await q('INSERT INTO pos_expenses (shop_id, category, amount_cents, note, spent_on) VALUES ($1,$2,$3,$4,$5)', [shopId, x.category, x.amount_cents, (x.note ? x.note + ' ' : '') + '(recurring)', x.last_run]);
+    }
+    router.get('/budgets', ah(async (req, res) => {
+        const today = todayNairobi(), ms = today.slice(0, 8) + '01';
+        const [b, spent, cats] = await Promise.all([
+            q('SELECT category, amount_cents FROM pos_budgets WHERE shop_id=$1 ORDER BY category', [req.shop.id]),
+            q('SELECT category, sum(amount_cents)::bigint t FROM pos_expenses WHERE shop_id=$1 AND spent_on >= $2 GROUP BY category', [req.shop.id, ms]),
+            catList(req.shop.id)
+        ]);
+        const sp = new Map(spent.rows.map(x => [x.category, Number(x.t)]));
+        send(req, res, { title: 'Budgets', nav: 'budgets', body: `<h1>Monthly Budgets</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><form action="/pos/budgets" method="POST" class="row"><div><label for="c">Category</label><input id="c" name="category" list="cl" required maxlength="60"><datalist id="cl">${cats.map(c => `<option value="${esc(c)}">`).join('')}</datalist></div><div><label for="a">Monthly budget (KES)</label><input id="a" name="amount" required inputmode="decimal"></div><button class="btn" type="submit">Set budget</button></form></div>
+        <div class="panel tablewrap">${b.rows.length ? `<table><tr><th>Category</th><th class="num">Budget</th><th class="num">Spent this month</th><th class="num">Left</th><th></th></tr>${b.rows.map(x => { const s = sp.get(x.category) || 0, left = Number(x.amount_cents) - s, pct = Math.min(100, Math.round(s * 100 / Math.max(1, Number(x.amount_cents)))); return `<tr><td>${esc(x.category)}<div style="background:#e2e8f0;border-radius:4px;height:6px;margin-top:4px"><div style="width:${pct}%;height:6px;border-radius:4px;background:${left < 0 ? '#dc2626' : pct > 80 ? '#d97706' : '#16a34a'}"></div></div></td><td class="num">${fmt(x.amount_cents)}</td><td class="num">${fmt(s)}</td><td class="num"><span class="tag ${left < 0 ? 'bad' : 'ok'}">${left < 0 ? '-' : ''}${fmt(Math.abs(left))}</span></td><td class="right"><form action="/pos/budgets/delete" method="POST" style="display:inline"><input type="hidden" name="category" value="${esc(x.category)}"><button class="btn small ghost" type="submit">Delete</button></form></td></tr>`; }).join('')}</table>` : '<p class="muted">No budgets set.</p>'}</div>` });
+    }));
+    router.post('/budgets', ah(async (req, res) => {
+        const cat = str(req.body.category).slice(0, 60), amt = parseMoney(req.body.amount);
+        if (!cat || amt === null) return back(res, '/pos/budgets', '', 'Enter a category and an amount.');
+        await q('INSERT INTO pos_budgets (shop_id, category, amount_cents) VALUES ($1,$2,$3) ON CONFLICT (shop_id, category) DO UPDATE SET amount_cents=EXCLUDED.amount_cents', [req.shop.id, cat, amt]);
+        back(res, '/pos/budgets', 'Budget saved.');
+    }));
+    router.post('/budgets/delete', ah(async (req, res) => {
+        await q('DELETE FROM pos_budgets WHERE shop_id=$1 AND category=$2', [req.shop.id, str(req.body.category).slice(0, 60)]);
+        back(res, '/pos/budgets', 'Budget deleted.');
+    }));
 
-// Lines like "Base fee: KES 3,000" for receipts, emails and pages. Empty for bookings made before this feature.
-function breakdownLines(b) {
-    if (b.baseAmount == null) return [];
-    const kes = n => 'KES ' + Number(n).toLocaleString('en-KE');
-    const lines = [['Service fee', kes(b.baseAmount)]];
-    lines.push([`Travel fare${b.travelKm != null ? ' (about ' + b.travelKm + ' km from Rangwe)' : ''}`, b.travelFee ? kes(b.travelFee) : 'Free']);
-    const u = PRICING.urgency[b.urgency];
-    if (b.urgencyFee) lines.push([`Urgency (${u ? u.label : b.urgency})`, kes(b.urgencyFee)]);
-    return lines;
-}
+    // ----- assets -----
+    router.get('/assets', ah(async (req, res) => {
+        const r = await q('SELECT * FROM pos_assets WHERE shop_id=$1 ORDER BY bought_on DESC, id DESC', [req.shop.id]), today = todayNairobi();
+        send(req, res, { title: 'Assets', nav: 'assets', body: `<h1>Assets</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><form action="/pos/assets" method="POST"><div class="grid2">
+            <div class="field"><label for="n">Asset name</label><input id="n" name="name" required maxlength="120" placeholder="e.g. Fridge, Shelves, Laptop"></div>
+            <div class="field"><label for="c">Cost (KES)</label><input id="c" name="cost" required inputmode="decimal"></div>
+            <div class="field"><label for="d">Date bought</label><input id="d" type="date" name="bought_on" value="${today}" required></div>
+            <div class="field"><label for="l">Useful life (years)</label><input id="l" name="life" inputmode="numeric" value="5"></div>
+            <div class="field"><label for="s">Value at end of life (KES)</label><input id="s" name="salvage" inputmode="decimal" value="0"></div></div><button class="btn" type="submit">Add asset</button></form></div>
+        <div class="panel tablewrap">${r.rows.length ? `<table><tr><th>Asset</th><th>Bought</th><th class="num">Cost</th><th class="num">Current value</th><th></th></tr>${r.rows.map(a => `<tr><td>${esc(a.name)}</td><td>${esc(dateFmt(isoDate(a.bought_on) + 'T12:00:00+03:00'))}</td><td class="num">${fmt(a.cost_cents)}</td><td class="num">${fmt(assetBookValue(a, today))}</td><td class="right">${delBtn('/pos/assets/' + a.id + '/delete')}</td></tr>`).join('')}</table><p class="muted">Current value drops evenly over the useful life (straight-line depreciation).</p>` : '<p class="muted">No assets recorded.</p>'}</div>` });
+    }));
+    router.post('/assets', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 120), cost = parseMoney(req.body.cost), salv = str(req.body.salvage) === '' ? 0 : parseMoney(req.body.salvage), life = parseCount(req.body.life || '5', { min: 1, max: 50 });
+        if (!name || cost === null || cost <= 0 || salv === null || salv > cost || !life || !validDate(req.body.bought_on)) return back(res, '/pos/assets', '', 'Check the name, cost, date and useful life.');
+        await q('INSERT INTO pos_assets (shop_id, name, cost_cents, bought_on, life_years, salvage_cents) VALUES ($1,$2,$3,$4,$5,$6)', [req.shop.id, name, cost, req.body.bought_on, life, salv]);
+        back(res, '/pos/assets', 'Asset added.');
+    }));
+    router.post('/assets/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_assets WHERE id=$1 AND shop_id=$2', [id, req.shop.id]);
+        back(res, '/pos/assets', 'Asset removed.');
+    }));
 
-// ---------------------------------------------------------------
-// 9. Booking links: they carry only the booking id and a signature.
-//    The page always reads the real details from the database,
-//    so a link can never be edited into a fake receipt.
-// ---------------------------------------------------------------
-const linksEnabled = () => LINK_SECRET.length >= 16 && PUBLIC_BASE_URL.startsWith('https://');
-const signId = id => crypto.createHmac('sha256', LINK_SECRET).update('booking:' + id).digest('base64url');
-function makeBookingLink(b) {
-    if (!linksEnabled()) return '';
-    return `${PUBLIC_BASE_URL}/booking/${b.id}.${signId(b.id)}`;
-}
-function readBookingLink(token) {
-    if (LINK_SECRET.length < 16) return null;
-    const t = String(token || '');
-    const dot = t.lastIndexOf('.');
-    if (dot < 1) return null;
-    const id = t.slice(0, dot);
-    if (!validBookingId(id)) return null;
-    const given = Buffer.from(t.slice(dot + 1));
-    const expected = Buffer.from(signId(id));
-    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
-    return id;
-}
+    // ----- notebook -----
+    router.get('/notebook', ah(async (req, res) => {
+        const r = await q('SELECT * FROM pos_notes WHERE shop_id=$1 ORDER BY created_at DESC LIMIT 200', [req.shop.id]);
+        send(req, res, { title: 'Notebook', nav: 'notebook', body: `<h1>Notebook</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><form action="/pos/notebook" method="POST"><div class="field"><label for="t">Title</label><input id="t" name="title" required maxlength="120"></div><div class="field"><label for="b">Note</label><textarea id="b" name="body" rows="4" maxlength="4000"></textarea></div><button class="btn" type="submit">Save note</button></form></div>
+        ${r.rows.map(n => `<div class="panel"><div class="row" style="align-items:center"><h2 style="margin:0">${esc(n.title)}</h2><span class="muted" style="flex:0 0 auto">${esc(timeFmt(n.created_at))}</span><span style="flex:0 0 auto">${delBtn('/pos/notebook/' + n.id + '/delete')}</span></div><p style="white-space:pre-wrap;margin-bottom:0">${esc(n.body)}</p></div>`).join('') || '<p class="muted">No notes yet. Use this for supplier numbers, reminders and anything you want to remember.</p>'}` });
+    }));
+    router.post('/notebook', ah(async (req, res) => {
+        const title = str(req.body.title).slice(0, 120);
+        if (!title) return back(res, '/pos/notebook', '', 'Please enter a title.');
+        await q('INSERT INTO pos_notes (shop_id, title, body) VALUES ($1,$2,$3)', [req.shop.id, title, String(req.body.body || '').slice(0, 4000)]);
+        back(res, '/pos/notebook', 'Note saved.');
+    }));
+    router.post('/notebook/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id) await q('DELETE FROM pos_notes WHERE id=$1 AND shop_id=$2', [id, req.shop.id]);
+        back(res, '/pos/notebook', 'Note deleted.');
+    }));
 
-// ---------------------------------------------------------------
-// 10. PDF receipt
-// ---------------------------------------------------------------
-// The built-in PDF fonts only cover Latin characters, so anything else becomes "?"
-const pdfText = v => String(v == null ? '' : v)
-    .replace(/[\r\n\t]+/g, ' ')
-    .replace(/[^\x20-\x7E¡-ÿ]/g, '?');
+    // ----- items export -----
+    router.get('/items.csv', ah(async (req, res) => {
+        const r = await q('SELECT i.name, c.name AS cat, i.barcode, i.price_cents, i.cost_cents, i.stock, i.track_stock, i.reorder_level, i.active FROM pos_items i LEFT JOIN pos_categories c ON c.id=i.category_id WHERE i.shop_id=$1 ORDER BY i.name', [req.shop.id]);
+        const lines = [['Item', 'Category', 'Barcode', 'Price', 'Cost', 'Stock', 'Tracked', 'Reorder level', 'Active'].map(csvCell).join(',')];
+        for (const i of r.rows) lines.push([i.name, i.cat || '', i.barcode || '', (i.price_cents / 100).toFixed(2), (i.cost_cents / 100).toFixed(2), i.stock, i.track_stock ? 'yes' : 'no', i.reorder_level, i.active ? 'yes' : 'no'].map(csvCell).join(','));
+        res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="items.csv"', 'Cache-Control': 'no-store' }).send('﻿' + lines.join('\r\n'));
+    }));
 
-function generatePdfBuffer(b) {
-    return new Promise((resolve, reject) => {
-        if (!PDFDocument) return reject(new Error('PDFKit not available'));
-        const doc = new PDFDocument({ size: 'A4', margin: 50, info: { Title: 'Payment Receipt - Tencent Innovations', Author: 'Tencent Innovations' } });
-        const chunks = [];
-        doc.on('data', c => chunks.push(c));
-        doc.on('end', () => resolve(Buffer.concat(chunks)));
-        doc.on('error', reject);
+    app.use('/pos', router);
 
-        doc.fillColor('#0284c7').font('Helvetica-Bold').fontSize(22).text('TENCENT INNOVATIONS', { align: 'center' });
-        doc.fillColor('#64748b').font('Helvetica').fontSize(10).text('Rangwe, Homa Bay County | Tel: 0740 311 014 | tencentbz@gmail.com', { align: 'center' });
-        doc.moveDown(2);
-        doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(16).text('OFFICIAL PAYMENT RECEIPT', { align: 'center' });
-        doc.moveDown(1.5);
+    // ======================= BUSINESS FEATURES: subscription, gateways, branches, staff, install =======================
+    const pubUrl = path => (publicBaseUrl || '') + path;
 
-        const dateStr = new Date(b.paidAt || Date.now()).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) + ' EAT';
-        const rows = [
-            ['Reference / Account:', b.accountRef],
-            ['Client Name:', b.name],
-            ['Phone Number:', b.phone],
-            ['Service Rendered:', b.service],
-            ['Location:', b.location],
-            ...breakdownLines(b).map(([k, v]) => [k + ':', v]),
-            ['Amount Paid:', `KES ${Number(b.amount).toLocaleString('en-KE')}`],
-            ['M-Pesa Receipt:', b.receipt || 'See your M-Pesa SMS'],
-            ['Date & Time:', dateStr],
-            ['Payment Status:', 'PAID & CONFIRMED']
-        ];
-        let y = doc.y;
-        rows.forEach(([label, val]) => {
-            const v = pdfText(val);
-            doc.font('Helvetica').fontSize(12);
-            const h = Math.max(doc.heightOfString(v, { width: 320 }), 16);
-            doc.fillColor('#0f172a').font('Helvetica-Bold').text(label, 50, y, { width: 160 });
-            doc.font('Helvetica').text(v, 220, y, { width: 320 });
-            y += h + 10;
-        });
-        doc.fontSize(10).fillColor('#64748b').text('Thank you for choosing Tencent Innovations. This is an electronically generated receipt.', 50, y + 30, { align: 'center', width: 495 });
-        doc.end();
-    });
-}
-
-function sendPdf(res, buf, accountRef) {
-    const ref = String(accountRef || 'receipt').replace(/[^A-Za-z0-9_-]/g, '') || 'receipt';
-    res.set({
-        'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="Tencent-Receipt-${ref}.pdf"`,
-        'Content-Length': buf.length,
-        'Cache-Control': 'private, no-store',
-        'X-Robots-Tag': 'noindex, nofollow'
-    });
-    res.end(buf);
-}
-
-// ---------------------------------------------------------------
-// 11. Receipt email to the customer
-// ---------------------------------------------------------------
-function receiptEmailHtml(b, link) {
-    const row = (k, v) => `<tr><td style="padding:8px 0;color:#5b7078;">${esc(k)}</td><td style="padding:8px 0;text-align:right;font-weight:600;">${esc(v)}</td></tr>`;
-    return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#17323a;line-height:1.5;">
-<h2 style="margin:0 0 4px;">Payment received</h2>
-<p style="margin:0 0 16px;color:#5b7078;">Thank you, ${esc(b.name)}. Your receipt is attached to this email as a PDF.</p>
-<table style="width:100%;border-collapse:collapse;border-top:1px solid #d7dfd8;border-bottom:1px solid #d7dfd8;">
-${row('Service', b.service)}${row('Location', b.location)}${breakdownLines(b).map(([k, v]) => row(k, v)).join('')}${row('Amount paid', 'KES ' + b.amount.toLocaleString('en-KE'))}${row('M-Pesa receipt', b.receipt || 'See your M-Pesa SMS')}${row('Reference', b.accountRef)}
-</table>
-${link ? `<p style="margin:20px 0;"><a href="${esc(link)}" style="display:inline-block;background:#0284c7;color:#ffffff;padding:10px 18px;border-radius:6px;text-decoration:none;font-weight:bold;">View your booking online</a></p>` : ''}
-<p>An engineer will call you on ${esc(b.phone)} to agree a time for the visit.</p>
-<p style="color:#5b7078;font-size:13px;">Tencent Innovations, Rangwe, Homa Bay County. Calls 0740 311 014</p>
-</div>`;
-}
-function receiptEmailText(b, link) {
-    return `Payment received\n\nThank you, ${b.name}. Your receipt is attached to this email as a PDF.\n\n` +
-        `Service: ${b.service}\nLocation: ${b.location}\n${breakdownLines(b).map(([k, v]) => k + ': ' + v + '\n').join('')}Amount paid: KES ${b.amount.toLocaleString('en-KE')}\n` +
-        `M-Pesa receipt: ${b.receipt || 'See your M-Pesa SMS'}\nReference: ${b.accountRef}\n` +
-        (link ? `\nView your booking online: ${link}\n` : '') +
-        `\nAn engineer will call you on ${b.phone} to agree a time for the visit.\n\nTencent Innovations, Rangwe, Homa Bay County. Calls 0740 311 014\n`;
-}
-async function setEmailStatus(id, status) {
-    try { await pool.query('UPDATE bookings SET email_status = $2 WHERE id = $1', [id, String(status).slice(0, 300)]); } catch (_) { /* best effort */ }
-}
-
-// Sends the PDF receipt to the customer. Never throws; returns true/false.
-async function emailReceipt(b) {
-    if (!b.email) { await setEmailStatus(b.id, 'no email address'); return false; }
-    try {
-        const attachments = [];
-        if (PDFDocument) attachments.push({ filename: `Tencent-Receipt-${b.accountRef}.pdf`, content: await generatePdfBuffer(b), contentType: 'application/pdf' });
-        const link = makeBookingLink(b);
-        const via = await sendMail({
-            to: b.email,
-            subject: `Your receipt from Tencent Innovations: ${b.service}`,
-            html: receiptEmailHtml(b, link),
-            text: receiptEmailText(b, link),
-            attachments
-        });
-        await setEmailStatus(b.id, 'sent via ' + via);
+    // ----- monthly subscription, paid by M-Pesa to the platform's own account (the one set up in server.js) -----
+    const subLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many payment attempts. Please try again later.' });
+    const subLastCheck = new Map();
+    async function markSubPaid(id, receipt) {   // only the first caller extends the subscription, even if the callback and the status check arrive together
+        const done = await q(`WITH p AS (UPDATE pos_sub_payments SET status='paid', receipt=CASE WHEN $2 <> '' THEN $2 ELSE receipt END, paid_at=now() WHERE id=$1 AND status <> 'paid' RETURNING business_id)
+                 UPDATE pos_shops s SET sub_until = GREATEST(now(), COALESCE(s.sub_until, now())) + interval '1 month' FROM p WHERE s.id = p.business_id RETURNING s.id`, [id, String(receipt || '').slice(0, 40)]);
+        if (done.rows[0]) await auditRaw(done.rows[0].id, null, 'system', null, '', 'sub.paid', 'KES ' + SUB_FEE_KES + ' ' + String(receipt || ''), '');
+        if (receipt) await q(`UPDATE pos_sub_payments SET receipt=$2 WHERE id=$1 AND receipt = ''`, [id, String(receipt).slice(0, 40)]);
+    }
+    // called from server.js when Safaricom's callback is not for a booking; returns true when it was ours
+    async function handlePlatformCallback(cb) {
+        const p = (await q('SELECT * FROM pos_sub_payments WHERE checkout_request_id=$1', [String(cb.CheckoutRequestID || '')])).rows[0];
+        if (!p) return false;
+        const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [], meta = n => { const it = items.find(i => i.Name === n); return it ? it.Value : undefined; };
+        const receipt = String(meta('MpesaReceiptNumber') || '').slice(0, 40);
+        if (p.status === 'paid') { if (receipt) await q(`UPDATE pos_sub_payments SET receipt=$2 WHERE id=$1 AND receipt = ''`, [p.id, receipt]); return true; }
+        if (Number(cb.ResultCode) !== 0) { await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [p.id]); return true; }
+        if (Number(meta('Amount')) !== p.amount_kes) { await q(`UPDATE pos_sub_payments SET status='review', receipt=$2 WHERE id=$1 AND status IN ('pending','review')`, [p.id, receipt]); return true; }
+        try {   // do not trust the callback alone
+            const r = await platform.stkQuery(p.checkout_request_id);
+            if (String(r.ResultCode) !== '0') { await q(`UPDATE pos_sub_payments SET status='review' WHERE id=$1 AND status='pending'`, [p.id]); return true; }
+        } catch (e) { console.error('POS subscription status check failed, leaving it pending for the background check:', e.message); return true; }
+        await markSubPaid(p.id, receipt);
         return true;
-    } catch (err) {
-        console.error('Receipt email failed:', err.message);
-        await setEmailStatus(b.id, 'failed: ' + err.message);
+    }
+    router.get('/subscribe', ah(async (req, res) => {
+        const b = req.biz, until = b.sub_until ? new Date(b.sub_until) : null, active = req.subActive;
+        const hist = (await q('SELECT amount_kes, status, receipt, created_at FROM pos_sub_payments WHERE business_id=$1 ORDER BY created_at DESC LIMIT 12', [b.id])).rows;
+        const phone = platform && platform.normalizePhone ? (platform.normalizePhone(req.session.user.phone) || '') : '';
+        const payId = parseCount(req.query.pay, { min: 1 });
+        send(req, res, { title: 'Subscription', nav: 'subscription', body: `<h1>Subscription</h1>${notice(req)}${errBox(req)}
+        <div class="panel" style="max-width:620px"><h2>${active ? 'Your POS is active' : 'Your POS is not active'}</h2>
+            <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month</b> for the whole business, including all branches and cashiers. Paying early adds a month to the end of your current period.</p>
+            ${payId ? `<div id="paybox" class="alert ok" role="status">Check your phone and enter your M-Pesa PIN. Waiting for the payment...</div>` : ''}
+            ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" class="row"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" type="submit">Pay KES ${SUB_FEE_KES.toLocaleString('en-KE')} with M-Pesa</button></form>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
+        </div>
+        ${active ? '<div class="panel" style="max-width:620px"><h2>Install the app</h2><p>Your POS can be installed on phones, tablets and computers. <a href="/pos/install">Open the install page</a>.</p></div>' : ''}
+        <div class="panel tablewrap" style="max-width:620px"><h2>Payments</h2>${hist.length ? `<table><tr><th>Date</th><th class="num">Amount</th><th>Status</th><th>M-Pesa code</th></tr>${hist.map(h => `<tr><td>${esc(timeFmt(h.created_at))}</td><td class="num">${h.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${h.status === 'paid' ? 'ok' : h.status === 'pending' ? 'warn' : 'bad'}">${esc(h.status)}</span></td><td>${esc(h.receipt)}</td></tr>`).join('')}</table>` : '<p class="muted">No payments yet.</p>'}</div>
+        ${payId ? `<script nonce="${req.nonce || ''}">(function(){var n=0,box=document.getElementById('paybox'),t=setInterval(function(){n++;fetch('/pos/subscribe/status/${payId}',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.status==='paid'){clearInterval(t);location.href='/pos/subscribe?ok='+encodeURIComponent('Payment received. Your POS is active.');}else if(d.status==='failed'){clearInterval(t);location.href='/pos/subscribe?err='+encodeURIComponent('The payment was cancelled or timed out. Please try again.');}else if(d.status==='review'){clearInterval(t);box.textContent='We are confirming your payment and will call you shortly.';}else if(n>=60){clearInterval(t);box.textContent='We have not seen the payment yet. If you paid, it will switch on automatically.';}}).catch(function(){});},4000);})();</script>` : ''}` });
+    }));
+    router.post('/subscribe', subLimiter, ah(async (req, res) => {
+        if (!platform || !platform.mpesaConfigured()) return back(res, '/pos/subscribe', '', 'Online payment is not available right now. Please call 0740 311 014.');
+        const phone = platform.normalizePhone(str(req.body.phone));
+        if (!phone) return back(res, '/pos/subscribe', '', 'Please enter a valid Safaricom number, for example 0712345678.');
+        const open = (await q(`SELECT id FROM pos_sub_payments WHERE business_id=$1 AND status='pending' AND created_at > now() - interval '2 minutes'`, [req.biz.id])).rows[0];
+        if (open) return res.redirect('/pos/subscribe?pay=' + open.id);
+        let row = null;
+        for (let i = 0; i < 5 && !row; i++) {
+            try { row = (await q(`INSERT INTO pos_sub_payments (business_id, amount_kes, phone, account_ref) VALUES ($1,$2,$3,$4) RETURNING id, account_ref`, [req.biz.id, SUB_FEE_KES, phone, 'POS' + crypto.randomBytes(4).toString('hex').toUpperCase()])).rows[0]; }
+            catch (e) { if (e.code !== '23505') throw e; }
+        }
+        if (!row) return back(res, '/pos/subscribe', '', 'Could not start the payment. Please try again.');
+        try {
+            const r = await platform.stkPush({ amount: SUB_FEE_KES, phone, accountRef: row.account_ref, desc: 'POS monthly' });
+            await q('UPDATE pos_sub_payments SET checkout_request_id=$2 WHERE id=$1', [row.id, r.CheckoutRequestID]);
+        } catch (e) {
+            console.error('POS subscription STK failed:', e.message);
+            await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1`, [row.id]);
+            return back(res, '/pos/subscribe', '', 'We could not send the M-Pesa prompt. Check the number and try again.');
+        }
+        res.redirect('/pos/subscribe?pay=' + row.id);
+    }));
+    router.get('/subscribe/status/:id', pollLimiter, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        let p = id && (await q('SELECT * FROM pos_sub_payments WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rows[0];
+        if (!p) return res.status(404).json({ status: 'unknown' });
+        if (p.status === 'pending' && p.checkout_request_id && Date.now() - new Date(p.created_at).getTime() > 25000 && Date.now() - (subLastCheck.get(p.id) || 0) > 12000) {
+            subLastCheck.set(p.id, Date.now());
+            try {
+                const r = await platform.stkQuery(p.checkout_request_id);
+                if (String(r.ResultCode) === '0') await markSubPaid(p.id, '');
+                else if (r.ResultCode !== undefined && String(r.ResultCode) !== '') await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [p.id]);
+            } catch (_) { /* still processing */ }
+            p = (await q('SELECT status FROM pos_sub_payments WHERE id=$1', [id])).rows[0];
+        }
+        res.set('Cache-Control', 'no-store').json({ status: p.status });
+    }));
+
+    // ----- payment gateways (owner): the business's own M-Pesa till/paybill, and others -----
+    // Changing payment settings needs a fresh two-step code, because this is where a hijacked account would redirect the money.
+    const stepFresh = req => Boolean(req.has2fa && req.session.posStepAt && Date.now() - req.session.posStepAt < STEP_VALID_MS);
+    function needStep(req, res, path) {   // true when the request was refused
+        if (!req.has2fa) { back(res, '/pos/security', '', 'Turn on two-step login first. It is required to change payment settings.'); return true; }
+        if (!stepFresh(req)) { back(res, path, '', 'Enter your two-step code at the top of the page first.'); return true; }
         return false;
     }
-}
-
-// ---------------------------------------------------------------
-// 12. Payment state changes
-// ---------------------------------------------------------------
-// The receipt email and your alert go out exactly once, and only when the M-Pesa receipt number is known
-// (or, as a fallback, a few minutes after payment was confirmed without one).
-async function finalizePaid(id, force = false) {
-    const r = await pool.query(
-        `UPDATE bookings SET receipt_sent = TRUE
-         WHERE id = $1 AND status = 'paid' AND receipt_sent = FALSE AND (COALESCE(receipt, '') <> '' OR $2::boolean)
-         RETURNING id`,
-        [id, force]
-    );
-    if (!r.rowCount) return;
-    const b = await getBooking(id);
-    if (!b) return;
-    const link = makeBookingLink(b);
-    const extra = {
-        'M-Pesa receipt': b.receipt || '(not received yet, match the Reference in your M-Pesa statement)',
-        Verified: b.verified ? 'Yes, confirmed with Safaricom' : 'Callback only (status query was unavailable)'
-    };
-    if (link) {
-        extra['Booking link'] = link;
-        extra['Send to client on WhatsApp'] = `https://wa.me/${b.phone}?text=${encodeURIComponent(`Hello ${b.name}, your Tencent Innovations booking is confirmed (${b.service}, KES ${b.amount} paid). Your booking details: ${link}`)}`;
-    }
-    await notify(`✅ PAID: ${b.service} - ${b.name}`, bookingFields(b, extra));
-    await emailReceipt(b);
-}
-
-async function markPaid(id, receipt, verified) {
-    // Only the first caller flips the booking to paid. Callback and status poll can arrive together.
-    await pool.query(
-        `UPDATE bookings
-         SET status = 'paid',
-             receipt = CASE WHEN $2 <> '' THEN $2 ELSE receipt END,
-             paid_at = $3,
-             verified = $4
-         WHERE id = $1 AND status <> 'paid'`,
-        [id, receipt || '', Date.now(), Boolean(verified)]
-    );
-    await finalizePaid(id, false);
-}
-async function markFailed(id, reason) {
-    const r = await pool.query(`UPDATE bookings SET status = 'failed' WHERE id = $1 AND status = 'pending'`, [id]);
-    if (r.rowCount) console.log('PAYMENT NOT COMPLETED:', JSON.stringify({ reason: String(reason || '').slice(0, 100) }));
-}
-const markReview = id => pool.query(`UPDATE bookings SET status = 'review' WHERE id = $1 AND status IN ('pending', 'review')`, [id]);
-
-async function handleCallback(body) {
-    const cb = body && body.Body && body.Body.stkCallback;
-    if (!cb) return;
-    const booking = await getBookingByCheckout(String(cb.CheckoutRequestID || ''));
-    if (!booking) {
-        // not a survey booking: it may be a POS subscription payment
-        if (posHooks && await posHooks.handlePlatformCallback(cb)) return;
-        console.log('Callback for an unknown CheckoutRequestID');
-        return;
-    }
-
-    const succeeded = Number(cb.ResultCode) === 0;
-    const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
-    const meta = name => { const it = items.find(i => i.Name === name); return it ? it.Value : undefined; };
-    const receipt = String(meta('MpesaReceiptNumber') || '').slice(0, 40);
-
-    if (booking.status === 'paid') {
-        // Payment was already confirmed by the status check: add the receipt number, then send the receipt
-        if (succeeded && receipt && !booking.receipt) {
-            await pool.query(`UPDATE bookings SET receipt = $2 WHERE id = $1 AND COALESCE(receipt, '') = ''`, [booking.id, receipt]);
-        }
-        await finalizePaid(booking.id, false);
-        return;
-    }
-    if (!succeeded) { await markFailed(booking.id, cb.ResultDesc); return; }
-
-    // The amount paid must match the price we asked for
-    if (Number(meta('Amount')) !== booking.amount) {
-        await markReview(booking.id);
-        await notify(`⚠️ CHECK PAYMENT: amount mismatch for ${booking.name}`, bookingFields(booking, {
-            'Amount reported by callback': String(meta('Amount')),
-            'M-Pesa receipt': receipt
-        }));
-        return;
-    }
-
-    // Do not trust the callback alone: ask Safaricom directly
-    let verified = false;
-    try {
-        const q = await stkQuery(booking.checkoutRequestId);
-        verified = String(q.ResultCode) === '0';
-        if (!verified) {
-            await markReview(booking.id);
-            await notify(`⚠️ CHECK PAYMENT: callback and status query disagree for ${booking.name}`, bookingFields(booking, {
-                'M-Pesa receipt': receipt,
-                'Query result': `${q.ResultCode} ${q.ResultDesc || ''}`
-            }));
-            return;
-        }
-    } catch (err) {
-        console.error('STK status query failed, accepting callback only:', err.message);
-    }
-    await markPaid(booking.id, receipt, verified);
-}
-
-// Safaricom calls this. The secret in the URL stops strangers from posting fake payments.
-app.post('/payments/cb/:secret', (req, res) => {
-    const given = Buffer.from(String(req.params.secret));
-    const expected = Buffer.from(String(MPESA.callbackSecret || ''));
-    const ok = expected.length > 0 && given.length === expected.length && crypto.timingSafeEqual(given, expected);
-    if (!ok) return res.sendStatus(404);
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });   // answer fast, process after
-    if (!dbReady) return console.error('Callback received while the database was not ready');
-    handleCallback(req.body).catch(err => console.error('Callback error:', err.message));
-});
-
-// The "check your phone" page polls this. Only the person who made the booking can see it.
-app.get('/payments/status/:id', statusLimiter, requireDb, ah(async (req, res) => {
-    if (!(req.session && req.session.user)) return res.status(401).json({ status: 'unknown' });
-    if (!validBookingId(req.params.id)) return res.status(404).json({ status: 'unknown' });
-    let b = await getBookingForUser(req.params.id, req.session.user.id);
-    if (!b) return res.status(404).json({ status: 'unknown' });
-
-    if (b.status === 'pending' && b.checkoutRequestId &&
-        Date.now() - b.createdAt > 25000 && Date.now() - (lastStatusQuery.get(b.id) || 0) > 12000) {
-        lastStatusQuery.set(b.id, Date.now());
-        try {
-            const q = await stkQuery(b.checkoutRequestId);
-            if (String(q.ResultCode) === '0') await markPaid(b.id, '', true);
-            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') await markFailed(b.id, q.ResultDesc || 'Payment cancelled');
-        } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
-        b = (await getBookingForUser(b.id, req.session.user.id)) || b;
-    }
-    res.json({
-        status: b.status,
-        pdf: (b.status === 'paid' && PDFDocument) ? `/payments/receipt/${b.id}/download.pdf` : ''
-    });
-}));
-
-// Only the owner can download from here. (The shareable /booking/ link has its own PDF route.)
-app.get('/payments/receipt/:id/download.pdf', requireAuth, requireDb, ah(async (req, res) => {
-    if (!PDFDocument) return errorPage(req, res, 501, 'Not available', 'Receipt download is not available right now.');
-    if (!validBookingId(req.params.id)) return errorPage(req, res, 404, 'Not found', 'We could not find that receipt.', { href: '/requests', label: 'My requests' });
-    const b = await getBookingForUser(req.params.id, req.session.user.id);
-    if (!b || b.status !== 'paid') return errorPage(req, res, 404, 'Not found', 'That receipt is not available. It may not be paid yet.', { href: '/requests', label: 'My requests' });
-    sendPdf(res, await generatePdfBuffer(b), b.accountRef);
-}));
-
-// Safety net: if the callback never delivered the M-Pesa receipt number, send the receipt anyway after 3 minutes.
-// Also finishes any receipt that was waiting when the server restarted.
-setInterval(() => {
-    if (!dbReady) return;
-    pool.query(`SELECT id FROM bookings WHERE status = 'paid' AND receipt_sent = FALSE AND paid_at < $1 AND paid_at > $2`,
-        [Date.now() - 3 * 60 * 1000, Date.now() - 2 * 24 * 60 * 60 * 1000])
-        .then(r => Promise.all(r.rows.map(row => finalizePaid(row.id, true))))
-        .catch(err => console.error('Receipt sweep error:', err.message));
-}, 60 * 1000).unref();
-
-// ---------------------------------------------------------------
-// 13. Layout: left sidebar (drawer on phones), theme toggle, styled error pages
-// ---------------------------------------------------------------
-function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) {
-    const user = req.session && req.session.user ? req.session.user : null;
-    const nonce = req.nonce || '';
-    const logo = LOGO_FILE ? '<img src="/brand-logo" alt="Tencent Innovations" class="logo-img">' : '';
-    return `<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${esc(title)} - Tencent Innovations</title>
-    <script nonce="${nonce}">
-        (function () {
-            var t = 'dark';
-            try { t = localStorage.getItem('theme') || 'dark'; } catch (e) {}
-            document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
-        })();
-    </script>
-    <style>
-        :root { --bg: #0b132b; --surface: #1c2541; --sidebar-bg: #060a17; --text: #ffffff; --muted: #94a3b8; --border: #334155; --primary: #0284c7; --accent: #10b981; --danger: #f87171; }
-        [data-theme="light"] { --bg: #f8fafc; --surface: #ffffff; --sidebar-bg: #ffffff; --text: #0f172a; --muted: #64748b; --border: #cbd5e1; --primary: #0284c7; --accent: #16a34a; --danger: #dc2626; }
-        * { box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; min-height: 100vh; transition: background 0.3s, color 0.3s; }
-        a { color: var(--primary); }
-
-        .sidebar { width: 260px; background: var(--sidebar-bg); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; z-index: 100; transition: transform 0.25s ease; }
-        .sidebar-header { padding: 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; background: rgba(0,0,0,0.2); }
-        .logo-container { display: flex; align-items: center; gap: 12px; text-decoration: none; }
-        .logo-img { height: 40px; width: auto; border-radius: 6px; background: #ffffff; padding: 2px; }
-        .logo-text-group { display: flex; flex-direction: column; }
-        .logo-text { font-size: 1.1rem; font-weight: bold; color: #38bdf8; line-height: 1.1; }
-        .logo-tagline { font-size: 0.65rem; color: var(--muted); }
-
-        .sidebar-nav { flex: 1; padding: 16px 12px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; list-style: none; margin: 0; }
-        .sidebar-nav a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 0.95rem; padding: 10px 14px; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; gap: 10px; }
-        .sidebar-nav a:hover, .sidebar-nav a.active { color: var(--text); background: var(--surface); }
-
-        .sidebar-auth-group { display: flex; flex-direction: column; gap: 8px; padding: 14px 12px; background: rgba(2, 132, 199, 0.08); border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
-        .sidebar-auth-btn { text-align: center; font-weight: bold; padding: 10px 14px; border-radius: 8px; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.95rem; transition: background 0.2s; cursor: pointer; font-family: inherit; width: 100%; }
-        .sidebar-login-btn { background: var(--primary); color: #ffffff !important; border: 1px solid var(--primary); }
-        .sidebar-login-btn:hover { background: #0369a1 !important; }
-        .sidebar-register-btn { background: transparent; border: 1px solid var(--primary); color: var(--primary) !important; }
-        .sidebar-register-btn:hover { background: var(--surface) !important; }
-        .sidebar-logout-btn { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
-        .sidebar-footer { padding: 15px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-        .theme-toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
-        .theme-toggle-btn:hover { background: var(--surface); }
-
-        .mobile-bar { display: none; }
-        .scrim { display: none; }
-
-        .main-content { margin-left: 260px; flex: 1; display: flex; flex-direction: column; min-height: 100vh; min-width: 0; }
-        .container { max-width: 100%; margin: 0 auto; padding: 0; flex: 1; width: 100%; }
-
-        .hero-video-container { position: relative; width: 100%; min-height: 420px; overflow: hidden; display: flex; align-items: center; justify-content: center; text-align: center; border-bottom: 3px solid var(--border); background: linear-gradient(135deg, #0b132b 0%, #0c4a6e 55%, #0b132b 100%); background-size: 200% 200%; animation: drift 18s ease-in-out infinite; }
-        .hero-video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; filter: brightness(0.45); }
-        .hero-overlay-content { position: relative; z-index: 2; padding: 30px 20px; max-width: 800px; }
-        .hero-logo-badge { height: 75px; width: auto; background: #fff; padding: 6px; border-radius: 10px; margin-bottom: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-        .hero-overlay-content h1 { font-size: 2.3rem; color: #ffffff; margin: 0 0 10px 0; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
-        .hero-overlay-content p { color: #e2e8f0; font-size: 1.15rem; margin: 0 0 20px 0; text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
-        .hero-cta { display: inline-block; background: #38bdf8; color: #0f172a; padding: 12px 28px; border-radius: 30px; font-weight: bold; text-decoration: none; }
-        @keyframes drift { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
-
-        .services-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; width: 100%; }
-        .service-card { padding: 40px 20px; text-align: center; display: flex; flex-direction: column; justify-content: space-between; min-height: 320px; transition: transform 0.2s; position: relative; }
-        .service-card:hover { transform: translateY(-4px); z-index: 10; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
-        .service-card h3 { font-size: 1.25rem; font-weight: 800; letter-spacing: 0.05em; margin: 15px 0 10px 0; text-transform: uppercase; }
-        .service-card p { font-size: 0.9rem; line-height: 1.5; margin-bottom: 25px; opacity: 0.9; }
-        .service-icon { font-size: 2.3rem; margin-bottom: 10px; }
-        .card-black { background: #000000; color: #ffffff; border-right: 1px solid #1e293b; }
-        .card-gray { background: #334155; color: #ffffff; border-right: 1px solid #475569; }
-        .card-light { background: #f1f5f9; color: #0f172a; border-right: 1px solid #cbd5e1; }
-        .card-teal { background: #14b8a6; color: #000000; }
-        .enquire-btn { display: inline-block; background: #ffffff; color: #0f172a; padding: 10px 20px; border-radius: 4px; font-weight: bold; text-decoration: none; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; transition: opacity 0.2s; }
-        .card-black .enquire-btn { background: #0284c7; color: #fff; }
-        .card-gray .enquire-btn, .card-light .enquire-btn, .card-teal .enquire-btn { background: #0f172a; color: #fff; }
-        .enquire-btn:hover { opacity: 0.85; }
-
-        .general-container { padding: 40px 30px; max-width: 900px; margin: 0 auto; }
-        .general-container h2 { margin-top: 0; }
-        .quote-box { background: var(--bg); border: 1px dashed var(--border); border-radius: 8px; padding: 12px 14px; margin: 0 0 16px 0; color: var(--muted); }
-        .quote-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; color: var(--text); }
-        .quote-row.total { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 8px; font-weight: bold; color: var(--accent); }
-        .terms h3 { color: var(--primary); margin-top: 28px; }
-        .terms p.clause { margin: 8px 0; }
-        .terms p.clause strong { color: var(--accent); margin-right: 6px; }
-        .terms ul { padding-left: 22px; }
-        .sub-title { color: var(--muted); font-size: 1.1rem; margin-top: -6px; margin-bottom: 22px; }
-        .intro-text { font-size: 1.05rem; color: var(--text); margin-bottom: 22px; }
-        .cta-btn { display: inline-block; background: var(--primary); color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1rem; border: none; cursor: pointer; text-align: center; font-family: inherit; }
-        .cta-btn:hover { background: #0369a1; }
-        .cta-btn.block { display: block; width: 100%; }
-        .cta-btn.green { background: var(--accent); color: #0f172a; }
-        .cta-btn.small { padding: 6px 12px; font-size: 0.85rem; border-radius: 6px; }
-        .form-container { background: var(--surface); border: 1px solid var(--border); padding: 30px; border-radius: 12px; margin-top: 20px; text-align: left; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 8px; color: var(--primary); font-weight: 600; }
-        .form-group input, .form-group select, .form-group textarea { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 1rem; font-family: inherit; }
-        .form-group small { display: block; margin-top: 6px; color: var(--muted); }
-        .alert { padding: 12px 14px; border-radius: 8px; margin: 0 0 18px 0; border: 1px solid var(--danger); color: var(--danger); background: rgba(248,113,113,0.1); }
-        .alert.ok { border-color: var(--accent); color: var(--accent); background: rgba(16,185,129,0.1); }
-        .badge { padding: 4px 10px; border-radius: 6px; font-weight: bold; font-size: 0.85rem; display: inline-block; }
-        .badge.paid { background: rgba(74,222,128,0.15); color: var(--accent); }
-        .badge.pending { background: rgba(56,189,248,0.15); color: #38bdf8; }
-        .badge.bad { background: rgba(248,113,113,0.15); color: var(--danger); }
-        .data-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.95rem; }
-        .data-table th { padding: 14px 12px; background: var(--bg); border-bottom: 2px solid var(--border); color: var(--primary); }
-        .data-table td { padding: 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
-        .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; margin-top: 20px; }
-        .inline-form { display: inline; margin: 0; }
-
-        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.75); z-index: 1000; display: flex; align-items: center; justify-content: center; animation: fadeIn 0.2s ease-out; }
-        .modal-box { background: var(--surface); border: 2px solid var(--accent); padding: 30px; border-radius: 12px; max-width: 450px; width: 90%; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        .modal-box h3 { color: var(--accent); margin-top: 0; font-size: 1.35rem; }
-        .modal-box p { font-size: 1.05rem; line-height: 1.5; color: var(--text); margin: 15px 0 25px 0; }
-        .modal-btn { background: var(--accent); color: #0f172a; border: none; padding: 12px 28px; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; text-transform: uppercase; }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-
-        .contact-bar { background: var(--sidebar-bg); border-top: 1px solid var(--border); padding: 25px 30px; text-align: center; color: var(--muted); margin-top: auto; }
-        .contact-bar strong { color: var(--primary); }
-        .site-footer { background: var(--sidebar-bg); border-top: 1px solid var(--border); color: var(--muted); padding: 40px 30px 20px 30px; }
-        .footer-grid { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 30px; margin-bottom: 30px; }
-        .footer-col h4 { color: var(--primary); font-size: 1rem; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); padding-bottom: 6px; }
-        .footer-links { list-style: none; padding: 0; margin: 0; }
-        .footer-links li { margin-bottom: 8px; }
-        .footer-links a { color: var(--muted); text-decoration: none; font-size: 0.9rem; }
-        .footer-links a:hover { color: var(--primary); }
-        .footer-bottom { max-width: 1100px; margin: 0 auto; border-top: 1px solid var(--border); padding-top: 15px; text-align: center; font-size: 0.85rem; color: var(--muted); }
-
-        @media (max-width: 992px) { .services-grid { grid-template-columns: repeat(2, 1fr); } }
-        @media (max-width: 768px) {
-            body { flex-direction: column; }
-            .mobile-bar { display: flex; position: fixed; top: 0; left: 0; right: 0; height: 56px; z-index: 90; align-items: center; gap: 12px; padding: 0 14px; background: var(--sidebar-bg); border-bottom: 1px solid var(--border); }
-            .menu-btn { background: transparent; border: 1px solid var(--border); color: var(--text); border-radius: 8px; width: 40px; height: 40px; font-size: 1.3rem; cursor: pointer; }
-            .mobile-title { font-weight: bold; color: #38bdf8; }
-            .sidebar { transform: translateX(-100%); width: 280px; max-width: 85vw; }
-            .sidebar.open { transform: translateX(0); box-shadow: 0 0 40px rgba(0,0,0,0.6); }
-            .scrim.open { display: block; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 95; }
-            .main-content { margin-left: 0; padding-top: 56px; }
-            .services-grid { grid-template-columns: 1fr; }
-            .general-container { padding: 28px 16px; }
-            .hero-overlay-content h1 { font-size: 1.7rem; }
-            .form-container { padding: 20px; }
-        }
-        @media (prefers-reduced-motion: reduce) { .hero-video-container { animation: none; } * { transition: none !important; } }
-    </style>
-</head>
-<body>
-    ${showMpesaPopup ? `
-    <div class="modal-overlay" id="mpesa-modal">
-        <div class="modal-box">
-            <h3>📱 M-Pesa Prompt Sent!</h3>
-            <p>An M-Pesa payment prompt has been sent to your phone. <strong>Please put your M-Pesa PIN immediately</strong> to authorize your order and complete the transaction.</p>
-            <button class="modal-btn" id="mpesa-modal-close" type="button">I Have Entered My PIN</button>
-        </div>
-    </div>` : ''}
-
-    <div class="mobile-bar">
-        <button class="menu-btn" id="menu-btn" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">☰</button>
-        <span class="mobile-title">Tencent Innovations</span>
-    </div>
-    <div class="scrim" id="scrim"></div>
-
-    <aside class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-            <a href="/" class="logo-container">
-                ${logo}
-                <div class="logo-text-group">
-                    <span class="logo-text">Tencent Innovations</span>
-                    <span class="logo-tagline">Connecting You, Faster.</span>
-                </div>
-            </a>
-        </div>
-        <ul class="sidebar-nav">
-            <li><a href="/" class="${activeNav === 'home' ? 'active' : ''}">🏠 Home</a></li>
-            <li><a href="/wifi" class="${activeNav === 'wifi' ? 'active' : ''}">📶 WiFi & Networking</a></li>
-            <li><a href="/cctv" class="${activeNav === 'cctv' ? 'active' : ''}">📷 CCTV Systems</a></li>
-            <li><a href="/smart-locks" class="${activeNav === 'smart-locks' ? 'active' : ''}">🔐 Smart Locks</a></li>
-            <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
-            <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
-            <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">🧾 POS for Shops</a></li>
-            <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
-            ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
-            <li><a href="/contact" class="${activeNav === 'contact' ? 'active' : ''}">📞 Contact Us</a></li>
-            <li><a href="/terms" class="${activeNav === 'terms' ? 'active' : ''}">📄 Terms & Conditions</a></li>
-            <li><hr style="border:0; border-top:1px solid var(--border); margin: 12px 0;"></li>
-            <li>
-                <div class="sidebar-auth-group">
-                    ${user ? `
-                        <div style="padding: 4px 6px; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">👤 <strong>${esc(user.name)}</strong></div>
-                        <form action="/logout" method="POST" class="inline-form"><button type="submit" class="sidebar-auth-btn sidebar-logout-btn">🚪 Logout</button></form>
-                    ` : `
-                        <a href="/login" class="sidebar-auth-btn sidebar-login-btn">🔑 Sign In / Login</a>
-                        <a href="/register" class="sidebar-auth-btn sidebar-register-btn">📝 Register Account</a>
-                    `}
-                </div>
-            </li>
-        </ul>
-        <div class="sidebar-footer">
-            <button id="theme-toggle" class="theme-toggle-btn" type="button" aria-label="Toggle theme">
-                <span id="theme-icon">☀️</span> <span id="theme-text">Light</span>
-            </button>
-        </div>
-    </aside>
-
-    <div class="main-content">
-        <div class="container">
-            ${user && !user.verified && !/^\/(verify-email|logout)/.test(req.path) ? '<div class="alert" role="alert" style="margin-bottom:18px;">Please confirm your email address to book services. <a href="/verify-email/pending">Check how</a></div>' : ''}
-            ${content}
-        </div>
-        <div class="contact-bar">
-            📍 <strong>Rangwe, Homa Bay County</strong> &nbsp;|&nbsp; 📞 <strong>0740 311 014</strong> &nbsp;|&nbsp; ✉️ <strong>tencentbz@gmail.com</strong>
-        </div>
-        <footer class="site-footer">
-            <div class="footer-grid">
-                <div class="footer-col">
-                    <h4>Find It Fast</h4>
-                    <ul class="footer-links">
-                        <li><a href="/smart-locks">Access Control</a></li>
-                        <li><a href="/cctv">Security Systems</a></li>
-                        <li><a href="/wifi">WiFi & Networking</a></li>
-                        <li><a href="/survey">Site Surveys</a></li>
-                        <li><a href="/solar">Solar Systems</a></li>
-                    </ul>
-                </div>
-                <div class="footer-col">
-                    <h4>Customer Care</h4>
-                    <ul class="footer-links">
-                        <li><a href="${user ? '/requests' : '/login'}">My Account</a></li>
-                        <li><a href="/contact">Contact Us</a></li>
-                        <li><a href="/terms">Terms & Conditions</a></li>
-                    </ul>
-                </div>
-                <div class="footer-col">
-                    <h4>Tencent Innovations</h4>
-                    <p style="font-size: 0.85rem; color: var(--muted); line-height: 1.5;">Empowering homes, schools, and businesses across Rangwe and Homa Bay County with integrated internet, reliable security, and clean solar backup power.</p>
-                </div>
-            </div>
-            <div class="footer-bottom"><p>&copy; 2026 Tencent Innovations. All rights reserved.</p></div>
-        </footer>
-    </div>
-
-    <script nonce="${nonce}">
-        (function () {
-            var root = document.documentElement;
-            function themeUI(theme) {
-                var icon = document.getElementById('theme-icon'), text = document.getElementById('theme-text');
-                if (icon) icon.textContent = theme === 'light' ? '🌙' : '☀️';
-                if (text) text.textContent = theme === 'light' ? 'Dark' : 'Light';
-            }
-            themeUI(root.getAttribute('data-theme'));
-            document.getElementById('theme-toggle').addEventListener('click', function () {
-                var next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
-                root.setAttribute('data-theme', next);
-                try { localStorage.setItem('theme', next); } catch (e) {}
-                themeUI(next);
-            });
-
-            var sidebar = document.getElementById('sidebar'), scrim = document.getElementById('scrim'), btn = document.getElementById('menu-btn');
-            function setMenu(open) {
-                sidebar.classList.toggle('open', open);
-                scrim.classList.toggle('open', open);
-                btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-            }
-            btn.addEventListener('click', function () { setMenu(!sidebar.classList.contains('open')); });
-            scrim.addEventListener('click', function () { setMenu(false); });
-            document.addEventListener('keydown', function (e) { if (e.key === 'Escape') setMenu(false); });
-
-            var close = document.getElementById('mpesa-modal-close');
-            if (close) close.addEventListener('click', function () { document.getElementById('mpesa-modal').style.display = 'none'; });
-        })();
-    </script>
-</body>
-</html>`;
-}
-
-function errorPage(req, res, status, title, message, back = { href: '/', label: 'Back to Home' }) {
-    return res.status(status).send(renderPage(req, {
-        title,
-        activeNav: '',
-        content: `<div class="general-container"><h2>${esc(title)}</h2><p class="intro-text">${esc(message)}</p><a href="${esc(back.href)}" class="cta-btn">${esc(back.label)}</a></div>`
+    router.post('/gateways/unlock', ah(async (req, res) => {
+        if (!req.has2fa) return back(res, '/pos/security', '', 'Turn on two-step login first.');
+        const r = await verifyOwnerOtp(req, req.body.otp);
+        await saveSess(req);
+        back(res, '/pos/gateways', r.ok ? 'Unlocked for 10 minutes.' : '', r.ok ? '' : (r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.'));
     }));
-}
-
-// ---------------------------------------------------------------
-// 14. Accounts: register, login, logout
-// ---------------------------------------------------------------
-function registerForm(req, { error = '', values = {} } = {}) {
-    return `
-        <div class="general-container">
-            <h2>Create an Account</h2>
-            <p class="sub-title">Register to book services, request surveys, and receive receipts by email.</p>
-            <div class="form-container">
-                ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
-                <form action="/register" method="POST">
-                    <div class="form-group"><label for="r-name">Full Name</label><input id="r-name" type="text" name="name" required maxlength="80" autocomplete="name" placeholder="John Otieno" value="${esc(values.name || '')}"></div>
-                    <div class="form-group"><label for="r-email">Email Address (your receipts are sent here)</label><input id="r-email" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="john@example.com" value="${esc(values.email || '')}"></div>
-                    <div class="form-group"><label for="r-phone">M-Pesa Phone Number</label><input id="r-phone" type="tel" name="phone" required autocomplete="tel" placeholder="0712345678" value="${esc(values.phone || '')}"></div>
-                    <div class="form-group"><label for="r-pass">Password</label><input id="r-pass" type="password" name="password" required minlength="8" maxlength="72" autocomplete="new-password"><small>At least 8 characters.</small></div>
-                    <div class="form-group"><label for="r-pass2">Confirm Password</label><input id="r-pass2" type="password" name="confirm" required minlength="8" maxlength="72" autocomplete="new-password"></div>
-                    <button type="submit" class="cta-btn block">Register</button>
-                </form>
-                <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login">Login here</a></p>
-            </div>
-        </div>`;
-}
-
-app.get('/register', (req, res) => {
-    if (req.session.user) return res.redirect('/survey');
-    res.send(renderPage(req, { title: 'Register', activeNav: 'register', content: registerForm(req) }));
-});
-
-app.post('/register', registerLimiter, requireDb, ah(async (req, res) => {
-    const values = { name: str(req.body.name).slice(0, 80), email: str(req.body.email).toLowerCase(), phone: str(req.body.phone) };
-    const password = typeof req.body.password === 'string' ? req.body.password : '';
-    const confirm = typeof req.body.confirm === 'string' ? req.body.confirm : '';
-    const fail = message => res.status(400).send(renderPage(req, { title: 'Register', activeNav: 'register', content: registerForm(req, { error: message, values }) }));
-
-    const phone = normalizePhone(values.phone);
-    if (values.name.length < 2) return fail('Please enter your full name.');
-    if (!validEmail(values.email)) return fail('Please enter a valid email address.');
-    if (!phone) return fail('Please enter a valid Safaricom number, for example 0712345678.');
-    const pwError = passwordProblem(password, confirm, values.email);
-    if (pwError) return fail(pwError);
-
-    const hash = await bcrypt.hash(password, BCRYPT_COST);
-    let user;
-    try {
-        const r = await pool.query(
-            'INSERT INTO users (name, email, phone, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, email, phone',
-            [values.name, values.email, phone, hash]
-        );
-        user = r.rows[0];
-    } catch (err) {
-        if (err.code === '23505') return fail('We could not create that account. If you already registered, please log in instead.');
-        throw err;
+    router.get('/gateways', ah(async (req, res) => {
+        const gws = (await q('SELECT id, provider, cfg, active, is_default, callback_token FROM pos_gateways WHERE business_id=$1 ORDER BY id', [req.biz.id])).rows;
+        const byProv = Object.fromEntries(gws.map(g => [g.provider, g]));
+        const recent = (await q(`SELECT p.id, p.amount_kes, p.status, p.receipt, p.fail_reason, p.created_at, p.cashier_name, s.name AS shop FROM pos_payments p JOIN pos_shops s ON s.id=p.shop_id WHERE s.id=$1 OR s.parent_id=$1 ORDER BY p.created_at DESC LIMIT 15`, [req.biz.id])).rows;
+        const mp = byProv.mpesa, ps = byProv.paystack, mc = mp ? mp.cfg : {}, fresh = stepFresh(req);
+        const act = g => `<form action="/pos/gateways/${g.id}/test" method="POST" style="display:inline"><button class="btn small ghost">Test keys</button></form> ${g.is_default ? '<span class="tag ok">default</span>' : `<form action="/pos/gateways/${g.id}/default" method="POST" style="display:inline"><button class="btn small ghost">Make default</button></form>`} <form action="/pos/gateways/${g.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost">${g.active ? 'Switch off' : 'Switch on'}</button></form> <form action="/pos/gateways/${g.id}/rotate" method="POST" style="display:inline"><button class="btn small ghost">New callback address</button></form> <form action="/pos/gateways/${g.id}/delete" method="POST" style="display:inline"><button class="btn small ghost">Remove</button></form>`;
+        send(req, res, { title: 'Payment Gateways', nav: 'gateways', body: `<h1>Payment Gateways</h1>${notice(req)}${errBox(req)}
+        <p class="muted" style="max-width:700px">Connect your own M-Pesa till or paybill so customers can pay from a prompt on their phone at the POS terminal. The money goes straight to your account, not ours. Your keys are stored encrypted and are never shown again.</p>
+        ${vault.enabled ? '' : '<div class="alert" role="alert">Keys cannot be saved yet: the site administrator must set POS_CRED_KEY (a long random secret) in the server settings.</div>'}
+        ${req.has2fa ? (fresh ? '<div class="alert ok" role="status">Unlocked: you can change payment settings for the next few minutes.</div>' : `<div class="panel" style="max-width:720px"><form action="/pos/gateways/unlock" method="POST" class="row"><div><label for="otp">Two-step code (needed to change anything on this page)</label><input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20"></div><button class="btn" type="submit">Unlock</button></form></div>`) : '<div class="alert" role="alert">Payment settings need two-step login. <a href="/pos/security">Turn it on first</a>.</div>'}
+        <div class="panel" style="max-width:720px"><h2>M-Pesa (Safaricom Daraja) ${mp ? (mp.active ? '<span class="tag ok">connected</span>' : '<span class="tag gray">off</span>') : ''}</h2>
+            ${mp ? `<p>${act(mp)}</p><p class="muted">Callback address used for this business: <code>${esc(pubUrl('/pos/mpesa/cb/' + String(mp.callback_token).trim()))}</code> (sent with every prompt, nothing to register). Every payment is also double-checked with Safaricom before a sale is saved.</p>` : ''}
+            <form action="/pos/gateways/mpesa" method="POST"><div class="grid2">
+                <div class="field"><label for="env">Environment</label><select id="env" name="env"><option value="production" ${mc.env === 'production' ? 'selected' : ''}>Live (production)</option><option value="sandbox" ${mc.env === 'sandbox' ? 'selected' : ''}>Test (sandbox)</option></select></div>
+                <div class="field"><label for="tt">Your account type</label><select id="tt" name="txnType"><option value="paybill" ${mc.txnType !== 'till' ? 'selected' : ''}>Paybill</option><option value="till" ${mc.txnType === 'till' ? 'selected' : ''}>Buy Goods (Till)</option></select></div>
+                <div class="field"><label for="sc">Business shortcode</label><input id="sc" name="shortcode" inputmode="numeric" maxlength="8" value="${esc(mc.shortcode || '')}" placeholder="Paybill number, or store number for a till"></div>
+                <div class="field"><label for="tl">Till number (Buy Goods only)</label><input id="tl" name="till" inputmode="numeric" maxlength="8" value="${esc(mc.till || '')}"></div>
+                <div class="field"><label for="ck">Consumer key</label><input id="ck" name="consumerKey" autocomplete="off" placeholder="${mp ? 'saved: leave blank to keep' : ''}"></div>
+                <div class="field"><label for="cs">Consumer secret</label><input id="cs" name="consumerSecret" type="password" autocomplete="off" placeholder="${mp ? 'saved: leave blank to keep' : ''}"></div>
+                <div class="field"><label for="pk">Lipa na M-Pesa passkey</label><input id="pk" name="passkey" type="password" autocomplete="off" placeholder="${mp ? 'saved: leave blank to keep' : ''}"></div></div>
+            <p class="muted">Get the key, secret and passkey from developer.safaricom.co.ke (your app, then Go Live), or from Safaricom Business support.</p>
+            <button class="btn" type="submit">${mp ? 'Update M-Pesa' : 'Connect M-Pesa'}</button></form></div>
+        ${PAYSTACK_ON ? `<div class="panel" style="max-width:720px"><h2>Paystack (M-Pesa mobile money) ${ps ? (ps.active ? '<span class="tag ok">connected</span>' : '<span class="tag gray">off</span>') : ''}</h2>
+            ${ps ? `<p>${act(ps)}</p><p class="muted">Optional webhook address for your Paystack dashboard: <code>${esc(pubUrl('/pos/paystack/hook/' + String(ps.callback_token).trim()))}</code></p>` : ''}
+            <form action="/pos/gateways/paystack" method="POST"><div class="field"><label for="sk">Paystack secret key</label><input id="sk" name="secretKey" type="password" autocomplete="off" placeholder="${ps ? 'saved: leave blank to keep' : 'sk_live_...'}"></div>
+            <p class="muted">Not yet tested against Paystack's live service: try a small sale first.</p>
+            <button class="btn" type="submit">${ps ? 'Update Paystack' : 'Connect Paystack'}</button></form></div>` : ''}
+        <div class="panel tablewrap"><h2>Recent phone-prompt payments</h2>${recent.length ? `<table><tr><th>When</th><th>Shop</th><th>Cashier</th><th class="num">KES</th><th>Status</th><th>Code</th><th></th></tr>${recent.map(r => `<tr><td class="nowrap">${esc(timeFmt(r.created_at))}</td><td>${esc(r.shop)}</td><td>${esc(r.cashier_name)}</td><td class="num">${r.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${r.status === 'paid' ? 'ok' : r.status === 'pending' ? 'warn' : 'bad'}">${esc(r.status)}</span>${r.fail_reason ? '<br><small class="muted">' + esc(r.fail_reason) + '</small>' : ''}</td><td>${esc(r.receipt)}</td><td class="right">${r.status === 'review' || r.status === 'pending' ? `<form action="/pos/payments/${esc(r.id)}/confirm" method="POST" style="display:inline"><input name="receipt" placeholder="M-Pesa code" maxlength="14" required style="width:110px;display:inline-block"> <button class="btn small ghost" type="submit">I received it</button></form>` : ''}</td></tr>`).join('')}</table><p class="muted">"review" means the amount or status did not match, or no confirmation came: check your M-Pesa statement. Only press "I received it" after you see the money, with the code from your statement.</p>` : '<p class="muted">None yet.</p>'}</div>` });
+    }));
+    async function saveGateway(req, res, provider, cfg, secrets) {
+        const existing = (await q('SELECT 1 FROM pos_gateways WHERE business_id=$1 AND is_default', [req.biz.id])).rowCount > 0;
+        await q(`INSERT INTO pos_gateways (business_id, provider, cfg, secrets, callback_token, is_default) VALUES ($1,$2,$3::jsonb,$4,$5,$6)
+                 ON CONFLICT (business_id, provider) DO UPDATE SET cfg=EXCLUDED.cfg, secrets=EXCLUDED.secrets, active=TRUE`, [req.biz.id, provider, JSON.stringify(cfg), vault.seal(secrets, `${req.biz.id}:${provider}`), crypto.randomBytes(24).toString('hex'), !existing]);
+        await audit(req, 'gateway.save', `${provider} ${cfg.env || ''} ${cfg.shortcode || ''}`.trim());   // never the secrets
+        const gw = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, provider]);
+        try { await GW.PROVIDERS[provider].test(gw); return back(res, '/pos/gateways', 'Saved. The keys were accepted.'); }
+        catch (e) { return back(res, '/pos/gateways', 'Saved, but the keys were NOT accepted (' + String(e.message).slice(0, 80) + '). Check them and the Live/Test setting.'); }
     }
-    await regenerateSession(req);   // a fresh session id at login prevents session fixation
-    req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: false };
-    await saveSession(req);
-    cooldownOk('verify', user.id, 60 * 1000);   // counts as the first send, so "send again" must wait a minute
-    try { await sendVerificationEmail(user); req.session.mailProblem = false; }
-    catch (err) { console.error('Verification email failed:', err.message); req.session.mailProblem = true; }
-    await saveSession(req);
-    res.redirect('/verify-email/pending');
-}));
+    router.post('/gateways/mpesa', ah(async (req, res) => {
+        if (!vault.enabled) return back(res, '/pos/gateways', '', 'Keys cannot be saved until the site administrator sets POS_CRED_KEY.');
+        if (needStep(req, res, '/pos/gateways')) return;
+        const b = req.body || {}, old = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, 'mpesa']);
+        const cfg = { env: b.env === 'sandbox' ? 'sandbox' : 'production', txnType: b.txnType === 'till' ? 'till' : 'paybill', shortcode: str(b.shortcode), till: str(b.till) };
+        const secrets = { consumerKey: str(b.consumerKey) || (old && old.secrets.consumerKey) || '', consumerSecret: str(b.consumerSecret) || (old && old.secrets.consumerSecret) || '', passkey: str(b.passkey) || (old && old.secrets.passkey) || '' };
+        if (!/^\d{5,8}$/.test(cfg.shortcode)) return back(res, '/pos/gateways', '', 'Enter the business shortcode (5 to 8 digits).');
+        if (cfg.txnType === 'till' && !/^\d{5,8}$/.test(cfg.till)) return back(res, '/pos/gateways', '', 'For Buy Goods, enter your till number.');
+        if (cfg.txnType !== 'till') cfg.till = '';
+        for (const k of ['consumerKey', 'consumerSecret', 'passkey']) if (!/^\S{8,300}$/.test(secrets[k])) return back(res, '/pos/gateways', '', 'Please fill in the consumer key, consumer secret and passkey.');
+        await saveGateway(req, res, 'mpesa', cfg, secrets);
+    }));
+    router.post('/gateways/paystack', ah(async (req, res) => {
+        if (!PAYSTACK_ON) return back(res, '/pos/gateways', '', 'Paystack is not switched on for this server.');
+        if (!vault.enabled) return back(res, '/pos/gateways', '', 'Keys cannot be saved until the site administrator sets POS_CRED_KEY.');
+        if (needStep(req, res, '/pos/gateways')) return;
+        const old = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, 'paystack']);
+        const secretKey = str(req.body.secretKey) || (old && old.secrets.secretKey) || '';
+        if (!/^sk_(live|test)_[A-Za-z0-9]{10,}$/.test(secretKey)) return back(res, '/pos/gateways', '', 'Enter your Paystack secret key (it starts with sk_).');
+        await saveGateway(req, res, 'paystack', {}, { secretKey });
+    }));
+    const gwById = async req => { const id = parseCount(req.params.id, { min: 1 }); return id ? loadGateway('id=$1 AND business_id=$2', [id, req.biz.id]) : null; };
+    router.post('/gateways/:id/test', ah(async (req, res) => {
+        const gw = await gwById(req); if (!gw) return back(res, '/pos/gateways', '', 'Gateway not found.');
+        try { await GW.PROVIDERS[gw.provider].test(gw); back(res, '/pos/gateways', 'The keys are accepted.'); } catch (e) { back(res, '/pos/gateways', '', 'The keys were not accepted: ' + String(e.message).slice(0, 100)); }
+    }));
+    const gwAction = (name, label, fn) => router.post('/gateways/:id/' + name, ah(async (req, res) => {
+        if (needStep(req, res, '/pos/gateways')) return;
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id && await fn(req, id)) await audit(req, 'gateway.' + name, 'gateway #' + id);
+        back(res, '/pos/gateways', label);
+    }));
+    gwAction('default', 'Default gateway changed.', async (req, id) => (await q('UPDATE pos_gateways SET is_default = (id=$2) WHERE business_id=$1', [req.biz.id, id])).rowCount > 0);
+    gwAction('toggle', 'Saved.', async (req, id) => (await q('UPDATE pos_gateways SET active = NOT active WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rowCount > 0);
+    gwAction('delete', 'Removed.', async (req, id) => (await q('DELETE FROM pos_gateways WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rowCount > 0);
+    gwAction('rotate', 'New callback address created. Payments already waiting are still checked directly with the payment company.', async (req, id) => (await q('UPDATE pos_gateways SET callback_token=$3 WHERE id=$1 AND business_id=$2', [id, req.biz.id, crypto.randomBytes(24).toString('hex')])).rowCount > 0);
+    // the owner can settle a payment by hand after seeing the money on their M-Pesa statement
+    router.post('/payments/:id/confirm', ah(async (req, res) => {
+        if (needStep(req, res, '/pos/gateways')) return;
+        const code = str(req.body.receipt).toUpperCase();
+        if (!/^[A-Z0-9]{8,14}$/.test(code)) return back(res, '/pos/gateways', '', 'Enter the M-Pesa code from your statement.');
+        const p = (await q(`SELECT p.id FROM pos_payments p JOIN pos_shops s ON s.id = p.shop_id WHERE p.id=$1 AND p.status IN ('pending','review') AND p.sale_id IS NULL AND (s.id=$2 OR s.parent_id=$2)`, [String(req.params.id).slice(0, 32), req.biz.id])).rows[0];
+        if (!p) return back(res, '/pos/gateways', '', 'That payment can no longer be confirmed.');
+        await finalizePayment(p.id, code);
+        await audit(req, 'payment.manual_confirm', 'payment ' + p.id + ' code ' + code);
+        back(res, '/pos/gateways', 'Payment confirmed and the sale was saved.');
+    }));
 
-function loginForm(req, { error = '', notice = '', email = '', next = '/survey' } = {}) {
-    return `
-        <div class="general-container">
-            <h2>Login to Your Account</h2>
-            <p class="sub-title">Access surveys, service bookings, and receipt downloads.</p>
-            <div class="form-container">
-                ${notice ? `<div class="alert ok" role="status">${esc(notice)}</div>` : ''}
-                ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
-                <form action="/login" method="POST">
-                    <input type="hidden" name="next" value="${esc(next)}">
-                    <div class="form-group"><label for="l-email">Email Address</label><input id="l-email" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="john@example.com" value="${esc(email)}"></div>
-                    <div class="form-group"><label for="l-pass">Password</label><input id="l-pass" type="password" name="password" required maxlength="72" autocomplete="current-password"></div>
-                    <button type="submit" class="cta-btn block">Login</button>
-                </form>
-                <p style="margin-top: 15px; text-align:center;"><a href="/forgot-password">Forgot your password?</a></p>
-                <p style="margin-top: 10px; text-align:center;">Don't have an account? <a href="/register">Register here</a></p>
-            </div>
-        </div>`;
-}
-
-app.get('/login', (req, res) => {
-    const next = safeNext(req.query.next);
-    if (req.session.user) return res.redirect(next);
-    res.send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { next, notice: req.query.reset ? 'Your password was changed. Please log in with the new one.' : '' }) }));
-});
-
-app.post('/login', loginLimiter, requireDb, ah(async (req, res) => {
-    const email = str(req.body.email).toLowerCase().slice(0, 254);
-    const password = typeof req.body.password === 'string' ? req.body.password.slice(0, 72) : '';
-    const next = safeNext(req.body.next);
-
-    const wait = lockedMinutes(email);
-    if (wait) {
-        return res.status(429).send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { error: `Too many wrong attempts. Please wait about ${wait} minute${wait === 1 ? '' : 's'}, or reset your password.`, email, next }) }));
-    }
-    const r = await pool.query('SELECT id, name, email, phone, password_hash, email_verified FROM users WHERE lower(email) = $1', [email]);
-    const user = r.rows[0];
-    // Always run one bcrypt comparison, so unknown emails take as long as wrong passwords
-    const match = await bcrypt.compare(password, user ? user.password_hash : DUMMY_HASH);
-    if (!user || !match) {
-        recordLoginFailure(email);
-        return res.status(401).send(renderPage(req, { title: 'Login', activeNav: 'login', content: loginForm(req, { error: 'Invalid email or password.', email, next }) }));
-    }
-    clearLoginFailures(email);
-    await regenerateSession(req);
-    req.session.user = { id: user.id, name: user.name, email: user.email, phone: user.phone, verified: Boolean(user.email_verified) };
-    await saveSession(req);
-    res.redirect(next);
-}));
-
-// ---------------------------------------------------------------
-// Email confirmation
-// ---------------------------------------------------------------
-const noStore = (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); };
-const simplePage = (req, res, status, title, bodyHtml) => res.status(status).send(renderPage(req, { title, activeNav: '', content: `<div class="general-container"><h2>${esc(title)}</h2>${bodyHtml}</div>` }));
-
-app.get('/verify-email/pending', requireAuth, requireDb, noStore, ah(async (req, res) => {
-    const r = await pool.query('SELECT email_verified FROM users WHERE id = $1', [req.session.user.id]);
-    if (r.rows[0] && r.rows[0].email_verified) { req.session.user.verified = true; return res.redirect('/survey'); }
-    const sent = req.query.sent === '1';
-    simplePage(req, res, 200, 'Confirm your email', `
-        ${req.session.mailProblem ? '<div class="alert" role="alert">We could not send the confirmation email just now. Please wait a minute and press "Send the link again", or <a href="/contact">contact us</a> and we will confirm your account.</div>' : ''}
-        ${sent && !req.session.mailProblem ? '<div class="alert ok" role="status">We sent a new confirmation link. Please check your inbox (and spam folder).</div>' : ''}
-        <p class="intro-text">We sent a confirmation link to <strong>${esc(req.session.user.email)}</strong>. Open it to finish setting up your account. You need this before you can book a service, because your receipts are emailed to this address.</p>
-        <form action="/verify-email/resend" method="POST"><button type="submit" class="cta-btn">Send the link again</button></form>
-        <p style="margin-top:18px; color:var(--muted);">Wrong email address? Please <a href="/contact">contact us</a> and we will fix it.</p>`);
-}));
-
-app.post('/verify-email/resend', requireAuth, requireDb, resendLimiter, ah(async (req, res) => {
-    const u = req.session.user;
-    if (cooldownOk('verify', u.id, 60 * 1000)) {
-        const r = await pool.query('SELECT id, name, email, email_verified FROM users WHERE id = $1', [u.id]);
-        if (r.rows[0] && !r.rows[0].email_verified) {
-            try { await sendVerificationEmail(r.rows[0]); req.session.mailProblem = false; }
-            catch (err) { console.error('Verification email failed:', err.message); req.session.mailProblem = true; }
-        }
-    }
-    res.redirect('/verify-email/pending?sent=1');
-}));
-
-app.get('/verify-email', requireDb, noStore, ah(async (req, res) => {
-    const userId = await useAuthToken(String(req.query.token || ''), 'verify');
-    if (!userId) {
-        return simplePage(req, res, 400, 'Link not valid', `<p class="intro-text">This confirmation link has expired or was already used. If you have not confirmed your email yet, log in and we will send you a new link.</p><a href="/login" class="cta-btn">Log in</a>`);
-    }
-    await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [userId]);
-    if (req.session.user && req.session.user.id === userId) req.session.user.verified = true;
-    simplePage(req, res, 200, 'Email confirmed', `<div class="alert ok" role="status">Thank you. Your email address is confirmed.</div><p class="intro-text">You can now book services and receive your receipts by email.</p><a href="${req.session.user ? '/survey' : '/login'}" class="cta-btn">${req.session.user ? 'Book a Survey' : 'Log in'}</a>`);
-}));
-
-// ---------------------------------------------------------------
-// Forgot / reset password
-// ---------------------------------------------------------------
-function forgotForm(error = '') {
-    return `<div class="general-container">
-        <h2>Forgot Your Password?</h2>
-        <p class="sub-title">Enter your account email and we will send you a link to choose a new one.</p>
-        <div class="form-container">
-            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
-            <form action="/forgot-password" method="POST">
-                <div class="form-group"><label for="f-email">Email Address</label><input id="f-email" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="john@example.com"></div>
-                <button type="submit" class="cta-btn block">Send Reset Link</button>
-            </form>
-            <p style="margin-top: 15px; text-align:center;"><a href="/login">Back to login</a></p>
-        </div></div>`;
-}
-app.get('/forgot-password', noStore, (req, res) => {
-    if (req.session.user) return res.redirect('/requests');
-    res.send(renderPage(req, { title: 'Forgot Password', activeNav: 'login', content: forgotForm() }));
-});
-app.post('/forgot-password', forgotLimiter, requireDb, ah(async (req, res) => {
-    const email = str(req.body.email).toLowerCase().slice(0, 254);
-    if (!validEmail(email)) return res.status(400).send(renderPage(req, { title: 'Forgot Password', activeNav: 'login', content: forgotForm('Please enter a valid email address.') }));
-    // The same answer is given whether or not the account exists, and the work happens after replying so timing reveals nothing
-    simplePage(req, res, 200, 'Check your email', `<p class="intro-text">If an account exists for <strong>${esc(email)}</strong>, we have sent a link to reset the password. It works for 1 hour. Please check your spam folder too.</p><a href="/login" class="cta-btn">Back to login</a>`);
-    quietly('Password reset email failed', (async () => {
-        const r = await pool.query('SELECT id, name, email FROM users WHERE lower(email) = $1', [email]);
-        const user = r.rows[0];
-        if (user && cooldownOk('reset', user.id, 2 * 60 * 1000)) await sendResetEmail(user);
-    })());
-}));
-
-function resetForm(token, error = '') {
-    return `<div class="general-container">
-        <h2>Choose a New Password</h2>
-        <div class="form-container">
-            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
-            <form action="/reset-password" method="POST">
-                <input type="hidden" name="token" value="${esc(token)}">
-                <div class="form-group"><label for="p-pass">New Password</label><input id="p-pass" type="password" name="password" required minlength="8" maxlength="72" autocomplete="new-password"><small>At least 8 characters.</small></div>
-                <div class="form-group"><label for="p-pass2">Confirm New Password</label><input id="p-pass2" type="password" name="confirm" required minlength="8" maxlength="72" autocomplete="new-password"></div>
-                <button type="submit" class="cta-btn block">Change Password</button>
-            </form>
-        </div></div>`;
-}
-const badResetLink = (req, res) => simplePage(req, res, 400, 'Link not valid', `<p class="intro-text">This reset link has expired or was already used. Please request a new one.</p><a href="/forgot-password" class="cta-btn">Request a new link</a>`);
-app.get('/reset-password', resetLimiter, requireDb, noStore, ah(async (req, res) => {
-    const token = String(req.query.token || '');
-    if (!(await peekAuthToken(token, 'reset'))) return badResetLink(req, res);
-    res.send(renderPage(req, { title: 'Reset Password', activeNav: 'login', content: resetForm(token) }));
-}));
-app.post('/reset-password', resetLimiter, requireDb, noStore, ah(async (req, res) => {
-    const token = typeof req.body.token === 'string' ? req.body.token : '';
-    const password = typeof req.body.password === 'string' ? req.body.password : '';
-    const confirm = typeof req.body.confirm === 'string' ? req.body.confirm : '';
-    if (!(await peekAuthToken(token, 'reset'))) return badResetLink(req, res);
-    const problem = passwordProblem(password, confirm);
-    if (problem) return res.status(400).send(renderPage(req, { title: 'Reset Password', activeNav: 'login', content: resetForm(token, problem) }));
-
-    const userId = await useAuthToken(token, 'reset');   // consumed here, so the link cannot be used twice
-    if (!userId) return badResetLink(req, res);
-    const hash = await bcrypt.hash(password, BCRYPT_COST);
-    // Using the emailed link proves the customer controls the inbox, so the email counts as confirmed too
-    const r = await pool.query('UPDATE users SET password_hash = $2, email_verified = TRUE WHERE id = $1 RETURNING id, name, email', [userId, hash]);
-    const user = r.rows[0];
-    await pool.query(`DELETE FROM session WHERE (sess->'user'->>'id') = $1`, [String(userId)]);   // sign the account out everywhere
-    await pool.query(`DELETE FROM auth_tokens WHERE user_id = $1`, [userId]);
-    if (user) {
-        clearLoginFailures(user.email.toLowerCase());
-        quietly('Password changed email failed', sendPasswordChangedEmail(user));
-    }
-    res.redirect('/login?reset=1');
-}));
-
-// POST, so another website cannot log people out with a link or image
-app.post('/logout', (req, res) => {
-    req.session.destroy(() => {
-        res.clearCookie('tc.sid');
-        res.redirect('/');
-    });
-});
-
-// ---------------------------------------------------------------
-// 15. Public pages
-// ---------------------------------------------------------------
-app.get('/', (req, res) => {
-    const logoBadge = LOGO_FILE ? '<img src="/brand-logo" alt="Tencent Innovations Logo" class="hero-logo-badge"><br>' : '';
-    const video = HERO_VIDEO ? '<video autoplay muted loop playsinline class="hero-video"><source src="/hero.mp4" type="video/mp4"></video>' : '';
-    const content = `
-        <div class="hero-video-container">
-            ${video}
-            <div class="hero-overlay-content">
-                ${logoBadge}
-                <h1>INTEGRATED TECHNOLOGY & SECURITY LEADERS</h1>
-                <p>Providing high-performance WiFi, Solar Backup, CCTV, Smart Locks, and Electric Fences across East Africa.</p>
-                <div style="margin-top:15px;"><a href="/survey" class="hero-cta">Book Site Survey</a></div>
-            </div>
-        </div>
-
-        <div class="services-grid">
-            <div class="service-card card-black">
-                <div><div class="service-icon">📶</div><h3>WIFI NETWORKS</h3><p>High-speed hotspot and dedicated home/office fiber internet installations designed for maximum uptime and stability.</p></div>
-                <div><a href="/wifi" class="enquire-btn">Enquire Now</a></div>
-            </div>
-            <div class="service-card card-gray">
-                <div><div class="service-icon">☀️</div><h3>SOLAR SOLUTIONS</h3><p>Contact us now for your solar system quote for both Home & Commercial off-grid and hybrid kits.</p></div>
-                <div><a href="/solar" class="enquire-btn">Enquire Now</a></div>
-            </div>
-            <div class="service-card card-light">
-                <div><div class="service-icon">📷</div><h3>CCTV SYSTEMS</h3><p>Advanced security surveillance cameras with remote smartphone viewing and crystal-clear night vision.</p></div>
-                <div><a href="/cctv" class="enquire-btn">Enquire Now</a></div>
-            </div>
-            <div class="service-card card-teal">
-                <div><div class="service-icon">🔐 & ⚡</div><h3>LOCKS & FENCES</h3><p>Secure biometric smart locks and high-voltage perimeter electric fences engineered to protect your premises.</p></div>
-                <div><a href="/smart-locks" class="enquire-btn">Enquire Now</a></div>
-            </div>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Home', activeNav: 'home', content }));
-});
-
-const servicePage = (route, nav, title, heading, sub, body, button) => app.get(route, (req, res) => {
-    const content = `
-        <div class="general-container">
-            <h2>${heading}</h2>
-            <p class="sub-title">${sub}</p>
-            ${body}
-            <div class="form-container" style="margin-top: 25px;">
-                <p style="margin-top:0;">${button.text}</p>
-                <a href="/survey" class="cta-btn">${button.label}</a>
-            </div>
-        </div>`;
-    res.send(renderPage(req, { title, activeNav: nav, content }));
-});
-
-servicePage('/wifi', 'wifi', 'WiFi & Networking',
-    'Reliable WiFi for Homes, Rentals, and ISP Resellers.',
-    'Pay-as-you-go hotspots, PPPoE client management, and dedicated fiber connections.',
-    `<div class="form-container" style="border-left: 4px solid var(--primary);">
-        <h3 style="color:var(--primary); margin-top:0;">What we offer WiFi resellers, technicians & network owners</h3>
-        <ul style="line-height: 1.8; margin-bottom: 0; padding-left: 20px;">
-            <li><strong>For resellers:</strong> We set up automated M-Pesa hotspot vending (MikroTik and FreeRADIUS), so your customers buy daily, weekly or monthly vouchers and are connected automatically.</li>
-            <li><strong>For technicians:</strong> We install and configure the network for you: mast grounding, shielded CAT6 STP cabling, and watchdog scripts on access points to prevent signal dropouts.</li>
-            <li><strong>For network owners:</strong> We monitor bandwidth use, set up automated payment reconciliation and help you track uptime, so you can see how your network is performing.</li>
-        </ul>
-    </div>`,
-    { text: 'Book a site visit or network review with our senior network engineers.', label: 'Book WiFi Consultation' });
-
-servicePage('/cctv', 'cctv', 'CCTV Systems',
-    'See your property from anywhere.',
-    'CCTV systems for homes, shops, schools and compounds, installed and set up to view live on your phone.', '',
-    { text: 'Get professional camera positioning and a clear quote.', label: 'Book CCTV Survey' });
-
-servicePage('/smart-locks', 'smart-locks', 'Smart Locks',
-    'Open your door without a key.',
-    'Smart locks for homes, rental units, offices and stores. Use a code, a card, a fingerprint or your phone.', '',
-    { text: 'Find the right smart lock model for your doors.', label: 'Book Smart Lock Consultation' });
-
-servicePage('/electric-fence', 'electric-fence', 'Electric Fence',
-    'Stop intruders at the boundary.',
-    'Electric fence installation for homes, compounds, schools, farms and commercial plots.', '',
-    { text: 'Measure your boundary and get a professional installation quote.', label: 'Book Electric Fence Survey' });
-
-servicePage('/solar', 'solar', 'Solar Solutions',
-    'Keep the lights, internet and cameras on when the grid goes off.',
-    'Solar and battery systems sized for your home, shop, school or network site.', '',
-    { text: 'Calculate your load requirements with our engineers.', label: 'Book Solar Consultation' });
-
-// ---------------------------------------------------------------
-// 16. Survey booking and payment (login required)
-// ---------------------------------------------------------------
-const quoteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { ok: false, error: 'Too many requests. Please wait a moment.' } });
-// Live price for the booking form. The same function prices the real booking, so the two can never disagree.
-app.get('/survey/quote', requireAuth, requireDb, requireVerified, quoteLimiter, (req, res) => {
-    res.set('Cache-Control', 'no-store');
-    const q = computeQuote({ service: str(req.query.service), urgency: str(req.query.urgency), place: str(req.query.place), lat: str(req.query.lat), lng: str(req.query.lng) });
-    res.json(q.ok ? { ok: true, base: q.base, km: q.km, travel: q.travel, urgencyFee: q.urgencyFee, urgencyLabel: q.urgencyLabel, total: q.total } : q);
-});
-
-app.get('/survey', requireAuth, requireDb, requireVerified, (req, res) => {
-    const u = req.session.user;
-    const content = `
-        <div class="general-container">
-            <h2>Know what your site needs before you spend.</h2>
-            <p class="sub-title">A site survey by an engineer, followed by a written plan and quote.</p>
-            <div class="form-container" style="border-color: var(--accent);">
-                <h3 style="margin-top:0; color: var(--accent);">Book Site Survey & Pay via M-Pesa (STK Push)</h3>
-                <p style="color:var(--muted); font-size:0.95rem;">Logged in as: <strong>${esc(u.email)}</strong>. Your receipt will be emailed here.</p>
-                <form action="/submit-survey-payment" method="POST" id="payment-form">
-                    <div class="form-group"><label for="s-name">Full Name</label><input id="s-name" type="text" name="name" value="${esc(u.name)}" required maxlength="80"></div>
-                    <div class="form-group"><label for="s-phone">M-Pesa Phone Number</label><input id="s-phone" type="tel" name="phone" value="${esc(u.phone)}" required placeholder="0712345678"></div>
-                    <div class="form-group">
-                        <label for="s-service">Service Category</label>
-                        <select name="service" id="s-service">
-                            <option value="Site Survey & Quotation">General Site Survey (from KES 3,000)</option>
-                            <option value="WiFi Setup">WiFi & Hotspot Consultation (from KES 3,000)</option>
-                            <option value="CCTV Installation">CCTV System Assessment (from KES 3,000)</option>
-                            <option value="Smart Locks">Smart Locks Consultation (from KES 2,500)</option>
-                            <option value="Electric Fence">Electric Fence Survey (from KES 5,000)</option>
-                            <option value="Solar Consultation">Solar Consultation & Sizing (from KES 4,000)</option>
-                        </select>
-                        <small>These are base fees. A travel fare (by distance from Rangwe) and an urgency fee are added below. Prices can change according to the location and urgency. Thank you.</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="s-urgency">How soon do you need us?</label>
-                        <select name="urgency" id="s-urgency">
-                            ${Object.entries(PRICING.urgency).map(([k, u]) => `<option value="${esc(k)}">${esc(u.label)}${u.fee ? ' (+KES ' + u.fee.toLocaleString('en-KE') + ')' : ''}</option>`).join('')}
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="s-place">Where is the site?</label>
-                        <select name="place" id="s-place">
-                            <option value="">Choose your area...</option>
-                            ${Object.entries(PLACES).map(([k, pl]) => `<option value="${esc(k)}">${esc(pl.label)}</option>`).join('')}
-                        </select>
-                        <button type="button" id="s-gps" class="cta-btn small" style="margin-top:10px;">📍 Use my current location instead</button>
-                        <small id="s-gps-note" style="display:block; margin-top:6px;">Sharing your location gives the most accurate travel fare. It is used only for this quote and to find your site.</small>
-                        <input type="hidden" name="lat" id="s-lat"><input type="hidden" name="lng" id="s-lng">
-                    </div>
-                    <div class="form-group"><label for="s-loc">Physical Location / Address</label><input id="s-loc" type="text" name="location" required maxlength="120" placeholder="e.g. Rangwe Town, near the market"></div>
-                    <div id="quote-box" class="quote-box" aria-live="polite">Choose your area to see the total.</div>
-                    <p style="color:var(--muted); font-size:0.9rem; margin:0 0 12px 0;">By booking, you agree to our <a href="/terms" target="_blank" rel="noopener">Terms and Conditions</a>.</p>
-                    <button type="submit" id="s-submit" class="cta-btn block green" disabled>Trigger M-Pesa Payment & Book Survey</button>
-                </form>
-                <script nonce="${req.nonce}">
-                (function () {
-                    var f = document.getElementById('payment-form'), box = document.getElementById('quote-box'), btn = document.getElementById('s-submit');
-                    var lat = document.getElementById('s-lat'), lng = document.getElementById('s-lng'), place = document.getElementById('s-place'), note = document.getElementById('s-gps-note');
-                    function kes(n) { return 'KES ' + Number(n).toLocaleString('en-KE'); }
-                    function row(k, v, strong) { var r = document.createElement('div'); r.className = 'quote-row' + (strong ? ' total' : ''); var a = document.createElement('span'), b = document.createElement('span'); a.textContent = k; b.textContent = v; r.appendChild(a); r.appendChild(b); return r; }
-                    var seq = 0;
-                    function refresh() {
-                        var mine = ++seq;
-                        var q = new URLSearchParams({ service: f.service.value, urgency: f.urgency.value, place: place.value, lat: lat.value, lng: lng.value });
-                        btn.disabled = true;
-                        fetch('/survey/quote?' + q.toString(), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
-                            if (mine !== seq) return;
-                            box.textContent = '';
-                            if (!d.ok) { box.textContent = d.error || 'Choose your area to see the total.'; return; }
-                            box.appendChild(row('Service fee', kes(d.base)));
-                            box.appendChild(row('Travel fare (about ' + d.km + ' km from Rangwe)', d.travel ? kes(d.travel) : 'Free'));
-                            if (d.urgencyFee) box.appendChild(row('Urgency (' + d.urgencyLabel + ')', kes(d.urgencyFee)));
-                            box.appendChild(row('Total to pay now', kes(d.total), true));
-                            btn.disabled = false;
-                        }).catch(function () { if (mine === seq) box.textContent = 'We could not work out the total. Please try again.'; });
-                    }
-                    ['service', 'urgency'].forEach(function (n) { f[n].addEventListener('change', refresh); });
-                    place.addEventListener('change', function () { lat.value = ''; lng.value = ''; note.textContent = 'Using the area you chose.'; refresh(); });
-                    document.getElementById('s-gps').addEventListener('click', function () {
-                        if (!navigator.geolocation) { note.textContent = 'Your browser cannot share location. Please choose your area instead.'; return; }
-                        note.textContent = 'Finding your location...';
-                        navigator.geolocation.getCurrentPosition(function (pos) {
-                            lat.value = pos.coords.latitude.toFixed(5); lng.value = pos.coords.longitude.toFixed(5); place.value = '';
-                            note.textContent = 'Location shared. Thank you.'; refresh();
-                        }, function () { note.textContent = 'We could not get your location. Please choose your area instead.'; }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 });
-                    });
-                    refresh();
-                })();
-                </script>
-            </div>
-        </div>`;
-    res.send(renderPage(req, { title: 'Surveys & Quotations', activeNav: 'survey', content }));
-});
-
-app.post('/submit-survey-payment', requireAuth, requireDb, requireVerified, payLimiter, ah(async (req, res) => {
-    const user = req.session.user;
-    const name = str(req.body.name).slice(0, 80);
-    const location = str(req.body.location).slice(0, 120);
-    const service = str(req.body.service);
-    const phone = normalizePhone(str(req.body.phone));
-    const back = { href: '/survey', label: 'Back to Surveys' };
-    const quote = computeQuote({ service, urgency: str(req.body.urgency), place: str(req.body.place), lat: str(req.body.lat), lng: str(req.body.lng) });
-
-    if (!name || !location) return errorPage(req, res, 400, 'We could not start your payment', 'Please enter your name and location.', back);
-    if (!quote.ok) return errorPage(req, res, 400, 'We could not start your payment', quote.error, back);
-    if (!phone) return errorPage(req, res, 400, 'We could not start your payment', 'Please enter a valid Safaricom number, for example 0712345678.', back);
-    if (!phoneAttemptAllowed(phone)) return errorPage(req, res, 429, 'Too many attempts', 'Too many payment requests for this number. Please try again later.', back);
-
-    // Random, unique reference (max 12 characters for Daraja)
-    let booking = null;
-    for (let attempt = 0; attempt < 5 && !booking; attempt++) {
-        const candidate = {
-            id: crypto.randomBytes(16).toString('hex'),
-            userId: user.id, name, phone, service, location,
-            amount: quote.total,   // base fee + travel fare + urgency fee, all worked out on the server
-            baseAmount: quote.base, travelKm: quote.km, travelFee: quote.travel, urgency: quote.urgency, urgencyFee: quote.urgencyFee,
-            geo: `${quote.lat},${quote.lng}`,
-            accountRef: 'TNC' + crypto.randomBytes(4).toString('hex').toUpperCase(),
-            email: user.email
-        };
+    // ----- branches (owner): linked accounts under the same business -----
+    const passwordProblem = (pw, min, username = '') => pw.length < min ? `The password must be at least ${min} characters.` : Buffer.byteLength(pw) > 72 ? 'The password is too long (72 characters at most).' : (COMMON_PW.has(pw.toLowerCase()) || (username && pw.toLowerCase() === String(username).toLowerCase())) ? 'That password is too easy to guess. Choose a different one.' : '';
+    const MIN_PW = { manager: 10, cashier: 8 };
+    const USERNAME_OK = /^[A-Za-z0-9._-]{3,30}$/;
+    router.get('/branches', ah(async (req, res) => {
+        const today = todayNairobi();
+        const rows = (await q(`SELECT s.id, s.name, s.address, s.phone, s.active, (s.parent_id IS NULL) AS hq,
+                (SELECT count(*)::int FROM pos_staff t WHERE t.shop_id=s.id AND t.active) AS staff,
+                COALESCE((SELECT sum(total_cents) FROM pos_sales x WHERE x.shop_id=s.id AND x.status='completed' AND (x.created_at AT TIME ZONE '${TZ}')::date = $2),0)::bigint AS today
+              FROM pos_shops s WHERE s.id=$1 OR s.parent_id=$1 ORDER BY (s.parent_id IS NULL) DESC, s.name`, [req.biz.id, today])).rows;
+        const total = rows.reduce((a, r) => a + Number(r.today), 0);
+        send(req, res, { title: 'Branches', nav: 'branches', body: `<h1>Branches</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><p style="margin-top:0">Staff sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with this business code: <b style="font-size:1.2rem;letter-spacing:.1em">${esc(req.biz.code || '')}</b></p>
+            <p class="muted" style="margin-bottom:0">Today's sales across all branches: <b>${kes(total)}</b></p></div>
+        <div class="panel tablewrap"><table><tr><th>Branch</th><th>Address</th><th class="num">Staff</th><th class="num">Sales today</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.hq ? ' <span class="tag gray">head office</span>' : ''}${r.active ? '' : ' <span class="tag bad">paused</span>'}</td><td>${esc(r.address)}</td><td class="num">${r.staff}</td><td class="num">${fmt(r.today)}</td><td class="right">${r.active ? `<form action="/pos/branches/switch" method="POST" style="display:inline"><input type="hidden" name="shop_id" value="${r.id}"><button class="btn small" type="submit">Open</button></form>` : ''} ${r.hq ? '' : `<form action="/pos/branches/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Pause' : 'Resume'}</button></form>`}</td></tr>`).join('')}</table></div>
+        <div class="panel" style="max-width:720px"><h2>Open a new branch</h2><form action="/pos/branches" method="POST"><div class="grid2">
+            <div class="field"><label for="bn">Branch name</label><input id="bn" name="name" required maxlength="120" placeholder="e.g. Kisumu Branch"></div>
+            <div class="field"><label for="ba">Address</label><input id="ba" name="address" maxlength="200"></div>
+            <div class="field"><label for="bp">Branch phone</label><input id="bp" name="phone" maxlength="40"></div></div>
+            <div class="field"><label><input type="checkbox" name="copy" value="1" checked style="width:auto"> Copy my items and categories to the new branch (stock starts at 0)</label></div>
+            <h2 style="margin-top:14px">Branch manager login (optional)</h2><p class="muted">The manager runs the branch and can register its cashiers.</p><div class="grid2">
+            <div class="field"><label for="mn">Manager name</label><input id="mn" name="mname" maxlength="80"></div>
+            <div class="field"><label for="mu">Username</label><input id="mu" name="musername" maxlength="30" autocapitalize="none" autocomplete="off"></div>
+            <div class="field"><label for="mp">Password</label><input id="mp" name="mpassword" type="password" autocomplete="new-password" maxlength="72"></div></div>
+            <button class="btn" type="submit">Open branch</button></form></div>` });
+    }));
+    router.post('/branches', ah(async (req, res) => {
+        const name = str(req.body.name).slice(0, 120), mname = str(req.body.mname).slice(0, 80), mu = str(req.body.musername), mpw = String(req.body.mpassword || '');
+        if (name.length < 2) return back(res, '/pos/branches', '', 'Please enter the branch name.');
+        const wantManager = Boolean(mname || mu || mpw);
+        if (wantManager && (mname.length < 2 || !USERNAME_OK.test(mu) || passwordProblem(mpw, MIN_PW.manager, mu))) return back(res, '/pos/branches', '', 'For the manager login enter a name, a username (3 to 30 letters or numbers) and a password of at least 10 characters that is not easy to guess.');
+        const count = Number((await q('SELECT count(*) n FROM pos_shops WHERE parent_id=$1', [req.biz.id])).rows[0].n);
+        if (count >= 50) return back(res, '/pos/branches', '', 'You have reached the limit of 50 branches.');
+        const hash = wantManager ? await bcrypt.hash(mpw, 10) : '';
+        const client = await pool().connect();
         try {
-            await pool.query(
-                `INSERT INTO bookings (id, user_id, name, phone, service, location, amount, account_ref, status, created_at,
-                                       base_amount, travel_km, travel_fee, urgency, urgency_fee, geo)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11, $12, $13, $14, $15)`,
-                [candidate.id, candidate.userId, name, phone, service, location, candidate.amount, candidate.accountRef, Date.now(),
-                 candidate.baseAmount, candidate.travelKm, candidate.travelFee, candidate.urgency, candidate.urgencyFee, candidate.geo]
-            );
-            booking = candidate;
-        } catch (err) {
-            if (err.code !== '23505') throw err;   // 23505 = reference already used, try another
+            await client.query('BEGIN');
+            const b = (await client.query('INSERT INTO pos_shops (parent_id, name, phone, address, receipt_footer) VALUES ($1,$2,$3,$4,$5) RETURNING id', [req.biz.id, name, str(req.body.phone).slice(0, 40), str(req.body.address).slice(0, 200), req.biz.receipt_footer])).rows[0];
+            if (req.body.copy === '1') {
+                await client.query('INSERT INTO pos_categories (shop_id, name) SELECT $2, name FROM pos_categories WHERE shop_id=$1', [req.biz.id, b.id]);
+                await client.query(`INSERT INTO pos_items (shop_id, category_id, name, barcode, price_cents, cost_cents, stock, track_stock, reorder_level, active)
+                    SELECT $2, nc.id, i.name, i.barcode, i.price_cents, i.cost_cents, 0, i.track_stock, i.reorder_level, i.active FROM pos_items i
+                    LEFT JOIN pos_categories oc ON oc.id = i.category_id LEFT JOIN pos_categories nc ON nc.shop_id = $2 AND nc.name = oc.name WHERE i.shop_id = $1`, [req.biz.id, b.id]);
+            }
+            if (wantManager) await client.query(`INSERT INTO pos_staff (business_id, shop_id, role, name, username, password_hash) VALUES ($1,$2,'manager',$3,$4,$5)`, [req.biz.id, b.id, mname, mu, hash]);
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            if (e.code === '23505') return back(res, '/pos/branches', '', 'That username is already used in your business. Choose another.');
+            throw e;
+        } finally { client.release(); }
+        await audit(req, 'branch.open', name);
+        back(res, '/pos/branches', 'Branch opened.');
+    }));
+    router.post('/branches/switch', ah(async (req, res) => {
+        const id = parseCount(req.body.shop_id, { min: 1 });
+        if (id && req.branches.some(b => b.id === id && b.active)) { req.session.posShopId = id; await saveSess(req); }
+        res.redirect('/pos/app');
+    }));
+    router.post('/branches/:id/toggle', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id && (await q('UPDATE pos_shops SET active = NOT active WHERE id=$1 AND parent_id=$2', [id, req.biz.id])).rowCount) await audit(req, 'branch.toggle', 'branch #' + id);
+        back(res, '/pos/branches', 'Saved.');
+    }));
+
+    // ----- staff: managers and cashiers -----
+    const staffScope = req => req.actor.role === 'owner' ? { sql: '(t.business_id=$1)', params: [req.biz.id] } : { sql: '(t.shop_id=$1 AND t.role=\'cashier\')', params: [req.shop.id] };
+    router.get('/staff', ah(async (req, res) => {
+        const owner = req.actor.role === 'owner', sc = staffScope(req);
+        const rows = (await q(`SELECT t.id, t.name, t.username, t.role, t.active, t.last_login, s.name AS shop FROM pos_staff t JOIN pos_shops s ON s.id=t.shop_id WHERE ${sc.sql} ORDER BY s.name, t.role, t.name`, sc.params)).rows;
+        send(req, res, { title: 'Staff', nav: 'staff', body: `<h1>${owner ? 'Staff & Cashiers' : 'Cashiers'}</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><p style="margin:0">They sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with business code <b>${esc(req.biz.code || '')}</b>, their username and their password.</p></div>
+        <div class="panel" style="max-width:720px"><h2>Register ${owner ? 'a staff member' : 'a cashier'}</h2><form action="/pos/staff" method="POST"><div class="grid2">
+            <div class="field"><label for="sn">Full name</label><input id="sn" name="name" required maxlength="80"></div>
+            <div class="field"><label for="su">Username</label><input id="su" name="username" required maxlength="30" autocapitalize="none" autocomplete="off"><small>3 to 30 letters, numbers, dot, dash or underscore.</small></div>
+            <div class="field"><label for="sp">Password</label><input id="sp" name="password" type="password" required maxlength="72" autocomplete="new-password"><small>At least 8 characters (10 for managers).</small></div>
+            ${owner ? `<div class="field"><label for="sr">Role</label><select id="sr" name="role"><option value="cashier">Cashier (sells only)</option><option value="manager">Branch manager</option></select></div>
+            <div class="field"><label for="ss">Works at</label><select id="ss" name="shop_id">${req.branches.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></div>` : ''}</div>
+            <button class="btn" type="submit">Register</button></form></div>
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>Name</th><th>Username</th><th>Role</th><th>Branch</th><th>Last sign-in</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.active ? '' : ' <span class="tag bad">off</span>'}</td><td>${esc(r.username)}</td><td>${esc(r.role)}</td><td>${esc(r.shop)}</td><td class="nowrap">${r.last_login ? esc(timeFmt(r.last_login)) : '-'}</td><td class="right nowrap">
+            <form action="/pos/staff/${r.id}/password" method="POST" style="display:inline"><input name="password" type="password" placeholder="New password" minlength="8" maxlength="72" required style="width:130px;display:inline-block" autocomplete="new-password"> <button class="btn small ghost" type="submit">Reset</button></form>
+            <form action="/pos/staff/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Switch off' : 'Switch on'}</button></form>
+            <form action="/pos/staff/${r.id}/delete" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form></td></tr>`).join('')}</table>` : '<p class="muted">No one registered yet.</p>'}</div>` });
+    }));
+    router.post('/staff', ah(async (req, res) => {
+        const owner = req.actor.role === 'owner';
+        const name = str(req.body.name).slice(0, 80), username = str(req.body.username), pw = String(req.body.password || '');
+        const role = owner && req.body.role === 'manager' ? 'manager' : 'cashier';
+        const shopId = owner ? parseCount(req.body.shop_id, { min: 1 }) : req.shop.id;
+        if (name.length < 2 || !USERNAME_OK.test(username)) return back(res, '/pos/staff', '', 'Enter a name and a username of 3 to 30 letters or numbers.');
+        const pwErr = passwordProblem(pw, MIN_PW[role], username);
+        if (pwErr) return back(res, '/pos/staff', '', pwErr);
+        if (!(owner ? req.branches : [{ id: req.shop.id }]).some(b => b.id === shopId)) return back(res, '/pos/staff', '', 'Choose a branch.');
+        try { await q('INSERT INTO pos_staff (business_id, shop_id, role, name, username, password_hash) VALUES ($1,$2,$3,$4,$5,$6)', [req.biz.id, shopId, role, name, username, await bcrypt.hash(pw, 10)]); }
+        catch (e) { if (e.code === '23505') return back(res, '/pos/staff', '', 'That username is already used in your business. Choose another.'); throw e; }
+        await audit(req, 'staff.add', `${username} (${role})`);
+        back(res, '/pos/staff', name + ' can now sign in.');
+    }));
+    const staffAct = (path, sqlFor) => router.post('/staff/:id/' + path, ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 }), sc = staffScope(req);
+        let msg = 'Saved.';
+        if (id) {
+            const own = (await q(`SELECT t.id, t.name, t.username, t.role FROM pos_staff t WHERE t.id=$${sc.params.length + 1} AND ${sc.sql}`, [...sc.params, id])).rows[0];
+            if (own) { const r = await sqlFor(req, own); if (r === false) msg = 'That password is not strong enough (8 characters, 10 for managers, not easy to guess).'; else await audit(req, 'staff.' + path, `${own.username} (${own.role})`); }
         }
-    }
-    if (!booking) return errorPage(req, res, 500, 'We could not save your booking', 'Please try again.', back);
+        back(res, '/pos/staff', msg);
+    }));
+    staffAct('password', async (req, t) => {
+        const pw = String(req.body.password || '');
+        if (passwordProblem(pw, MIN_PW[t.role], t.username)) return false;
+        await q('UPDATE pos_staff SET password_hash=$2, failed=0, locked_until=NULL, session_ver = session_ver + 1 WHERE id=$1', [t.id, await bcrypt.hash(pw, 10)]);
+        await q('DELETE FROM pos_auth_fails WHERE left(key, char_length($1)) = $1', [`u:${req.biz.code}:${String(t.username).toLowerCase()}`]);   // lift any sign-in lock
+    });
+    staffAct('toggle', (req, t) => q('UPDATE pos_staff SET active = NOT active, session_ver = session_ver + 1 WHERE id=$1', [t.id]));
+    staffAct('delete', (req, t) => q('DELETE FROM pos_staff WHERE id=$1', [t.id]));
 
-    // Tell you about the lead right away (alerts go to you only, never to the customer)
-    notify(`📋 Survey booking (awaiting payment): ${name} - ${service}`, bookingFields(booking)).catch(() => {});
+    // ----- a staff member changes their own password -----
+    router.get('/account', ah(async (req, res) => {
+        send(req, res, { title: 'My Account', nav: 'account', body: `<h1>My Account</h1>${notice(req)}${errBox(req)}<div class="panel" style="max-width:480px"><p>Signed in as <b>${esc(req.actor.name || '')}</b> (${esc(req.actor.role)}) at ${esc(req.shop.name)}.</p>
+            <form action="/pos/account/password" method="POST"><div class="field"><label for="cp">Current password</label><input id="cp" name="current" type="password" required autocomplete="current-password" maxlength="100"></div>
+            <div class="field"><label for="np">New password</label><input id="np" name="password" type="password" required minlength="8" maxlength="72" autocomplete="new-password"></div><button class="btn" type="submit">Change password</button></form></div>` });
+    }));
+    router.post('/account/password', ah(async (req, res) => {
+        if (req.actor.kind !== 'staff') return back(res, '/pos/app', 'Owners change their password on the main site.');
+        const row = (await q('SELECT password_hash FROM pos_staff WHERE id=$1', [req.actor.staffId])).rows[0];
+        const pw = String(req.body.password || '');
+        if (!row || !(await bcrypt.compare(String(req.body.current || ''), row.password_hash))) return back(res, '/pos/account', '', 'The current password is not right.');
+        const pwErr = passwordProblem(pw, MIN_PW[req.actor.role] || 8, req.actor.username || '');
+        if (pwErr) return back(res, '/pos/account', '', pwErr);
+        await q('UPDATE pos_staff SET password_hash=$2, session_ver = session_ver + 1 WHERE id=$1', [req.actor.staffId, await bcrypt.hash(pw, 10)]);
+        req.session.posStaff.ver += 1;   // this session stays signed in, every other one ends
+        await audit(req, 'staff.own_password', '');
+        back(res, '/pos/account', 'Password changed.');
+    }));
 
-    if (!mpesaConfigured()) {
-        await pool.query(`UPDATE bookings SET status = 'failed' WHERE id = $1 AND status = 'pending'`, [booking.id]);
-        console.error('M-Pesa is not fully configured (check MPESA_* variables and PUBLIC_BASE_URL).');
-        return errorPage(req, res, 503, 'Online payment is unavailable', 'Online payment is not available right now. We have saved your request and will call you.', { href: '/requests', label: 'My requests' });
-    }
+    // ----- install as an app -----
+    router.get('/install', ah(async (req, res) => {
+        send(req, res, { title: 'Install App', nav: 'install', body: `<h1>Install the POS app</h1>
+        <div class="panel" style="max-width:640px"><p style="margin-top:0">Install Tencent POS on this phone, tablet or computer. It opens in its own window with its own icon, like any other app, and always stays up to date.</p>
+            <p><button class="btn ok" id="install-now" type="button" style="display:none">Install now</button></p>
+            <div id="install-help"><p><b>If there is no Install button above:</b></p><ul style="line-height:1.7">
+                <li><b>Android (Chrome):</b> tap the menu (three dots), then <i>Install app</i> or <i>Add to Home screen</i>.</li>
+                <li><b>iPhone / iPad (Safari):</b> tap Share, then <i>Add to Home Screen</i>.</li>
+                <li><b>Windows / Mac (Chrome or Edge):</b> click the install icon at the right end of the address bar.</li></ul></div>
+            <p class="muted">The POS needs internet to save sales. ${req.actor.role === 'owner' ? `Cashiers and managers install it the same way, opening <b>${esc(pubUrl('/pos/staff/login'))}</b> on their own device.` : ''}</p></div>` });
+    }));
 
-    try {
-        const r = await stkPush(booking);
-        await pool.query('UPDATE bookings SET checkout_request_id = $1 WHERE id = $2', [r.CheckoutRequestID, booking.id]);
-    } catch (err) {
-        console.error('STK push failed:', err.message);
-        await pool.query(`UPDATE bookings SET status = 'failed' WHERE id = $1 AND status = 'pending'`, [booking.id]);
-        return errorPage(req, res, 502, 'We could not send the M-Pesa prompt', 'Please check your number and try again, or call us on 0740 311 014.', back);
-    }
 
-    const link = makeBookingLink(booking);
-    res.send(renderPage(req, {
-        title: 'Check Your Phone',
-        activeNav: 'survey',
-        showMpesaPopup: true,
-        content: `
-            <div class="general-container">
-                <h2>📱 M-Pesa Prompt Sent</h2>
-                <div style="background:var(--surface); border:2px solid var(--accent); padding:25px; border-radius:12px; margin-top:20px; text-align:center;">
-                    <h3 style="color:var(--accent); margin-top:0; font-size:1.4rem;">Please check your phone</h3>
-                    <p style="font-size:1.15rem; font-weight:bold; margin:15px 0;">Enter your M-Pesa PIN on <strong>${esc(phone)}</strong> to pay KES ${booking.amount.toLocaleString('en-KE')}.</p>
-                    <div id="status-box" style="margin:25px 0 0; padding:15px; border-radius:8px; background:var(--bg); border:1px solid var(--border);">
-                        <p id="status-text" style="font-weight:bold; color:#38bdf8; margin:0;">⏳ Waiting for your M-Pesa PIN entry...</p>
-                    </div>
-                </div>
-                <div style="margin-top:25px; text-align:center; display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
-                    <a href="/requests" class="cta-btn">View All My Requests & Receipts</a>
-                    ${link ? `<a href="${esc(link)}" class="cta-btn green">Open your booking page</a>` : ''}
-                </div>
-            </div>
-            <script nonce="${req.nonce}">
-            (function () {
-                var id = ${JSON.stringify(booking.id)}, tries = 0, box = document.getElementById('status-box'), timer;
-                function show(html) { box.innerHTML = html; }
-                function check() {
-                    tries++;
-                    fetch('/payments/status/' + encodeURIComponent(id), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
-                        if (d.status === 'paid') {
-                            var h = '<h3 style="color:var(--accent); margin:0;">✅ Payment Confirmed</h3><p style="margin-top:8px;">An official PDF receipt is being emailed to you.</p>';
-                            if (d.pdf) h += '<p><a href="' + d.pdf + '" class="cta-btn green">📥 Download Official PDF Receipt</a></p>';
-                            show(h); clearInterval(timer);
-                        } else if (d.status === 'failed') {
-                            show('<h3 style="color:var(--danger); margin:0;">❌ Payment Cancelled or Timed Out</h3><p style="color:var(--muted);">The payment request was not completed.</p><a href="/survey" class="cta-btn">Try Again</a>'); clearInterval(timer);
-                        } else if (d.status === 'review') {
-                            show('<p style="margin:0; font-weight:bold;">We are confirming your payment and will call you shortly.</p>'); clearInterval(timer);
-                        } else if (tries >= 60) {
-                            show('<p style="margin:0;">We have not seen the payment yet. If you paid, we will confirm and call you.</p>'); clearInterval(timer);
-                        }
-                    }).catch(function () {});
+    // ----- background checks (safe to run on several server copies at once: every step is idempotent) -----
+    // 1) payments still waiting are asked about directly, so a sale is saved even if the callback never arrives
+    // 2) payments with no answer after 30 minutes go to "review" for the owner
+    // 3) gateway secrets sealed with an old key are re-sealed with the current key
+    // 4) old throttle rows are removed
+    let lastHousekeeping = 0;
+    async function sweep() {
+        const pend = (await q(`SELECT * FROM pos_payments WHERE status='pending' AND provider_ref IS NOT NULL AND created_at < now() - interval '25 seconds' AND created_at > now() - interval '30 minutes' ORDER BY created_at LIMIT 25`)).rows;
+        for (const p of pend) {
+            const gw = await loadGateway('id=$1', [p.gateway_id]);
+            if (!gw) continue;
+            await applyVerdict(p, await GW.PROVIDERS[gw.provider].verify(gw, p.provider_ref).catch(() => ({ state: 'pending' })));
+        }
+        await q(`UPDATE pos_payments SET status='review', fail_reason='No confirmation received. Check your M-Pesa statement.', updated_at=now() WHERE status='pending' AND created_at < now() - interval '30 minutes'`);
+        if (platform) {
+            const subs = (await q(`SELECT * FROM pos_sub_payments WHERE status='pending' AND checkout_request_id IS NOT NULL AND created_at < now() - interval '25 seconds' AND created_at > now() - interval '30 minutes' LIMIT 25`)).rows;
+            for (const p of subs) {
+                try {
+                    const r = await platform.stkQuery(p.checkout_request_id);
+                    if (String(r.ResultCode) === '0') await markSubPaid(p.id, '');
+                    else if (r.ResultCode !== undefined && String(r.ResultCode) !== '') await q(`UPDATE pos_sub_payments SET status='failed' WHERE id=$1 AND status='pending'`, [p.id]);
+                } catch (_) { /* not ready yet */ }
+            }
+        }
+        if (Date.now() - lastHousekeeping > 10 * 60 * 1000) {
+            lastHousekeeping = Date.now();
+            await q(`DELETE FROM pos_auth_fails WHERE COALESCE(locked_until, first_at) < now() - interval '2 days'`);
+            if (vault.enabled) {
+                for (const g of (await q('SELECT id, business_id, provider, secrets FROM pos_gateways')).rows) {
+                    if (!vault.needsRotation(g.secrets)) continue;
+                    try { const scope = `${g.business_id}:${g.provider}`; await q('UPDATE pos_gateways SET secrets=$2 WHERE id=$1 AND secrets=$3', [g.id, vault.seal(vault.open(g.secrets, scope), scope), g.secrets]); console.log('POS: re-sealed gateway', g.id, 'with the current key'); }
+                    catch (e) { console.error('POS: could not re-seal gateway', g.id + ':', e.message); }
                 }
-                check();
-                timer = setInterval(check, 4000);
-            })();
-            </script>`
-    }));
-}));
-
-// ---------------------------------------------------------------
-// 17. My requests and receipts
-// ---------------------------------------------------------------
-const FLASH = {
-    sent: { cls: 'ok', text: 'The receipt was emailed to you.' },
-    failed: { cls: '', text: 'We could not send the email right now. You can still download the PDF.' }
-};
-app.get('/requests', requireAuth, requireDb, ah(async (req, res) => {
-    const bookings = await listBookings(req.session.user.id);
-    const flash = FLASH[String(req.query.msg || '')];
-
-    let rowsHtml;
-    if (bookings.length === 0) {
-        rowsHtml = `<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--muted);">You have not made any service requests or bookings yet.<br><a href="/survey" style="font-weight:bold;">Book a Site Survey Now</a></td></tr>`;
-    } else {
-        rowsHtml = bookings.map(b => {
-            const dateStr = new Date(b.createdAt).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
-            const badge = b.status === 'paid' ? '<span class="badge paid">PAID & CONFIRMED</span>'
-                : b.status === 'pending' ? '<span class="badge pending">PENDING PAYMENT</span>'
-                    : `<span class="badge bad">${esc(b.status.toUpperCase())}</span>`;
-            const action = b.status === 'paid'
-                ? `<a href="/payments/receipt/${esc(b.id)}/download.pdf" class="cta-btn green small">📥 Download PDF</a>
-                   <form action="/requests/${esc(b.id)}/resend" method="POST" class="inline-form"><button type="submit" class="cta-btn small">✉️ Email me</button></form>`
-                : `<a href="/survey" style="font-size:0.85rem; font-weight:bold;">Book again</a>`;
-            return `<tr>
-                <td>${esc(dateStr)}</td>
-                <td><strong>${esc(b.service)}</strong><br><small style="color:var(--muted);">${esc(b.location)}</small></td>
-                <td>KES ${b.amount.toLocaleString('en-KE')}</td>
-                <td>${esc(b.accountRef)}</td>
-                <td>${badge}</td>
-                <td>${esc(b.receipt || '-')}</td>
-                <td style="display:flex; gap:6px; flex-wrap:wrap;">${action}</td>
-            </tr>`;
-        }).join('');
-    }
-
-    const content = `
-        <div class="general-container">
-            <h2>My Service Requests & Tracking</h2>
-            <p class="sub-title">Monitor your bookings, payment statuses, and download official PDF receipts.</p>
-            ${flash ? `<div class="alert ${flash.cls}" role="status">${esc(flash.text)}</div>` : ''}
-            <div class="table-wrap">
-                <table class="data-table">
-                    <thead><tr><th>Date</th><th>Service & Location</th><th>Amount</th><th>Reference</th><th>Status</th><th>M-Pesa Receipt</th><th>Action</th></tr></thead>
-                    <tbody>${rowsHtml}</tbody>
-                </table>
-            </div>
-            <div style="margin-top: 30px; text-align: right;"><a href="/survey" class="cta-btn">+ Book Another Service</a></div>
-        </div>`;
-    res.send(renderPage(req, { title: 'My Requests', activeNav: 'requests', content }));
-}));
-
-app.post('/requests/:id/resend', requireAuth, resendLimiter, requireDb, ah(async (req, res) => {
-    if (!validBookingId(req.params.id)) return res.redirect('/requests');
-    const b = await getBookingForUser(req.params.id, req.session.user.id);
-    if (!b || b.status !== 'paid') return res.redirect('/requests');
-    const ok = await emailReceipt(b);
-    res.redirect('/requests?msg=' + (ok ? 'sent' : 'failed'));
-}));
-
-// ---------------------------------------------------------------
-// 18. Shareable booking page (signed link; details always come from the database)
-// ---------------------------------------------------------------
-const BOOKING_VIEWS = {
-    paid: { h: 'Payment Receipt & Booking', sub: 'Payment received. Keep this page as your receipt.', badge: '<span class="badge paid">PAID & CONFIRMED</span>' },
-    pending: { h: 'Booking Received', sub: 'We are waiting for your M-Pesa payment. This page refreshes by itself.', badge: '<span class="badge pending">AWAITING PAYMENT</span>' },
-    failed: { h: 'Payment Not Completed', sub: 'The payment was cancelled or did not go through. You can book again.', badge: '<span class="badge bad">NOT PAID</span>' },
-    review: { h: 'Confirming Your Payment', sub: 'We are checking your payment and will call you shortly.', badge: '<span class="badge pending">CHECKING</span>' }
-};
-
-app.get('/booking/:token', requireDb, ah(async (req, res) => {
-    res.set({ 'X-Robots-Tag': 'noindex, nofollow', 'Cache-Control': 'private, no-store' });
-    const id = readBookingLink(req.params.token);
-    const b = id ? await getBooking(id) : null;
-    if (!b) return errorPage(req, res, 404, 'This link is not valid', 'Please check the link you were sent, or call us on 0740 311 014.');
-
-    const v = BOOKING_VIEWS[b.status] || BOOKING_VIEWS.pending;
-    const isPaid = b.status === 'paid';
-    const when = new Date(isPaid && b.paidAt ? b.paidAt : b.createdAt).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' }) + ' EAT';
-    const row = (k, val) => `<p style="margin:8px 0;"><strong>${esc(k)}:</strong> ${val}</p>`;
-    const refresh = b.status === 'pending' ? `
-        <script nonce="${req.nonce}">
-        (function () {
-            var n = 0;
-            try { n = Number(sessionStorage.getItem('bk-refresh') || 0); } catch (e) {}
-            if (n >= 40) return;
-            setTimeout(function () {
-                try { sessionStorage.setItem('bk-refresh', String(n + 1)); } catch (e) {}
-                location.reload();
-            }, 8000);
-        })();
-        </script>` : '';
-    const content = `
-        <div class="general-container">
-            <h2>${esc(v.h)}</h2>
-            <p class="sub-title">${esc(v.sub)}</p>
-            <div class="form-container">
-                ${row('Status', v.badge)}
-                ${row('Client Name', esc(b.name))}
-                ${row('Phone Number', esc(b.phone))}
-                ${row('Service', esc(b.service))}
-                ${row('Location', esc(b.location))}
-                ${breakdownLines(b).map(([k, v]) => row(k, esc(v))).join('')}
-                ${row(isPaid ? 'Amount Paid' : 'Amount Due', 'KES ' + b.amount.toLocaleString('en-KE'))}
-                ${isPaid ? row('M-Pesa Receipt', esc(b.receipt || 'See your M-Pesa SMS')) : ''}
-                ${row('Reference', esc(b.accountRef))}
-                ${row(isPaid ? 'Paid on' : 'Requested on', esc(when))}
-                ${isPaid && PDFDocument ? `<div style="margin-top: 25px;"><a href="/booking/${esc(req.params.token)}/receipt.pdf" class="cta-btn green">Download Official PDF Receipt</a></div>` : ''}
-                ${b.status === 'failed' ? '<div style="margin-top: 25px;"><a href="/survey" class="cta-btn">Book again</a></div>' : ''}
-            </div>
-        </div>${refresh}`;
-    res.send(renderPage(req, { title: 'Receipt', activeNav: '', content }));
-}));
-
-app.get('/booking/:token/receipt.pdf', requireDb, ah(async (req, res) => {
-    if (!PDFDocument) return errorPage(req, res, 501, 'Not available', 'Receipt download is not available right now.');
-    const id = readBookingLink(req.params.token);
-    const b = id ? await getBooking(id) : null;
-    if (!b || b.status !== 'paid') return errorPage(req, res, 404, 'Receipt not found', 'This receipt is not available. It may not be paid yet.');
-    sendPdf(res, await generatePdfBuffer(b), b.accountRef);
-}));
-
-// ---------------------------------------------------------------
-// Contact page: call, WhatsApp, email, and a callback request (alerts go to you by Telegram/email)
-// ---------------------------------------------------------------
-const contactLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
-    message: 'Too many requests from this network. Please call us on 0740 311 014.'
-});
-function contactPage(req, { error = '', sent = false, values = {} } = {}) {
-    const content = `
-        <div class="general-container">
-            <h2>Contact Us</h2>
-            <p class="sub-title">Call, message us on WhatsApp, or ask for a callback and an engineer will phone you.</p>
-            ${sent ? `<div class="alert ok" role="status">Thank you${values.name ? ', ' + esc(values.name) : ''}. We have received your request and will call you shortly.</div>` : ''}
-            ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
-            <div class="form-container">
-                <p style="margin-top:0;">📞 <strong>Calls:</strong> <a href="tel:+254740311014">0740 311 014</a></p>
-                <p>💬 <strong>WhatsApp:</strong> <a href="https://wa.me/254769306917" target="_blank" rel="noopener">0769 306 917</a></p>
-                <p>✉️ <strong>Email:</strong> <a href="mailto:tencentbz@gmail.com">tencentbz@gmail.com</a></p>
-                <p style="margin-bottom:0;">📍 <strong>Location:</strong> Rangwe, Homa Bay County, Kenya</p>
-            </div>
-            <div class="form-container">
-                <h3 style="margin-top:0; color:var(--primary);">Request a callback</h3>
-                <form action="/contact" method="POST">
-                    <div class="form-group"><label for="c-name">Your Name</label><input id="c-name" type="text" name="name" required maxlength="80" autocomplete="name" placeholder="e.g. John Otieno" value="${esc(values.name || '')}"></div>
-                    <div class="form-group"><label for="c-phone">Phone Number</label><input id="c-phone" type="tel" name="phone" required autocomplete="tel" placeholder="0712345678" value="${esc(values.phone || '')}"></div>
-                    <div class="form-group"><label for="c-msg">How can we help?</label><textarea id="c-msg" name="message" rows="4" required maxlength="600" placeholder="e.g. I need CCTV installed at my shop in Rangwe">${esc(values.message || '')}</textarea></div>
-                    <button type="submit" class="cta-btn block">Request Callback</button>
-                </form>
-            </div>
-        </div>`;
-    return renderPage(req, { title: 'Contact Us', activeNav: 'contact', content });
-}
-app.get('/contact', (req, res) => res.send(contactPage(req)));
-app.post('/contact', contactLimiter, ah(async (req, res) => {
-    const values = { name: str(req.body.name).slice(0, 80), phone: str(req.body.phone).slice(0, 30), message: str(req.body.message).slice(0, 600) };
-    if (!values.name || !values.message) return res.status(400).send(contactPage(req, { error: 'Please enter your name and a short message.', values }));
-    if (!normalizePhone(values.phone)) return res.status(400).send(contactPage(req, { error: 'Please enter a valid phone number, for example 0712345678.', values }));
-    await notify(`📞 Callback request: ${values.name}`, { Name: values.name, Phone: values.phone, Message: values.message });
-    res.send(contactPage(req, { sent: true, values: { name: values.name } }));
-}));
-
-// ---------------------------------------------------------------
-// 19. Terms and Conditions
-// ---------------------------------------------------------------
-app.get('/terms', (req, res) => {
-    const content = `
-        <div class="general-container terms">
-        <h2>Terms and Conditions of Service</h2>
-        <p class="sub-title">Tencent Innovations &middot; Rangwe, Homa Bay County, Kenya<br>Calls: 0740 311 014 &middot; WhatsApp: 0769 306 917</p>
-
-        <p class="intro-text">These Terms and Conditions ("Terms") govern the provision of WiFi/internet, CCTV installation, electric fence installation, solar standby system, and fingerprint door lock installation services by Tencent Innovations ("the Company", "we", "us") to any person or entity that subscribes to, purchases, or otherwise uses those services ("the Customer", "you"). By registering for an account, connecting to our network, paying for a package, or signing an installation job card, you agree to be bound by these Terms.</p>
-
-        <h3>1. Definitions</h3>
-        <p class="clause"><strong>1.1</strong> "Service" means any of the WiFi/internet access, CCTV installation, electric fence installation, solar standby system, or fingerprint door lock installation services offered by the Company.</p>
-        <p class="clause"><strong>1.2</strong> "Package" means a specific data, speed, or duration bundle purchased for internet access, as published by the Company from time to time.</p>
-        <p class="clause"><strong>1.3</strong> "Customer Premises Equipment" or "CPE" means routers, antennas, cameras, fence energisers, solar panels, batteries, fingerprint door locks, cabling, and any other hardware installed at the Customer's premises.</p>
-        <p class="clause"><strong>1.4</strong> "Hotspot" means the Company's WiFi network accessible via login portal and voucher, PIN, or M-Pesa payment.</p>
-
-        <h3>2. Account Registration</h3>
-        <p class="clause"><strong>2.1</strong> Customers must register using accurate name and phone number details. This information is used for billing, support, and network security, and will not be sold to third parties.</p>
-        <p class="clause"><strong>2.2</strong> A customer is responsible for keeping their account PIN, voucher codes, and WiFi password confidential. The Company is not liable for usage arising from a shared or leaked password.</p>
-        <p class="clause"><strong>2.3</strong> One account and connection are intended for a single household or business premises unless a business/enterprise package has been agreed in writing.</p>
-
-        <h3>3. WiFi and Internet Service</h3>
-        <p class="clause"><strong>3.1</strong> Internet access is sold in prepaid Packages (hourly, daily, weekly, or monthly) as displayed on the Hotspot login page or communicated by the Company. Prices may be revised from time to time; the price in effect at the moment of payment applies to that purchase.</p>
-        <p class="clause"><strong>3.2</strong> Payment is made via M-Pesa STK Push or such other method as the Company may enable. A Package activates automatically once payment is confirmed, and its allocated time or data begins running from activation, whether or not the Customer is actively using the connection.</p>
-        <p class="clause"><strong>3.3</strong> Packages are non-refundable and non-transferable once activated, save for cases of a confirmed technical fault on the Company's network, at the Company's discretion.</p>
-        <p class="clause"><strong>3.4</strong> Speeds advertised (e.g. "up to" a stated Mbps) are maximum attainable speeds under ideal conditions. Actual speed may vary with the number of concurrent users, device capability, weather, and upstream network conditions, and is not guaranteed.</p>
-        <p class="clause"><strong>3.5</strong> The Company operates a Fair Use Policy. Unlimited or bundled Packages are intended for normal browsing, streaming, communication, and work use by the registered premises. Sustained heavy use that materially degrades service for other customers (for example commercial-scale reselling, large-scale server hosting, or automated bulk downloading) may be throttled, or the Customer moved to a suitable business package, after notice where practicable.</p>
-        <p class="clause"><strong>3.6</strong> The Customer may not resell, rebroadcast, or share the Hotspot connection with persons outside the registered premises without a prior written reseller or hotspot-sharing agreement with the Company.</p>
-        <p class="clause"><strong>3.7</strong> WiFi/internet installations are currently offered within Rangwe and its immediate environs, within the Company's normal service radius from its base station. Requests for WiFi installation outside this area will be assessed individually and may not be available.</p>
-
-        <h3>4. Acceptable Use</h3>
-        <p class="clause">The Service may not be used to:</p>
-        <ul>
-            <li>Transmit, host, or access content that is illegal under the laws of Kenya, including material that infringes copyright, is defamatory, obscene, or promotes violence or hatred;</li>
-            <li>Attempt to gain unauthorised access to the Company's network, another customer's account, or any third-party system;</li>
-            <li>Distribute malware, run port scans, flood the network, or otherwise disrupt Service for other users;</li>
-            <li>Impersonate another person or misrepresent your affiliation in connection with the Service.</li>
-        </ul>
-        <p class="clause">A breach of this clause entitles the Company to suspend or terminate access immediately, without refund, and to report unlawful activity to the relevant authorities.</p>
-
-        <h3>5. Equipment (CPE)</h3>
-        <p class="clause"><strong>5.1</strong> Where the Company supplies and installs equipment (router, antenna, CCTV camera, fence energiser, solar panel, battery, or fingerprint door lock), ownership of that equipment remains with the Company until it has been fully paid for, unless otherwise agreed in writing.</p>
-        <p class="clause"><strong>5.2</strong> The Customer must provide a safe mounting location, stable power supply, and reasonable access for installation and future maintenance.</p>
-        <p class="clause"><strong>5.3</strong> The Customer is responsible for equipment once installed and accepted, and must promptly report any fault, damage, or tampering. Damage caused by the Customer, third parties, lightning, rodents, theft, or vandalism is not covered by any workmanship warranty and may attract a call-out and repair or replacement fee.</p>
-        <p class="clause"><strong>5.4</strong> Where a device remains the Company's property under an instalment or lease arrangement, the Customer may not relocate, resell, or allow a third party to tamper with it without the Company's written consent.</p>
-        <p class="clause"><strong>5.5</strong> Where the Customer supplies their own equipment for use with the Service (for example, a Customer-owned router under a Commercial/Rental WiFi installation), that equipment remains the Customer's property at all times, and the Company's equipment ownership terms and workmanship warranty apply only to hardware supplied and installed by the Company.</p>
-
-        <h3>6. Installation Services (CCTV, Electric Fence, Solar Standby, Fingerprint Door Locks)</h3>
-        <p class="clause"><strong>6.1</strong> A site assessment may be carried out before a quotation is confirmed. Quoted costs are based on the site conditions observed at assessment; material changes discovered on the installation day (for example additional cabling distance, wall type, or wiring condition) may adjust the final cost, which will be communicated to the Customer before proceeding.</p>
-        <p class="clause"><strong>6.2</strong> Workmanship is warranted for a period agreed at the time of installation and stated on the job card or invoice. This workmanship warranty does not cover damage from power surges, lightning, water damage, unauthorised modification, or normal wear and tear. Equipment manufacturer warranties, where applicable, are handled in line with the manufacturer's own terms.</p>
-        <p class="clause"><strong>6.3</strong> CCTV and electric fence systems are deterrent and monitoring aids, and fingerprint door locks are an access-control aid. The Company does not guarantee that any installed system will prevent theft, break-in, injury, or loss, and accepts no liability for such incidents.</p>
-        <p class="clause"><strong>6.4</strong> Solar standby systems are sized to the load and backup duration agreed with the Customer at the point of sale. Connecting additional appliances beyond the agreed load may reduce backup duration or damage the system, and is done at the Customer's own risk.</p>
-        <p class="clause"><strong>6.5</strong> CCTV, electric fence, solar standby, and fingerprint door lock installation services are offered nationwide across Kenya, subject to logistics and travel costs for sites outside the Company's normal service radius, communicated to the Customer at the point of quotation.</p>
-        <p class="clause"><strong>6.6</strong> Fingerprint door locks are powered by internal batteries. The Customer is responsible for replacing batteries as needed and for keeping any backup mechanical key or master code safe. Loss of access due to depleted batteries, lost backup keys or codes, or manufacturer firmware issues is not covered by the workmanship warranty.</p>
-
-        <h3>7. Service Availability</h3>
-        <p class="clause"><strong>7.1</strong> The Company takes reasonable technical measures to keep the network available but does not guarantee uninterrupted, error-free service. Outages may occur due to power interruptions, upstream provider faults, adverse weather, equipment failure, or scheduled maintenance.</p>
-        <p class="clause"><strong>7.2</strong> Where practical, the Company will give advance notice of planned maintenance that is expected to interrupt Service.</p>
-        <p class="clause"><strong>7.3</strong> The Company is not liable for losses arising from Service interruption, including business losses, except where caused by the Company's proven negligence.</p>
-
-        <h3>8. Suspension and Termination</h3>
-        <p class="clause"><strong>8.1</strong> The Company may suspend or terminate Service for non-payment, breach of these Terms, unlawful use, or where continued connection poses a risk to the network or other customers.</p>
-        <p class="clause"><strong>8.2</strong> A Customer may discontinue Service at any time; Packages already paid for are consumed as described in Clause 3.3 and are not refunded on voluntary discontinuation.</p>
-        <p class="clause"><strong>8.3</strong> Where equipment remains the Company's property, the Company may retrieve it on termination of an instalment or lease arrangement, giving reasonable notice to the Customer.</p>
-        <p class="clause"><strong>8.4</strong> Upon termination of Service, any Customer-supplied equipment remains the property of the Customer, except the outdoor LiteBeam (LBE) CPE unit, which remains the property of the Company and will be retrieved regardless of who originally supplied or paid for it.</p>
-
-        <h3>9. Limitation of Liability</h3>
-        <p class="clause"><strong>9.1</strong> To the extent permitted by law, the Company's total liability for any claim arising from the Service is limited to the amount paid by the Customer for the specific Service giving rise to the claim in the preceding three months.</p>
-        <p class="clause"><strong>9.2</strong> The Company is not liable for indirect, incidental, or consequential loss, including loss of income, data, or business opportunity.</p>
-
-        <h3>10. Privacy</h3>
-        <p class="clause"><strong>10.1</strong> Customer information collected at registration is used for billing, service delivery, and support, and is kept confidential save where disclosure is required by law or necessary to enforce these Terms.</p>
-
-        <h3>11. Amendments</h3>
-        <p class="clause"><strong>11.1</strong> The Company may update these Terms from time to time. Material changes will be communicated through the Hotspot login page, SMS, WhatsApp, or notices at the Company's office. Continued use of the Service after a change takes effect constitutes acceptance of the revised Terms.</p>
-
-        <h3>12. Governing Law</h3>
-        <p class="clause"><strong>12.1</strong> These Terms are governed by the laws of Kenya. Any dispute that cannot be resolved amicably between the parties shall be subject to the jurisdiction of the Kenyan courts.</p>
-
-        <h3>13. Contact</h3>
-        <p class="clause"><strong>13.1</strong> For billing, support, or installation enquiries, contact Tencent Innovations on Calls 0740 311 014, WhatsApp 0769 306 917, or visit the office in Rangwe, Homa Bay County.</p>
-
-        <a href="/" class="cta-btn" style="margin-top:30px;">Back to Home</a>
-        </div>
-    `;
-    res.send(renderPage(req, { title: 'Terms and Conditions', activeNav: 'terms', content }));
-});
-
-
-// USSD endpoint (the USSD gateway posts here; no login, no cookies)
-app.post('/ussd', (req, res) => {
-    const { text, phoneNumber } = req.body;
-    let response = '';
-
-    if (text === '') {
-        response = `CON Welcome to Tencent Innovations
-1. WiFi & Hotspot Internet
-2. CCTV Installation
-3. Smart Locks
-4. Electric Fence
-5. Solar Backup Power
-6. Site Survey & Visit`;
-    } else if (text === '1') {
-        response = `CON WiFi Consultation: KES 3,000
-(Prices can change by location & urgency)
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '2') {
-        response = `CON CCTV Survey: KES 3,000
-(Prices can change by location & urgency)
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '3') {
-        response = `CON Smart Locks Consultation: KES 2,500
-(Prices can change by location & urgency)
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '4') {
-        response = `CON Electric Fence Survey: KES 5,000
-(Prices can change by location & urgency)
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '5') {
-        response = `CON Solar Consultation: KES 4,000
-(Prices can change by location & urgency)
-1. Confirm & Pay via M-PESA`;
-    } else if (text === '6') {
-        response = `CON Site Survey: KES 3,000
-(Prices can change by location & urgency)
-1. Confirm & Pay via M-PESA`;
-    } else if (text.endsWith('*1')) {
-        response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
-    } else {
-        response = `END Invalid selection. Please dial again.`;
-    }
-
-    res.set('Content-Type', 'text/plain');
-    res.send(response);
-});
-
-// ---------------------------------------------------------------
-// Point of sale service
-// ---------------------------------------------------------------
-if (POS) {
-    // until the POS tables are ready, /pos says so instead of failing in strange ways
-    // (the site administrator, signed in with the NOTIFY_TO / mail address, also sees why, so no log digging is needed)
-    app.use('/pos', (req, res, next) => {
-        if (posReady) return next();
-        const me = String((req.session && req.session.user && req.session.user.email) || '').toLowerCase(), admin = String(MAIL.adminTo || '').toLowerCase();
-        const why = me && admin && me === admin ? ' [Administrator only: ' + (dbSetupNote || posSetupNote || 'no error recorded yet') + ']' : '';
-        return errorPage(req, res, 503, 'POS is starting up', 'The POS is getting ready. Please try again in a minute.' + why);
-    });
-    posHooks = POS({
-        app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
-        publicBaseUrl: PUBLIC_BASE_URL,
-        // the platform's own M-Pesa account (MPESA_* variables) receives the monthly POS subscription
-        platform: { mpesaConfigured, stkPush, stkQuery, normalizePhone },
-        // inside the POS router req.path is shortened, so the original URL is used for the "come back here after login" link
-        requireAuth: (req, res, next) => {
-            if (req.session && req.session.user) return next();
-            if (req.method === 'GET') return res.redirect('/login?next=' + encodeURIComponent(safeNext(req.originalUrl.split('?')[0])));
-            return res.redirect('/login');
+            }
         }
-    });
-} else {
-    // the POS files did not load (the reason is in the server log under "POS module not loaded"): say so instead of a confusing 404
-    app.use('/pos', (req, res) => errorPage(req, res, 503, 'POS unavailable', 'The POS service did not start. Please try again shortly.'));
-}
-
-// ---------------------------------------------------------------
-// 20. Not found, errors, start
-// ---------------------------------------------------------------
-app.use((req, res) => errorPage(req, res, 404, 'Page not found', 'We could not find that page.'));
-
-// One place that catches every error, so a database hiccup cannot crash the server
-app.use((err, req, res, next) => {   // eslint-disable-line no-unused-vars
-    console.error('Request error:', err && err.message ? err.message : err);
-    if (res.headersSent) return;
-    const status = err && (err.status === 400 || err.type === 'entity.too.large') ? (err.status || 413) : 500;
-    try {
-        errorPage(req, res, status, status === 500 ? 'Something went wrong' : 'Bad request',
-            status === 500 ? 'Something went wrong on our side. Please try again in a moment.' : 'We could not read that request.');
-    } catch (_) {
-        res.status(status).type('text/plain').send('Something went wrong.');
     }
-});
+    if (process.env.POS_NO_JOBS !== '1') { const t = setInterval(() => sweep().catch(e => console.error('POS background check failed:', e.message)), 30000); if (t.unref) t.unref(); }
 
-(async () => {
-    await initDb();   // wait for the tables before taking traffic (it keeps retrying in the background if the database is down)
-    if (!(MAIL.brevoKey && MAIL.fromEmail) && !(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)) {
-    console.error('EMAIL IS NOT SET UP: confirmation links, password resets and receipts cannot be sent. Add BREVO_API_KEY and MAIL_FROM_EMAIL in Render.');
+    return { handlePlatformCallback };
 }
-if (!PUBLIC_BASE_URL) console.error('PUBLIC_BASE_URL is not set: confirmation and reset emails cannot be sent. Add it in Render, for example https://your-site.onrender.com');
-app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
-})();
+
+module.exports = mountPos;
+module.exports.initSchema = initSchema;
