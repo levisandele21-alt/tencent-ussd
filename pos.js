@@ -29,7 +29,31 @@ async function assignCode(db, shopId) {   // short business code that staff type
     throw new Error('Could not create a business code');
 }
 
+// An older POS design may already exist in the database (no owner_id column, other column names). It cannot be used by this
+// version, so every pos_* table is renamed to legacy_<date>_pos_* (data, indexes and constraints included). NOTHING is deleted:
+// the old data stays in the database and can be copied across later.
+async function quarantineLegacyLayout(pool) {
+    const cols = (await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'pos_shops'`)).rows.map(r => r.column_name);
+    if (!cols.length || cols.includes('owner_id')) return;   // brand new database, or already the current layout
+    const tag = 'legacy_' + new Date().toISOString().slice(2, 10).replace(/-/g, '') + '_';
+    const qi = n => '"' + String(n).replace(/"/g, '""') + '"', fit = n => (tag + n).slice(0, 63);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const tables = (await client.query(`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND left(tablename, 4) = 'pos_' ORDER BY tablename`)).rows.map(r => r.tablename);
+        for (const t of tables) {
+            for (const c of (await client.query('SELECT conname FROM pg_constraint WHERE conrelid = $1::regclass', [qi(t)])).rows) await client.query(`ALTER TABLE ${qi(t)} RENAME CONSTRAINT ${qi(c.conname)} TO ${qi(fit(c.conname))}`);
+            for (const i of (await client.query(`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1`, [t])).rows) if (!i.indexname.startsWith(tag)) await client.query(`ALTER INDEX ${qi(i.indexname)} RENAME TO ${qi(fit(i.indexname))}`);
+            await client.query(`ALTER TABLE ${qi(t)} RENAME TO ${qi(fit(t))}`);
+        }
+        await client.query('COMMIT');
+        console.log(`POS: the old POS tables (${tables.length}) were moved aside as ${tag}pos_*. Nothing was deleted.`);
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw new Error('Could not move the old POS tables aside: ' + e.message); }
+    finally { client.release(); }
+}
+
 async function initSchema(pool) {
+    await quarantineLegacyLayout(pool);
     await pool.query(`
         CREATE TABLE IF NOT EXISTS pos_shops (
             id SERIAL PRIMARY KEY,
