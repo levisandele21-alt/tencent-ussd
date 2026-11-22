@@ -1430,6 +1430,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         req.session.pos2faAt = Date.now(); req.session.posStepAt = Date.now();
         await saveSess(req);
         await audit(req, '2fa.enabled', '');
+        alertOwner(req, '2-step login was turned on');
         send(req, res, { title: 'Security', nav: 'security', body: `<h1>Two-step login is on</h1><div class="panel" style="max-width:620px"><h2>Save your recovery codes</h2><p>If you lose your phone, each of these codes works once instead of the app code. <b>They are shown only now.</b> Write them down and keep them somewhere safe.</p><pre id="rc" style="font-size:1.1rem;line-height:1.8">${codes.map(esc).join('\n')}</pre><p class="row noprint"><button class="btn ghost" id="rc-copy" type="button">Copy</button><button class="btn ghost" id="rc-print" type="button">Print</button><a class="btn" href="/pos/security">I have saved them</a></p></div><script nonce="${req.nonce || ''}">(function(){document.getElementById('rc-print').addEventListener('click',function(){window.print();});document.getElementById('rc-copy').addEventListener('click',function(){var t=document.getElementById('rc').textContent,b=this;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent='Copied';},function(){b.textContent='Select and copy by hand';});});})();</script>` });
     }));
     router.post('/security/disable', ah(async (req, res) => {
@@ -1437,6 +1438,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         if (!r.ok) return back(res, '/pos/security', '', r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.');
         await q('DELETE FROM pos_owner_security WHERE user_id=$1', [req.session.user.id]);
         await audit(req, '2fa.disabled', '');
+        alertOwner(req, '2-step login was turned off');
         back(res, '/pos/security', 'Two-step login turned off.');
     }));
 
@@ -2085,11 +2087,21 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             <button class="btn" type="submit">${ps ? 'Update Paystack' : 'Connect Paystack'}</button></form></div>` : ''}
         <div class="panel tablewrap"><h2>Recent phone-prompt payments</h2>${recent.length ? `<table><tr><th>When</th><th>Shop</th><th>Cashier</th><th class="num">KES</th><th>Status</th><th>Code</th><th></th></tr>${recent.map(r => `<tr><td class="nowrap">${esc(timeFmt(r.created_at))}</td><td>${esc(r.shop)}</td><td>${esc(r.cashier_name)}</td><td class="num">${r.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${r.status === 'paid' ? 'ok' : r.status === 'pending' ? 'warn' : 'bad'}">${esc(r.status)}</span>${r.fail_reason ? '<br><small class="muted">' + esc(r.fail_reason) + '</small>' : ''}</td><td>${esc(r.receipt)}</td><td class="right">${r.status === 'review' || r.status === 'pending' ? `<form action="/pos/payments/${esc(r.id)}/confirm" method="POST" style="display:inline"><input name="receipt" placeholder="M-Pesa code" maxlength="14" required style="width:110px;display:inline-block"> <button class="btn small ghost" type="submit">I received it</button></form>` : ''}</td></tr>`).join('')}</table><p class="muted">"review" means the amount or status did not match, or no confirmation came: check your M-Pesa statement. Only press "I received it" after you see the money, with the code from your statement.</p>` : '<p class="muted">None yet.</p>'}</div>` });
     }));
+    // tells the owner by email whenever payment settings or 2-step change, so a break-in is noticed within minutes
+    function alertOwner(req, what) {
+        if (!sendMail || !req.session || !req.session.user || !req.session.user.email) return;
+        const when = new Date(Date.now() + 3 * 3600e3).toISOString().replace('T', ' ').slice(0, 16) + ' (Nairobi time)', ip = String(req.ip || '').slice(0, 60);
+        sendMail({ to: req.session.user.email, subject: 'Security alert: ' + what,
+            html: `<p><b>${esc(what)}</b></p><p>Business: ${esc(req.biz ? req.biz.name : '')}<br>When: ${esc(when)}<br>From network address: ${esc(ip)}</p><p>If this was you, no action is needed. If it was not you, change your password now, turn on 2-step login, and check Payment Gateways and the Audit Log.</p>`,
+            text: `${what}\nBusiness: ${req.biz ? req.biz.name : ''}\nWhen: ${when}\nFrom: ${ip}\nIf this was not you, change your password now and check Payment Gateways and the Audit Log.` })
+            .catch(e => console.error('Security alert email failed:', e.message));
+    }
     async function saveGateway(req, res, provider, cfg, secrets) {
         const existing = (await q('SELECT 1 FROM pos_gateways WHERE business_id=$1 AND is_default', [req.biz.id])).rowCount > 0;
         await q(`INSERT INTO pos_gateways (business_id, provider, cfg, secrets, callback_token, is_default) VALUES ($1,$2,$3::jsonb,$4,$5,$6)
                  ON CONFLICT (business_id, provider) DO UPDATE SET cfg=EXCLUDED.cfg, secrets=EXCLUDED.secrets, active=TRUE`, [req.biz.id, provider, JSON.stringify(cfg), vault.seal(secrets, `${req.biz.id}:${provider}`), crypto.randomBytes(24).toString('hex'), !existing]);
         await audit(req, 'gateway.save', `${provider} ${cfg.env || ''} ${cfg.shortcode || ''}`.trim());   // never the secrets
+        alertOwner(req, `${provider === 'mpesa' ? 'M-Pesa' : provider} payment details were saved` + (cfg.shortcode ? ` (shortcode ${cfg.shortcode})` : ''));
         const gw = await loadGateway('business_id=$1 AND provider=$2', [req.biz.id, provider]);
         try { await GW.PROVIDERS[provider].test(gw); return back(res, '/pos/gateways', 'Saved. The keys were accepted.'); }
         catch (e) { return back(res, '/pos/gateways', 'Saved, but the keys were NOT accepted (' + String(e.message).slice(0, 80) + '). Check them and the Live/Test setting.'); }
@@ -2123,7 +2135,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const gwAction = (name, label, fn) => router.post('/gateways/:id/' + name, ah(async (req, res) => {
         if (needStep(req, res, '/pos/gateways')) return;
         const id = parseCount(req.params.id, { min: 1 });
-        if (id && await fn(req, id)) await audit(req, 'gateway.' + name, 'gateway #' + id);
+        if (id && await fn(req, id)) { await audit(req, 'gateway.' + name, 'gateway #' + id); alertOwner(req, 'Payment gateway setting changed: ' + ({ default: 'default gateway changed', toggle: 'gateway switched on or off', delete: 'gateway removed', rotate: 'callback address replaced' }[name] || name)); }
         back(res, '/pos/gateways', label);
     }));
     gwAction('default', 'Default gateway changed.', async (req, id) => (await q('UPDATE pos_gateways SET is_default = (id=$2) WHERE business_id=$1', [req.biz.id, id])).rowCount > 0);
