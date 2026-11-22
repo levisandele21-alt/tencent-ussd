@@ -143,7 +143,12 @@ async function initSchema(pool) {
     // the audit-log lock is a safety extra: if the database refuses it (old version, no permission), the POS still starts and the problem is logged
     const OPTIONAL_STEP = /pos_audit_immutable|pos_audit_no_change/;
     const step = async sql => { try { await pool.query(sql); } catch (e) {
-            if (OPTIONAL_STEP.test(String(sql.text || sql))) { console.error('POS: skipped an optional safety step (' + e.message + '). The audit log will work but will not be locked against edits.'); return; } throw new Error(`POS schema step failed (${e.message}) in: ${String(sql.text || sql).replace(/\s+/g, ' ').slice(0, 140)}`); } };
+            if (OPTIONAL_STEP.test(String(sql.text || sql))) { console.error('POS: skipped an optional safety step (' + e.message + '). The audit log will work but will not be locked against edits.'); return; } let layout = '';
+            try {   // what the existing POS tables really look like, to make a mismatch easy to diagnose
+                const r = await pool.query(`SELECT table_name, string_agg(column_name, ',' ORDER BY ordinal_position) AS cols FROM information_schema.columns WHERE table_schema = current_schema() AND table_name IN ('pos_shops', 'pos_items', 'pos_sales', 'pos_categories') GROUP BY table_name ORDER BY table_name`);
+                layout = ' | existing tables: ' + r.rows.map(x => `${x.table_name}(${x.cols})`).join('; ');
+            } catch (_) { /* diagnostics only */ }
+            throw new Error(`POS schema step failed (${e.message}) in: ${String(sql.text || sql).replace(/\s+/g, ' ').slice(0, 140)}${layout.slice(0, 900)}`); } };
     console.log('POS: setting up database tables');
     for (const sql of T) await step(sql);
 
