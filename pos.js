@@ -16,6 +16,7 @@ const TZ = 'Africa/Nairobi';
 const VAT_RATE = 16;   // percent. Selling prices already include this VAT.
 const vatOf = gross => Math.round(Number(gross) * VAT_RATE / (100 + VAT_RATE));   // VAT inside a VAT-inclusive amount, in cents
 const envInt = (name, fallback) => { const n = Number(process.env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
+const BRANCH_FEE_KES = envInt('POS_BRANCH_FEE', 2000);   // extra per month for every active branch besides the head office
 const SUB_FEE_KES = envInt('POS_MONTHLY_FEE', 3000);   // monthly subscription, paid to the platform M-Pesa account in server.js
 const GRACE_DAYS = envInt('POS_GRACE_DAYS', 30);       // shops that already existed before subscriptions started get this many free days
 const LOGO_OK = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/;
@@ -385,7 +386,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/pos/sw.js',{s
         const content = `
         <div class="general-container">
             <h2>Tencent POS: a point of sale for your shop</h2>
-            <p class="sub-title">Sell faster, know your stock, and see your profit every day. Works on any phone, tablet or computer, and installs like an app. KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month.</p>
+            <p class="sub-title">Sell faster, know your stock, and see your profit every day. Works on any phone, tablet or computer, and installs like an app. KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month for the main shop, plus KES ${BRANCH_FEE_KES.toLocaleString('en-KE')} per month for each extra branch.</p>
             <div class="form-container" style="border-left:4px solid var(--primary);">
                 <h3 style="margin-top:0;color:var(--primary);">What your shop gets</h3>
                 <ul style="line-height:1.8;padding-left:20px;margin-bottom:0;">
@@ -1967,11 +1968,17 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
 
     // ----- monthly subscription, paid by M-Pesa to the platform's own account (the one set up in server.js) -----
     const subLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: 'Too many payment attempts. Please try again later.' });
+    // monthly fee = main shop + KES 2,000 for each active branch; the amount is fixed on the payment row when it starts and checked again when Safaricom confirms
+    async function feeFor(bizId) {
+        const n = (await q('SELECT count(*)::int AS n FROM pos_shops WHERE parent_id=$1 AND active', [bizId])).rows[0].n;
+        return { branches: n, total: SUB_FEE_KES + BRANCH_FEE_KES * n };
+    }
+    const kes0 = n => Number(n).toLocaleString('en-KE');
     const subLastCheck = new Map();
     async function markSubPaid(id, receipt) {   // only the first caller extends the subscription, even if the callback and the status check arrive together
         const done = await q(`WITH p AS (UPDATE pos_sub_payments SET status='paid', receipt=CASE WHEN $2 <> '' THEN $2 ELSE receipt END, paid_at=now() WHERE id=$1 AND status <> 'paid' RETURNING business_id)
                  UPDATE pos_shops s SET sub_until = GREATEST(now(), COALESCE(s.sub_until, now())) + interval '1 month' FROM p WHERE s.id = p.business_id RETURNING s.id`, [id, String(receipt || '').slice(0, 40)]);
-        if (done.rows[0]) await auditRaw(done.rows[0].id, null, 'system', null, '', 'sub.paid', 'KES ' + SUB_FEE_KES + ' ' + String(receipt || ''), '');
+        if (done.rows[0]) await auditRaw(done.rows[0].id, null, 'system', null, '', 'sub.paid', 'KES ' + (await q('SELECT amount_kes FROM pos_sub_payments WHERE id=$1', [id])).rows[0].amount_kes + ' ' + String(receipt || ''), '');
         if (receipt) await q(`UPDATE pos_sub_payments SET receipt=$2 WHERE id=$1 AND receipt = ''`, [id, String(receipt).slice(0, 40)]);
     }
     // called from server.js when Safaricom's callback is not for a booking; returns true when it was ours
@@ -1996,11 +2003,12 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const phone = platform && platform.normalizePhone ? (platform.normalizePhone(req.session.user.phone) || '') : '';
         const compNote = req.comped ? '<div class="alert ok" role="status">This is a complimentary test account: the POS is switched on without a subscription payment.</div>' : '';
         const payId = parseCount(req.query.pay, { min: 1 });
+        const fee = await feeFor(b.id);
         send(req, res, { title: 'Subscription', nav: 'subscription', body: `<h1>Subscription</h1>${notice(req)}${errBox(req)}
         ${compNote}<div class="panel" style="max-width:620px"><h2>${active ? 'Your POS is active' : 'Your POS is not active'}</h2>
-            <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${SUB_FEE_KES.toLocaleString('en-KE')} per month</b> for the whole business, including all branches and cashiers. Paying early adds a month to the end of your current period.</p>
+            <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${kes0(SUB_FEE_KES)} per month</b> for the main shop plus <b>KES ${kes0(BRANCH_FEE_KES)} per month for each branch</b> (cashiers are free). You have ${fee.branches} active branch${fee.branches === 1 ? '' : 'es'}, so you pay <b>KES ${kes0(fee.total)}</b>. Paying early adds a month to the end of your current period.</p>
             ${payId ? `<div id="paybox" class="alert ok" role="status">Check your phone and enter your M-Pesa PIN. Waiting for the payment...</div>` : ''}
-            ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" class="row"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" type="submit">Pay KES ${SUB_FEE_KES.toLocaleString('en-KE')} with M-Pesa</button></form>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
+            ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" class="row"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" type="submit">Pay KES ${kes0(fee.total)} with M-Pesa</button></form>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
         </div>
         ${active ? '<div class="panel" style="max-width:620px"><h2>Install the app</h2><p>Your POS can be installed on phones, tablets and computers. <a href="/pos/install">Open the install page</a>.</p></div>' : ''}
         <div class="panel tablewrap" style="max-width:620px"><h2>Payments</h2>${hist.length ? `<table><tr><th>Date</th><th class="num">Amount</th><th>Status</th><th>M-Pesa code</th></tr>${hist.map(h => `<tr><td>${esc(timeFmt(h.created_at))}</td><td class="num">${h.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${h.status === 'paid' ? 'ok' : h.status === 'pending' ? 'warn' : 'bad'}">${esc(h.status)}</span></td><td>${esc(h.receipt)}</td></tr>`).join('')}</table>` : '<p class="muted">No payments yet.</p>'}</div>
@@ -2013,13 +2021,14 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const open = (await q(`SELECT id FROM pos_sub_payments WHERE business_id=$1 AND status='pending' AND created_at > now() - interval '2 minutes'`, [req.biz.id])).rows[0];
         if (open) return res.redirect('/pos/subscribe?pay=' + open.id);
         let row = null;
+        const fee = await feeFor(req.biz.id);
         for (let i = 0; i < 5 && !row; i++) {
-            try { row = (await q(`INSERT INTO pos_sub_payments (business_id, amount_kes, phone, account_ref) VALUES ($1,$2,$3,$4) RETURNING id, account_ref`, [req.biz.id, SUB_FEE_KES, phone, 'POS' + crypto.randomBytes(4).toString('hex').toUpperCase()])).rows[0]; }
+            try { row = (await q(`INSERT INTO pos_sub_payments (business_id, amount_kes, phone, account_ref) VALUES ($1,$2,$3,$4) RETURNING id, account_ref`, [req.biz.id, fee.total, phone, 'POS' + crypto.randomBytes(4).toString('hex').toUpperCase()])).rows[0]; }
             catch (e) { if (e.code !== '23505') throw e; }
         }
         if (!row) return back(res, '/pos/subscribe', '', 'Could not start the payment. Please try again.');
         try {
-            const r = await platform.stkPush({ amount: SUB_FEE_KES, phone, accountRef: row.account_ref, desc: 'POS monthly' });
+            const r = await platform.stkPush({ amount: fee.total, phone, accountRef: row.account_ref, desc: 'POS monthly' });
             await q('UPDATE pos_sub_payments SET checkout_request_id=$2 WHERE id=$1', [row.id, r.CheckoutRequestID]);
         } catch (e) {
             console.error('POS subscription STK failed:', e.message);
@@ -2165,7 +2174,9 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 COALESCE((SELECT sum(total_cents) FROM pos_sales x WHERE x.shop_id=s.id AND x.status='completed' AND (x.created_at AT TIME ZONE '${TZ}')::date = $2),0)::bigint AS today
               FROM pos_shops s WHERE s.id=$1 OR s.parent_id=$1 ORDER BY (s.parent_id IS NULL) DESC, s.name`, [req.biz.id, today])).rows;
         const total = rows.reduce((a, r) => a + Number(r.today), 0);
+        const bfee = await feeFor(req.biz.id);
         send(req, res, { title: 'Branches', nav: 'branches', body: `<h1>Branches</h1>${notice(req)}${errBox(req)}
+        <div class="alert" role="status">Each active branch costs <b>KES ${kes0(BRANCH_FEE_KES)} per month</b> on top of the main shop's KES ${kes0(SUB_FEE_KES)}. Your monthly total is now <b>KES ${kes0(bfee.total)}</b>. A new branch is included from your next payment. <a href="/pos/subscribe">Subscription</a></div>
         <div class="panel"><p style="margin-top:0">Staff sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with this business code: <b style="font-size:1.2rem;letter-spacing:.1em">${esc(req.biz.code || '')}</b></p>
             <p class="muted" style="margin-bottom:0">Today's sales across all branches: <b>${kes(total)}</b></p></div>
         <div class="panel tablewrap"><table><tr><th>Branch</th><th>Address</th><th class="num">Staff</th><th class="num">Sales today</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.hq ? ' <span class="tag gray">head office</span>' : ''}${r.active ? '' : ' <span class="tag bad">paused</span>'}</td><td>${esc(r.address)}</td><td class="num">${r.staff}</td><td class="num">${fmt(r.today)}</td><td class="right">${r.active ? `<form action="/pos/branches/switch" method="POST" style="display:inline"><input type="hidden" name="shop_id" value="${r.id}"><button class="btn small" type="submit">Open</button></form>` : ''} ${r.hq ? '' : `<form action="/pos/branches/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Pause' : 'Resume'}</button></form>`}</td></tr>`).join('')}</table></div>
