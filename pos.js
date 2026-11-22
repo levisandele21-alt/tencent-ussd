@@ -140,7 +140,11 @@ async function initSchema(pool) {
         `CREATE TABLE IF NOT EXISTS pos_assets (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(120) NOT NULL, cost_cents BIGINT NOT NULL, bought_on DATE NOT NULL, life_years INT NOT NULL DEFAULT 5, salvage_cents BIGINT NOT NULL DEFAULT 0, note VARCHAR(200) NOT NULL DEFAULT '')`,
         `CREATE TABLE IF NOT EXISTS pos_notes (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, title VARCHAR(120) NOT NULL, body VARCHAR(4000) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`
     ];
-    const step = async sql => { try { await pool.query(sql); } catch (e) { throw new Error(`POS schema step failed (${e.message}) in: ${String(sql.text || sql).replace(/\s+/g, ' ').slice(0, 140)}`); } };
+    // the audit-log lock is a safety extra: if the database refuses it (old version, no permission), the POS still starts and the problem is logged
+    const OPTIONAL_STEP = /pos_audit_immutable|pos_audit_no_change/;
+    const step = async sql => { try { await pool.query(sql); } catch (e) {
+            if (OPTIONAL_STEP.test(String(sql.text || sql))) { console.error('POS: skipped an optional safety step (' + e.message + '). The audit log will work but will not be locked against edits.'); return; } throw new Error(`POS schema step failed (${e.message}) in: ${String(sql.text || sql).replace(/\s+/g, ' ').slice(0, 140)}`); } };
+    console.log('POS: setting up database tables');
     for (const sql of T) await step(sql);
 
     // ---- businesses, branches, staff, payment gateways, subscription and VAT ----
