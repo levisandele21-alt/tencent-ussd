@@ -275,23 +275,41 @@ app.use((req, res, next) => {
     next();
 });
 
-// Reject form posts that come from other websites (CSRF). Browsers always say where a form came from;
-// cookies are also SameSite=Lax. Safaricom's callback is a machine call and is exempt.
+// Reject unsafe browser requests unless their exact origin is trusted.
+// Machine callbacks have their own authentication checks; USSD does not use sessions.
 app.use((req, res, next) => {
-    if (req.method !== 'POST' || req.path.startsWith('/payments/cb/') || req.path.startsWith('/pos/mpesa/cb/') || req.path.startsWith('/pos/paystack/hook/')) return next();
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    if (req.method === 'POST' && (
+        /^\/payments\/cb\/[^/]+$/.test(req.path) ||
+        /^\/pos\/mpesa\/cb\/[^/]+$/.test(req.path) ||
+        /^\/pos\/paystack\/hook\/[^/]+$/.test(req.path) ||
+        req.path === '/ussd'
+    )) return next();
+
     const fetchSite = req.get('sec-fetch-site');
     const origin = req.get('origin');
-    let blocked = false;
-    if (fetchSite) {
-        // Modern browsers say exactly how the request relates to this site, so trust that and skip host comparisons
-        blocked = fetchSite === 'cross-site';
-    } else if (origin) {
-        // Older browsers: compare the Origin with every name this site is reached by (Render, custom domain, proxy)
-        const allowed = new Set([req.get('host'), req.get('x-forwarded-host')].filter(Boolean).map(h => h.split(',')[0].trim().toLowerCase()));
-        try { allowed.add(new URL(PUBLIC_BASE_URL).host.toLowerCase()); } catch (_) { /* not set */ }
-        try { blocked = !allowed.has(new URL(origin).host.toLowerCase()); } catch (_) { blocked = true; }
+    const allowed = new Set();
+    // Use the actual request host, not an arbitrary X-Forwarded-Host header.
+    try { allowed.add(new URL(`${req.protocol}://${req.get('host')}`).origin); } catch (_) {}
+    try {
+        const configured = new URL(PUBLIC_BASE_URL);
+        if (['https:', 'http:'].includes(configured.protocol)) allowed.add(configured.origin);
+    } catch (_) {}
+
+    let accepted = false;
+    if (origin) {
+        // Compare scheme, hostname AND port. A same-site sibling is not same-origin.
+        try {
+            const supplied = new URL(origin);
+            accepted = ['https:', 'http:'].includes(supplied.protocol) &&
+                origin === supplied.origin && allowed.has(supplied.origin);
+        } catch (_) {}
+        if (fetchSite === 'cross-site') accepted = false;
+    } else {
+        // Modern browsers provide trustworthy Fetch Metadata. Missing both fails closed.
+        accepted = fetchSite === 'same-origin';
     }
-    if (blocked) return errorPage(req, res, 403, 'Request blocked', 'This request came from another website, so it was blocked.');
+    if (!accepted) return errorPage(req, res, 403, 'Request blocked', 'The request origin could not be verified. Please reload this site and try again.');
     next();
 });
 
@@ -1018,7 +1036,8 @@ async function handleCallback(body) {
             return;
         }
     } catch (err) {
-        console.error('STK status query failed, accepting callback only:', err.message);
+        console.error('STK status query failed; payment remains unconfirmed:', err.message);
+        return;   // fail closed: the existing pending-status poll can retry verification
     }
     await markPaid(booking.id, receipt, verified);
 }
