@@ -167,6 +167,7 @@ if (dbEnabled) {
     console.error('DATABASE_URL is not set: sign-in, bookings and receipts are switched off until you add it.');
 }
 
+const POS_GATE_BUILD = 'r3';   // shown on the "POS is starting up" page so you can tell which version is live
 let posReady = false, posInitRunning = false, posSetupNote = 'POS setup has not started: the main database setup has not finished yet.', dbSetupNote = '';
 async function initPosSchema() {
     if (posInitRunning || posReady) return;
@@ -2193,8 +2194,9 @@ if (POS) {
     app.use('/pos', (req, res, next) => {
         if (posReady) return next();
         const me = String((req.session && req.session.user && req.session.user.email) || '').toLowerCase(), admin = String(MAIL.adminTo || '').toLowerCase();
-        const why = me && admin && me === admin ? ' [Administrator only: ' + (dbSetupNote || posSetupNote || 'no error recorded yet') + ']' : '';
-        return errorPage(req, res, 503, 'POS is starting up', 'The POS is getting ready. Please try again in a minute.' + why);
+        const showWhy = process.env.POS_DEBUG === '1' || (me && admin && me === admin);   // POS_DEBUG=1 shows the reason to everyone: set it only while fixing a problem
+        const why = showWhy ? ' [Reason: ' + (dbSetupNote || posSetupNote || 'no error recorded yet') + ']' : '';
+        return errorPage(req, res, 503, 'POS is starting up', 'The POS is getting ready. Please try again in a minute. (build ' + POS_GATE_BUILD + ')' + why);
     });
     posHooks = POS({
         app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
