@@ -213,6 +213,8 @@ async function initSchema(pool) {
         'DROP TRIGGER IF EXISTS pos_audit_no_change ON pos_audit',
         'CREATE TRIGGER pos_audit_no_change BEFORE UPDATE OR DELETE ON pos_audit FOR EACH ROW EXECUTE PROCEDURE pos_audit_immutable()',
         `CREATE TABLE IF NOT EXISTS pos_owner_security (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE, last_counter BIGINT NOT NULL DEFAULT 0, recovery JSONB NOT NULL DEFAULT '[]', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `ALTER TABLE pos_owner_security ADD COLUMN IF NOT EXISTS method VARCHAR(8) NOT NULL DEFAULT 'app'`,
+        `CREATE TABLE IF NOT EXISTS pos_email_otp (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, tries INT NOT NULL DEFAULT 0, sent_log JSONB NOT NULL DEFAULT '[]')`,
         `CREATE TABLE IF NOT EXISTS pos_void_requests (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE, reason VARCHAR(200) NOT NULL, requested_by VARCHAR(80) NOT NULL DEFAULT '', staff_id INT, status VARCHAR(10) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), decided_at TIMESTAMPTZ, decided_by VARCHAR(80) NOT NULL DEFAULT '')`,
         `CREATE UNIQUE INDEX IF NOT EXISTS pos_void_one_pending ON pos_void_requests (sale_id) WHERE status = 'pending'`
     ]) await step(sql);
@@ -261,7 +263,7 @@ function assetBookValue(a, todayIso) {   // straight-line depreciation by whole 
 // ---------------------------------------------------------------------------
 // Mount
 // ---------------------------------------------------------------------------
-function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, platform = null, publicBaseUrl = '' }) {
+function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, platform = null, publicBaseUrl = '', sendMail = null }) {
     const pool = () => getPool();
     let QRCode = null; try { QRCode = require('qrcode'); } catch (_) { /* optional: the page shows the typed key instead */ }
     const router = express.Router();
@@ -540,17 +542,49 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         if (isApi(req)) return res.status(401).json({ error: 'Your two-step code is needed. Reload the page.' });
         return res.redirect('/pos/2fa');
     }
+    // ----- 2-step by email: a 6-digit code mailed to the owner's confirmed address (10 minutes, 5 tries, one use) -----
+    const maskEmail = e => String(e || '').replace(/^(.).*(@.*)$/, (m, a, b) => a + '***' + b);
+    const emailHash = (uid, code) => crypto.createHash('sha256').update('tpos-email-otp:' + uid + ':' + String(code).replace(/\D/g, '')).digest('hex');
+    async function sendEmailCode(req) {   // returns '' on success, or a message for the person
+        if (!sendMail) return 'Email codes are not available on this server.';
+        const uid = req.session.user.id, to = req.session.user.email;
+        if (!to) return 'Your account has no email address.';
+        const now = Date.now(), old = (await q('SELECT sent_log FROM pos_email_otp WHERE user_id=$1', [uid])).rows[0];
+        const log = (old && Array.isArray(old.sent_log) ? old.sent_log : []).filter(t => now - t < 3600e3);
+        if (log.length && now - log[log.length - 1] < 60e3) return 'A code was just sent. Wait a minute before asking for another.';
+        if (log.length >= 5) return 'Too many codes requested. Try again in an hour.';
+        const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+        log.push(now);
+        await q(`INSERT INTO pos_email_otp (user_id, code_hash, expires_at, tries, sent_log) VALUES ($1,$2, now() + interval '10 minutes', 0, $3::jsonb)
+                 ON CONFLICT (user_id) DO UPDATE SET code_hash=EXCLUDED.code_hash, expires_at=EXCLUDED.expires_at, tries=0, sent_log=EXCLUDED.sent_log`, [uid, emailHash(uid, code), JSON.stringify(log)]);
+        try {
+            await sendMail({ to, subject: 'Your Tencent POS sign-in code: ' + code,
+                html: `<p>Your Tencent POS code is:</p><p style="font-size:28px;letter-spacing:6px"><b>${code}</b></p><p>It works once and expires in 10 minutes. If you did not just try to sign in or change security settings, someone knows your password: change it now.</p>`,
+                text: `Your Tencent POS code is ${code}. It works once and expires in 10 minutes. If this was not you, change your password now.` });
+        } catch (e) { console.error('Email code send failed:', e.message); return 'The email could not be sent. Try again in a minute.'; }
+        return '';
+    }
+    async function checkEmailCode(uid, input) {
+        const code = String(input || '').replace(/\s/g, '');
+        if (!/^\d{6}$/.test(code)) return false;
+        const row = (await q(`UPDATE pos_email_otp SET tries = tries + 1 WHERE user_id=$1 AND expires_at > now() AND tries < 5 RETURNING code_hash`, [uid])).rows[0];
+        if (!row) return false;
+        const a = Buffer.from(row.code_hash), b = Buffer.from(emailHash(uid, code));
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+        return (await q('DELETE FROM pos_email_otp WHERE user_id=$1 AND code_hash=$2 RETURNING 1', [uid, row.code_hash])).rowCount > 0;   // one use
+    }
     // checks a code from the authenticator app (or a one-time recovery code). Five wrong tries lock it for 15 minutes.
     async function verifyOwnerOtp(req, input) {
         const uid = req.session.user.id, kUser = '2fa:' + uid, kIp = '2fa-ip:' + String(req.ip || '');
         if (await failLocked([kUser, kIp])) return { ok: false, locked: true };
-        const row = (await q('SELECT secret, last_counter, recovery, enabled FROM pos_owner_security WHERE user_id = $1', [uid])).rows[0];
+        const row = (await q('SELECT secret, last_counter, recovery, enabled, method FROM pos_owner_security WHERE user_id = $1', [uid])).rows[0];
         let ok = false;
         const code = String(input || '').trim();
         if (row && row.enabled && vault.enabled) {
             if (/^\d{3}\s?\d{3}$/.test(code)) {
-                const counter = SEC.checkTotp(vault.open(row.secret, '2fa:' + uid).s, code, row.last_counter);
+                const counter = row.method === 'email' ? null : SEC.checkTotp(vault.open(row.secret, '2fa:' + uid).s, code, row.last_counter);
                 if (counter) ok = (await q('UPDATE pos_owner_security SET last_counter = $2 WHERE user_id = $1 AND last_counter < $2 RETURNING 1', [uid, counter])).rowCount > 0;   // a code works once
+                if (!ok) ok = await checkEmailCode(uid, code);   // a code that was mailed (also works as a backup for app users)
             } else if (code.length >= 10) {
                 const h = SEC.hashRecovery(code), list = Array.isArray(row.recovery) ? row.recovery : [];
                 if (list.includes(h)) ok = (await q('UPDATE pos_owner_security SET recovery = $2::jsonb WHERE user_id = $1 AND recovery = $3::jsonb RETURNING 1', [uid, JSON.stringify(list.filter(x => x !== h)), JSON.stringify(list)])).rowCount > 0;
@@ -564,11 +598,24 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const autoSubmit = nonce => `<script nonce="${nonce}">(function(){var i=document.getElementById('o'),f=i&&i.form;if(!i)return;i.addEventListener('input',function(){if(/^\\d{6}$/.test(i.value.replace(/\\s/g,'')))f.submit();});})();</script>`;
     const otpForm = (error = '', nonce = '') => `<h1>Two-step check</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}<form action="/pos/2fa" method="POST">
         <div class="field"><label for="o">6-digit code from your authenticator app</label><input id="o" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" autofocus style="font-size:1.6rem;letter-spacing:.3em;text-align:center"><small>It signs you in by itself after 6 digits. Lost your phone? Type a recovery code instead.</small></div>
-        <button class="btn" type="submit" style="width:100%">Continue</button></form></div>${autoSubmit(nonce)}`;
-    router.get('/2fa', (req, res) => {
+        <button class="btn" type="submit" style="width:100%">Continue</button></form>
+        <form action="/pos/2fa/email" method="POST" style="margin-top:12px"><button class="btn ghost" type="submit" style="width:100%">Email me a code instead</button></form></div>${autoSubmit(nonce)}`;
+    router.get('/2fa', ah(async (req, res) => {
         if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
-        send(req, res, { title: 'Two-step check', bare: true, body: otpForm('', req.nonce || '') });
-    });
+        let note = '';
+        if (req.query.sent) note = 'We emailed a 6-digit code to ' + maskEmail(req.session.user.email) + '. It lasts 10 minutes.';
+        else if (req.query.err) note = String(req.query.err).slice(0, 120);
+        else {   // people who chose email as their method get the mail without having to ask
+            const m = (await q('SELECT method FROM pos_owner_security WHERE user_id=$1', [req.session.user.id])).rows[0];
+            if (m && m.method === 'email') { const e = await sendEmailCode(req); note = e || ('We emailed a 6-digit code to ' + maskEmail(req.session.user.email) + '. It lasts 10 minutes.'); }
+        }
+        send(req, res, { title: 'Two-step check', bare: true, body: otpForm(note, req.nonce || '').replace('<div class="alert" role="alert">', note && !req.query.err && !/wait|could not|Too many/.test(note) ? '<div class="alert ok" role="status">' : '<div class="alert" role="alert">') });
+    }));
+    router.post('/2fa/email', ah(async (req, res) => {
+        if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
+        const e = await sendEmailCode(req);
+        res.redirect('/pos/2fa?' + (e ? 'err=' + encodeURIComponent(e) : 'sent=1'));
+    }));
     router.post('/2fa', ah(async (req, res) => {
         if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
         const r = await verifyOwnerOtp(req, req.body.otp);
@@ -1320,6 +1367,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         let body;
         if (!vault.enabled) body = '<div class="alert" role="alert">Two-step login needs POS_CRED_KEY to be set on the server first.</div>';
         else if (row && row.enabled) body = `<div class="panel" style="max-width:620px"><h2>Two-step login is ON <span class="tag ok">protected</span></h2><p>Every time you open the POS you type a code from your authenticator app. Payment settings need a fresh code.</p>
+            <p class="muted">Method: ${row.method === 'email' ? 'codes sent to your email' : 'authenticator app (email codes also work as a backup)'}. <form action="/pos/security/email" method="POST" style="display:inline"><button class="linkbtn" type="submit">Email me a code now</button></form></p>
             <form action="/pos/security/disable" method="POST" class="row"><div><label for="o">To turn it off, enter a current code</label><input id="o" name="otp" inputmode="numeric" required maxlength="20" autocomplete="one-time-code"></div><button class="btn bad" type="submit">Turn off</button></form></div>`;
         else {
             // no extra "start" click: opening this page prepares a fresh (not yet active) key
@@ -1334,10 +1382,36 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             <p><b>2.</b> ${qr ? 'In the app tap <b>+</b> then <b>Scan a QR code</b> and point it here:' : 'In the app tap <b>+</b> then <b>Enter a setup key</b>.'}</p>
             ${qr ? `<p style="text-align:center"><img src="${qr}" width="220" height="220" alt="QR code to scan with your authenticator app" style="background:#fff;padding:6px;border:1px solid var(--line);border-radius:8px"></p>` : ''}
             <p class="muted" style="margin:6px 0">${qr ? 'Cannot scan? Type this key instead' : 'Key'} (time based): <b style="letter-spacing:.08em;word-break:break-all;user-select:all">${esc(sec.match(/.{1,4}/g).join(' '))}</b><br>On this phone you can also <a href="${esc(uri)}">tap here to add it to the app</a>.</p>
-            <form action="/pos/security/enable" method="POST"><div class="field"><label for="c"><b>3.</b> Type the 6-digit number the app shows</label><input id="c" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code" autofocus style="font-size:1.5rem;letter-spacing:.3em;text-align:center;max-width:240px"><small>It turns on by itself after 6 digits.</small></div><button class="btn ok" type="submit">Turn on</button></form></div>
+            <form action="/pos/security/enable" method="POST"><div class="field"><label for="c"><b>3.</b> Type the 6-digit number the app shows</label><input id="c" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code" autofocus style="font-size:1.5rem;letter-spacing:.3em;text-align:center;max-width:240px"><small>It turns on by itself after 6 digits.</small></div><button class="btn ok" type="submit">Turn on</button></form>
+            <hr style="border:0;border-top:1px solid var(--line);margin:16px 0"><p style="margin:0"><b>No authenticator app?</b> Get the code by email instead.</p>
+            <form action="/pos/security/email" method="POST" style="margin-top:8px"><button class="btn ghost" type="submit">Use email codes (${esc(maskEmail(req.session.user.email))})</button></form></div>
             <script nonce="${req.nonce || ''}">(function(){var i=document.getElementById('c');i.addEventListener('input',function(){if(/^\\d{6}$/.test(i.value.replace(/\\s/g,'')))i.form.submit();});})();</script>`;
         }
         send(req, res, { title: 'Security', nav: 'security', body: `<h1>Security</h1>${notice(req)}${errBox(req)}${body}` });
+    }));
+    // email method: send a code, then confirm it to switch 2-step on (or send a code to turn it off / sign in)
+    router.post('/security/email', ah(async (req, res) => {
+        if (!vault.enabled) return back(res, '/pos/security', '', 'Two-step login needs POS_CRED_KEY to be set on the server.');
+        const e = await sendEmailCode(req);
+        if (e) return back(res, '/pos/security', '', e);
+        const on = (await q('SELECT enabled FROM pos_owner_security WHERE user_id=$1', [req.session.user.id])).rows[0];
+        if (on && on.enabled) return back(res, '/pos/security', 'Code sent to ' + maskEmail(req.session.user.email) + '. Type it in the box to turn off.');
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Check your email</h1><div class="panel" style="max-width:520px"><p style="margin-top:0">We sent a 6-digit code to <b>${esc(maskEmail(req.session.user.email))}</b>. It lasts 10 minutes.</p>
+            <form action="/pos/security/email/enable" method="POST"><div class="field"><label for="ec">Type the code</label><input id="ec" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code" autofocus style="font-size:1.5rem;letter-spacing:.3em;text-align:center;max-width:240px"><small>It turns on by itself after 6 digits.</small></div><button class="btn ok" type="submit">Turn on</button></form></div>
+            <script nonce="${req.nonce || ''}">(function(){var i=document.getElementById('ec');i.addEventListener('input',function(){if(/^\\d{6}$/.test(i.value.replace(/\\s/g,'')))i.form.submit();});})();</script>` });
+    }));
+    router.post('/security/email/enable', ah(async (req, res) => {
+        const uid = req.session.user.id, kUser = '2fa:' + uid;
+        if (!vault.enabled || req.has2fa) return back(res, '/pos/security', '', req.has2fa ? 'Already on.' : 'Two-step login needs POS_CRED_KEY to be set on the server.');
+        if (await failLocked([kUser])) return back(res, '/pos/security', '', 'Too many wrong codes. Wait 15 minutes.');
+        if (!(await checkEmailCode(uid, req.body.otp))) { await failHit(kUser, 5, 900, 900); return back(res, '/pos/security', '', 'That code is wrong or expired. Press the email button to get a new one.'); }
+        const codes = SEC.newRecoveryCodes(8);
+        await q(`INSERT INTO pos_owner_security (user_id, secret, enabled, method, last_counter, recovery) VALUES ($1,$2,TRUE,'email',0,$3::jsonb)
+                 ON CONFLICT (user_id) DO UPDATE SET secret=EXCLUDED.secret, enabled=TRUE, method='email', last_counter=0, recovery=EXCLUDED.recovery`, [uid, vault.seal({ s: SEC.newTotpSecret() }, '2fa:' + uid), JSON.stringify(codes.map(SEC.hashRecovery))]);
+        req.session.pos2faAt = Date.now(); req.session.posStepAt = Date.now();
+        await saveSess(req);
+        await audit(req, '2fa.enabled', 'email');
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Two-step login is on (email)</h1><div class="panel" style="max-width:620px"><h2>Save your recovery codes</h2><p>If you cannot get into your email, each of these works once. <b>They are shown only now.</b> Write them down and keep them safe.</p><pre id="rc" style="font-size:1.1rem;line-height:1.8">${codes.map(esc).join('\\n')}</pre><p class="row noprint"><button class="btn ghost" id="rc-print" type="button">Print</button><a class="btn" href="/pos/security">I have saved them</a></p></div><script nonce="${req.nonce || ''}">document.getElementById('rc-print').addEventListener('click',function(){window.print();});</script>` });
     }));
     router.post('/security/start', ah(async (req, res) => {
         if (!vault.enabled || req.has2fa) return back(res, '/pos/security', '', req.has2fa ? 'Already on.' : 'Two-step login needs POS_CRED_KEY to be set on the server.');
