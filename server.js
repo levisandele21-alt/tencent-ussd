@@ -2200,7 +2200,7 @@ if (POS) {
     });
     posHooks = POS({
         app, getPool: () => pool, esc, str, ah, rateLimit, requireDb, requireVerified, renderPage,
-        publicBaseUrl: PUBLIC_BASE_URL,
+        publicBaseUrl: PUBLIC_BASE_URL, sendMail,
         // the platform's own M-Pesa account (MPESA_* variables) receives the monthly POS subscription
         platform: { mpesaConfigured, stkPush, stkQuery, normalizePhone },
         // inside the POS router req.path is shortened, so the original URL is used for the "come back here after login" link
