@@ -177,12 +177,16 @@ async function initSchema(pool) {
     for (const sql of T) await step(sql);
 
     // ---- businesses, branches, staff, payment gateways, subscription and VAT ----
+    try { await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS pos_sales_mpesa_ref_uq ON pos_sales (mpesa_ref) WHERE mpesa_ref IS NOT NULL'); }
+    catch (e) { console.error('Could not add the one-use M-Pesa code index (old duplicate codes exist). Sales still check for repeats in code:', e.message); }
     const hadSub = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'sub_until'`);
     for (const sql of [
         'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES pos_shops(id) ON DELETE CASCADE',   // set on branches: points at the head office
         'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS code VARCHAR(10)',                                          // business code used by staff to sign in
         'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS logo TEXT',
         'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS vat_enabled BOOLEAN NOT NULL DEFAULT TRUE',
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS max_discount_pct INT NOT NULL DEFAULT 10',                  // most a cashier/manager may take off a sale; owners are not capped
+        'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS allow_manual_codes BOOLEAN NOT NULL DEFAULT TRUE',          // typed M-Pesa codes can be switched off in favour of STK push only
         'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS sub_until TIMESTAMPTZ',
         'ALTER TABLE pos_shops DROP CONSTRAINT IF EXISTS pos_shops_owner_id_key',                                   // one business per owner now means one HEAD OFFICE per owner
         'ALTER TABLE pos_shops ALTER COLUMN owner_id DROP NOT NULL',
@@ -259,8 +263,11 @@ function assetBookValue(a, todayIso) {   // straight-line depreciation by whole 
 // ---------------------------------------------------------------------------
 function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireDb, requireVerified, renderPage, platform = null, publicBaseUrl = '' }) {
     const pool = () => getPool();
+    let QRCode = null; try { QRCode = require('qrcode'); } catch (_) { /* optional: the page shows the typed key instead */ }
     const router = express.Router();
     const q = (text, params) => pool().query(text, params);
+    // loose per-network limit for everything under /pos (the server-wide limiter skips /pos so a shop's many staff behind one WiFi are not blocked together)
+    router.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 3000, standardHeaders: true, legacyHeaders: false, skip: r => /^\/(mpesa\/cb|paystack\/hook)\//.test(r.path), message: 'Too many requests from this network. Please wait a few minutes.' }));
 
     // ----- layout -----
     const BASE_NAV = [
@@ -285,7 +292,8 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
         const switcher = role === 'owner' && req.branches && req.branches.length > 1 ? `<form action="/pos/branches/switch" method="POST" style="margin:0 0 6px"><label for="sw" style="color:#6b87a6;font-size:.7rem;padding:0 10px;text-transform:uppercase;letter-spacing:.06em">Branch</label><select id="sw" name="shop_id" style="margin:2px 8px 0;width:calc(100% - 16px);font-size:.85rem">${req.branches.map(b => `<option value="${b.id}"${shop && b.id === shop.id ? ' selected' : ''}>${esc(biz && b.id === biz.id ? b.name + ' (head office)' : b.name)}</option>`).join('')}</select></form>` : '';
         const daysLeft = biz && biz.sub_until ? Math.ceil((new Date(biz.sub_until) - Date.now()) / 86400000) : null;
         const voidBanner = role === 'owner' && req.pendingVoids ? `<div class="alert noprint" role="status">${req.pendingVoids} void request${req.pendingVoids === 1 ? '' : 's'} waiting for your approval. <a href="/pos/voids">Review</a></div>` : '';
-        const banner = voidBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
+        const nudge2 = role === 'owner' && !isStaff && req.has2fa === false && vault.enabled && nav !== 'security' && !bare ? `<div class="alert noprint" role="status">Protect your shop money: <a href="/pos/security"><b>turn on 2-step login</b></a> (takes about a minute).</div>` : '';
+        const banner = nudge2 + voidBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
         const links = navFor(role).map(([group, items]) => `<div class="nav-group">${esc(group)}</div>` +
             items.map(([key, href, label]) => `<a href="${href}"${key === 'install' ? ' id="nav-install"' : ''} class="${nav === key ? 'active' : ''}">${esc(label)}</a>`).join('')).join('');
         return `<!DOCTYPE html>
@@ -294,6 +302,7 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
 <title>${esc(title)} | ${esc(shop ? shop.name : 'Tencent POS')}</title>
 <meta name="robots" content="noindex">
 <link rel="manifest" href="/pos/manifest.webmanifest"><meta name="theme-color" content="#0b1b2e"><link rel="icon" type="image/png" href="/pos/icon-192.png"><link rel="apple-touch-icon" href="/pos/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Tencent POS">
+<script nonce="${req.nonce || ''}">window.__ip=null;window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();window.__ip=e;window.dispatchEvent(new Event('ip-ready'));});</script>
 <style>
 :root{--bg:#f1f5f9;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--side:#0b1b2e;--side2:#12304d;--accent:#0ea5e9;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--radius:10px}
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);font-size:15px;line-height:1.45}
@@ -341,14 +350,23 @@ ${switcher}${links}
 <form action="${isStaff ? '/pos/staff/logout' : '/logout'}" method="POST"><button class="linkbtn" type="submit">Log out</button></form>
 </nav>
 <main class="main">${banner}${body}</main>
+<div id="ibar" class="noprint" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;background:#0b1b2e;color:#fff;padding:10px 14px;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:0 -2px 12px rgba(0,0,0,.25)"><span style="flex:1;min-width:150px;font-weight:600">Get the Tencent POS app</span><button id="ibar-go" type="button" style="background:#16a34a;color:#fff;border:0;border-radius:8px;padding:11px 22px;font-size:1rem;font-weight:700;cursor:pointer">Install</button><button id="ibar-x" type="button" aria-label="Hide" style="background:none;border:0;color:#cbd5e1;font-size:1.3rem;cursor:pointer">&times;</button><span id="ibar-ios" style="display:none;flex-basis:100%;font-size:.9rem">On iPhone: tap the Share button in Safari, then <b>Add to Home Screen</b>.</span></div>
 <script nonce="${req.nonce || ''}">
 (function(){var b=document.getElementById('side-btn'),s=document.getElementById('side');if(b)b.addEventListener('click',function(){var o=s.classList.toggle('open');b.setAttribute('aria-expanded',o?'true':'false');});
 var sw=document.getElementById('sw');if(sw)sw.addEventListener('change',function(){sw.form.submit();});
-var ev=null,ib=document.getElementById('install-now'),ni=document.getElementById('nav-install');
+var ev=window.__ip,ib=document.getElementById('install-now'),ni=document.getElementById('nav-install');
 var standalone=(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches)||window.navigator.standalone===true;
 if(standalone&&ni)ni.style.display='none';
 function startInstall(){if(!ev)return false;var p=ev;ev=null;p.prompt();p.userChoice.then(function(c){if(c&&c.outcome==='accepted'){if(ni)ni.style.display='none';if(ib)ib.style.display='none';}});return true;}
-window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();ev=e;if(ib)ib.style.display='';var h=document.getElementById('install-help');if(h)h.style.display='none';});
+function ready(){ev=window.__ip;if(ib)ib.style.display='';var h=document.getElementById('install-help');if(h)h.style.display='none';showBar();}
+window.addEventListener('ip-ready',ready);
+var bar=document.getElementById('ibar'),ibtn=document.getElementById('ibar-go'),ix=document.getElementById('ibar-x'),ios=/iphone|ipad|ipod/i.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+function hidden(){try{return Number(localStorage.getItem('ibar-hide')||0)>Date.now();}catch(_){return false;}}
+function showBar(){if(bar&&!standalone&&!hidden()&&(window.__ip||ios))bar.style.display='flex';}
+if(ev)ready();else if(ios)showBar();
+if(ibtn)ibtn.addEventListener('click',function(){if(window.__ip){ev=window.__ip;window.__ip=null;startInstall();bar.style.display='none';}else{document.getElementById('ibar-ios').style.display='block';}});
+if(ix)ix.addEventListener('click',function(){bar.style.display='none';try{localStorage.setItem('ibar-hide',String(Date.now()+7*864e5));}catch(_){}});
+if(standalone&&bar)bar.style.display='none';
 window.addEventListener('appinstalled',function(){if(ni)ni.style.display='none';});
 if(ni)ni.addEventListener('click',function(e){if(startInstall())e.preventDefault();});
 if(ib)ib.addEventListener('click',startInstall);
@@ -437,7 +455,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', 10);   // compared when the username is unknown, so timing does not give it away
     // ----- audit log: append-only (the database refuses UPDATE and DELETE on it) -----
     async function auditRaw(bizId, shopId, kind, actorId, actorName, action, detail, ip) {
-        try { await q('INSERT INTO pos_audit (business_id, shop_id, actor_kind, actor_id, actor_name, action, detail, ip) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [bizId, shopId || null, kind, actorId || null, String(actorName || '').slice(0, 80), action, String(detail || '').slice(0, 300), String(ip || '').slice(0, 60)]); }
+        try {
+            if (!bizId && kind === 'owner' && actorId) bizId = ((await q('SELECT id FROM pos_shops WHERE owner_id=$1 AND parent_id IS NULL', [actorId])).rows[0] || {}).id;   // 2-step checks happen before the shop is loaded
+            if (!bizId) return;
+            await q('INSERT INTO pos_audit (business_id, shop_id, actor_kind, actor_id, actor_name, action, detail, ip) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [bizId, shopId || null, kind, actorId || null, String(actorName || '').slice(0, 80), action, String(detail || '').slice(0, 300), String(ip || '').slice(0, 60)]); }
         catch (e) { console.error('Audit write failed:', e.message); }
     }
     const audit = (req, action, detail) => auditRaw(req.biz ? req.biz.id : (req.actor && req.actor.businessId), req.shop ? req.shop.id : null, req.actor ? req.actor.kind : 'system', req.actor ? (req.actor.staffId || (req.session && req.session.user && req.session.user.id)) : null, req.actor ? req.actor.name : '', action, detail, req.ip);
@@ -540,17 +561,18 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         req.session.posStepAt = Date.now();
         return { ok: true };
     }
-    const otpForm = (error = '') => `<h1>Two-step check</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}<form action="/pos/2fa" method="POST">
-        <div class="field"><label for="o">6-digit code from your authenticator app</label><input id="o" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" autofocus><small>Lost your phone? Type one of your recovery codes instead.</small></div>
-        <button class="btn" type="submit" style="width:100%">Continue</button></form></div>`;
+    const autoSubmit = nonce => `<script nonce="${nonce}">(function(){var i=document.getElementById('o'),f=i&&i.form;if(!i)return;i.addEventListener('input',function(){if(/^\\d{6}$/.test(i.value.replace(/\\s/g,'')))f.submit();});})();</script>`;
+    const otpForm = (error = '', nonce = '') => `<h1>Two-step check</h1><div class="panel">${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}<form action="/pos/2fa" method="POST">
+        <div class="field"><label for="o">6-digit code from your authenticator app</label><input id="o" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" autofocus style="font-size:1.6rem;letter-spacing:.3em;text-align:center"><small>It signs you in by itself after 6 digits. Lost your phone? Type a recovery code instead.</small></div>
+        <button class="btn" type="submit" style="width:100%">Continue</button></form></div>${autoSubmit(nonce)}`;
     router.get('/2fa', (req, res) => {
         if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
-        send(req, res, { title: 'Two-step check', bare: true, body: otpForm() });
+        send(req, res, { title: 'Two-step check', bare: true, body: otpForm('', req.nonce || '') });
     });
     router.post('/2fa', ah(async (req, res) => {
         if (req.actor.kind !== 'owner' || !req.has2fa) return res.redirect('/pos/app');
         const r = await verifyOwnerOtp(req, req.body.otp);
-        if (!r.ok) return send(req, res, { title: 'Two-step check', bare: true, body: otpForm(r.locked ? 'Too many wrong codes. Please wait 15 minutes.' : 'That code is not right. Try the newest code.') }, r.locked ? 429 : 401);
+        if (!r.ok) return send(req, res, { title: 'Two-step check', bare: true, body: otpForm(r.locked ? 'Too many wrong codes. Please wait 15 minutes.' : 'That code is not right. Try the newest code.', req.nonce || '') }, r.locked ? 429 : 401);
         req.session.pos2faAt = Date.now();
         await saveSess(req);
         res.redirect('/pos/app');
@@ -858,7 +880,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 ${vatOn ? `<div class="tot muted"><small>Includes VAT ${VAT_RATE}%</small><small id="vat">0.00</small></div>` : ''}
                 <div class="pay" style="grid-template-columns:repeat(${stkOn ? 3 : 2},1fr)"><button type="button" id="m-cash" class="on">Cash</button><button type="button" id="m-mpesa">M-Pesa code</button>${stkOn ? '<button type="button" id="m-stk">Phone prompt</button>' : ''}</div>
                 <div id="cashbox" class="field"><label for="tender">Cash received (KES)</label><input id="tender" inputmode="decimal" placeholder="0"><div class="tot" style="margin-top:6px"><span>Change</span><b id="change">0.00</b></div></div>
-                <div id="mpesabox" class="field" style="display:none"><label for="mref">M-Pesa code (from the customer's SMS)</label><input id="mref" maxlength="14" autocapitalize="characters" placeholder="e.g. SHK4A1B2C3"></div>
+                <div id="mpesabox" class="field" style="display:none"><label for="mref">M-Pesa code (from the customer's SMS)</label><input id="mref" maxlength="10" autocapitalize="characters" placeholder="e.g. SHK4A1B2C3"></div>
                 <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer M-Pesa number</label><input id="sphone" type="tel" placeholder="0712345678"><small>The customer gets a prompt on their phone and types their PIN.</small></div>
                 <div class="field" id="cpbox"><label for="cphone">Customer phone (optional, to share the receipt)</label><input id="cphone" type="tel" placeholder="0712345678"></div>
                 <div id="err" class="alert" role="alert" style="display:none"></div>
@@ -971,7 +993,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 if (busy || !cart.length) return; var t = totals();
                 if (method === 'stk') { startStk(); return; }
                 if (method === 'cash' && money($('tender').value) < t.total) { showErr('The cash received is less than the total.'); return; }
-                if (method === 'mpesa' && !/^[A-Za-z0-9]{8,14}$/.test($('mref').value.trim())) { showErr("Enter the M-Pesa code from the customer's SMS."); return; }
+                if (method === 'mpesa' && !/^[A-Za-z0-9]{10}$/.test($('mref').value.trim())) { showErr("The M-Pesa code is 10 letters and numbers, as in the customer's SMS."); return; }
                 busy = true; $('done').disabled = true; $('done').textContent = 'Saving...'; showErr('');
                 fetch('/pos/api/sales', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
                     lines: lines(), discount: $('disc').value, method: method, tendered: $('tender').value, mpesaRef: $('mref').value.trim(), customerPhone: $('cphone').value.trim() }) })
@@ -994,6 +1016,12 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const cashierOf = req => ({ staffId: req.actor.kind === 'staff' ? req.actor.staffId : null, name: String(req.actor.name || '').slice(0, 80) });
     const kePhone = raw => { const m = String(raw || '').replace(/[\s-]/g, '').match(/^(?:\+?254|0)([17]\d{8})$/); return m ? '254' + m[1] : ''; };
 
+    // staff may only take off so much; every discount is written to the audit log
+    function discountProblem(req, subtotal, discount) {
+        if (!discount || req.actor.kind === 'owner') return '';
+        const pct = Number.isInteger(Number(req.biz.max_discount_pct)) ? Number(req.biz.max_discount_pct) : 10;
+        return discount > Math.floor(subtotal * pct / 100) + 100 ? `Discounts above ${pct}% need the owner. Ask the owner to make this sale or raise the limit in Shop Settings.` : '';   // +KES 1 for rounding
+    }
     // reads the cart from the request: { want: Map(itemId -> qty), discountIn } or { error }
     function readCart(b) {
         if (!Array.isArray(b.lines) || !b.lines.length || b.lines.length > 100) return { error: 'The sale has no items.' };
@@ -1047,7 +1075,8 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const cart = readCart(b);
         if (cart.error) return bad(cart.error);
         const mref = method === 'mpesa' ? String(b.mpesaRef || '').trim().toUpperCase() : '';
-        if (method === 'mpesa' && !/^[A-Z0-9]{8,14}$/.test(mref)) return bad("Enter the M-Pesa code from the customer's SMS.");
+        if (method === 'mpesa' && !/^[A-Z0-9]{10}$/.test(mref)) return bad("The M-Pesa code is 10 letters and numbers, as in the customer's SMS.");
+        if (method === 'mpesa' && req.actor.kind !== 'owner' && req.biz.allow_manual_codes === false) return bad('Typed M-Pesa codes are switched off for this business. Use the "M-Pesa prompt" option.', 403);
         const phoneRaw = String(b.customerPhone || '').replace(/[\s-]/g, ''), phone = kePhone(phoneRaw);
         if (phoneRaw && !phone) return bad('The customer phone number is not valid.');
         const who = cashierOf(req);
@@ -1057,6 +1086,12 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             const priced = await priceCart(client, req.shop.id, cart.want, true);
             if (priced.error) { await client.query('ROLLBACK'); return bad(priced.error, priced.code); }
             const subtotal = priced.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(cart.discountIn, subtotal), total = subtotal - discount;
+            const dProb = discountProblem(req, subtotal, discount);
+            if (dProb) { await client.query('ROLLBACK'); await audit(req, 'sale.discount_blocked', `KES ${fmt(discount)} off KES ${fmt(subtotal)}`); return bad(dProb, 403); }
+            if (mref) {
+                const dup = await client.query('SELECT 1 FROM pos_sales WHERE mpesa_ref=$1 LIMIT 1', [mref]);
+                if (dup.rowCount) { await client.query('ROLLBACK'); await audit(req, 'sale.code_reused', mref); return bad('That M-Pesa code has already been used for another sale.', 409); }
+            }
             let paid = total, change = 0;
             if (method === 'cash') {
                 const tendered = String(b.tendered || '').trim() === '' ? null : parseMoney(b.tendered);
@@ -1065,9 +1100,11 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             }
             const sale = await insertSale(client, req.shop, req.biz, { lines: priced.lines, discount, method, mref, phone, paid, change, staffId: who.staffId, cashierName: who.name });
             await client.query('COMMIT');
+            if (discount > 0) await audit(req, 'sale.discount', `Receipt #${sale.no}: KES ${fmt(discount)} off KES ${fmt(subtotal)}`);
             res.json({ ok: true, saleId: sale.id, receiptNo: sale.no, total: sale.total, change, receiptUrl: `/pos/sales/${sale.id}/receipt`, whatsapp: whatsappLink(req.shop, phone, sale.no, sale.total, method) });
         } catch (err) {
             await client.query('ROLLBACK').catch(() => {});
+            if (err && err.code === '23505' && /mpesa_ref/.test(String(err.constraint || err.message))) return bad('That M-Pesa code has already been used for another sale.', 409);
             throw err;
         } finally { client.release(); }
     }));
@@ -1094,6 +1131,8 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const priced = await priceCart({ query: q }, req.shop.id, cart.want, false);
         if (priced.error) return bad(priced.error, priced.code);
         const subtotal = priced.lines.reduce((a, l) => a + l.price * l.qty, 0), discount = Math.min(cart.discountIn, subtotal), total = subtotal - discount;
+        const dProb = discountProblem(req, subtotal, discount);
+        if (dProb) { await audit(req, 'sale.discount_blocked', `KES ${fmt(discount)} off KES ${fmt(subtotal)}`); return bad(dProb, 403); }
         const amountKes = Math.ceil(total / 100);   // M-Pesa takes whole shillings
         if (amountKes < 1) return bad('The total is too small to charge.');
         const who = cashierOf(req), id = crypto.randomBytes(12).toString('hex');
@@ -1282,12 +1321,22 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         if (!vault.enabled) body = '<div class="alert" role="alert">Two-step login needs POS_CRED_KEY to be set on the server first.</div>';
         else if (row && row.enabled) body = `<div class="panel" style="max-width:620px"><h2>Two-step login is ON <span class="tag ok">protected</span></h2><p>Every time you open the POS you type a code from your authenticator app. Payment settings need a fresh code.</p>
             <form action="/pos/security/disable" method="POST" class="row"><div><label for="o">To turn it off, enter a current code</label><input id="o" name="otp" inputmode="numeric" required maxlength="20" autocomplete="one-time-code"></div><button class="btn bad" type="submit">Turn off</button></form></div>`;
-        else if (row) {
-            const sec = vault.open(row.secret, '2fa:' + uid).s;
-            body = `<div class="panel" style="max-width:620px"><h2>Finish setting up</h2><ol style="line-height:1.8"><li>Install an authenticator app (Google Authenticator, Microsoft Authenticator or Authy).</li><li>Add an account and choose <i>Enter a setup key</i>. Account: <b>${esc(req.session.user.email || 'Tencent POS')}</b>, key: <b style="letter-spacing:.08em;word-break:break-all">${esc(sec.match(/.{1,4}/g).join(' '))}</b>, type: time based.</li><li>Type the 6-digit code it shows below.</li></ol>
-            <form action="/pos/security/enable" method="POST" class="row"><div><label for="c">6-digit code</label><input id="c" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code"></div><button class="btn ok" type="submit">Turn on</button></form>
-            <p class="muted">Phone with the key? On the phone itself you can tap this link to add it: <a href="${esc(SEC.otpauthUri(req.session.user.email || 'owner', sec))}">open in authenticator</a>.</p></div>`;
-        } else body = '<div class="panel" style="max-width:620px"><h2>Two-step login is OFF</h2><p>A stolen or guessed password would give a stranger your whole business, including where your M-Pesa money is sent. Two-step login stops that. It is required to change payment settings.</p><form action="/pos/security/start" method="POST"><button class="btn ok" type="submit">Set up two-step login</button></form></div>';
+        else {
+            // no extra "start" click: opening this page prepares a fresh (not yet active) key
+            let sec;
+            if (row) sec = vault.open(row.secret, '2fa:' + uid).s;
+            else { await q(`INSERT INTO pos_owner_security (user_id, secret, enabled) VALUES ($1,$2,FALSE) ON CONFLICT (user_id) DO NOTHING`, [uid, vault.seal({ s: SEC.newTotpSecret() }, '2fa:' + uid)]); sec = vault.open((await q('SELECT secret FROM pos_owner_security WHERE user_id=$1', [uid])).rows[0].secret, '2fa:' + uid).s; }
+            const uri = SEC.otpauthUri(req.session.user.email || 'owner', sec);
+            let qr = '';
+            if (QRCode) { try { qr = await QRCode.toDataURL(uri, { margin: 1, width: 220, errorCorrectionLevel: 'M' }); } catch (_) { qr = ''; } }
+            body = `<div class="panel" style="max-width:620px"><h2>Turn on 2-step login</h2><p style="margin-top:0">A stranger who learns your password still cannot get into your shop. Three quick steps:</p>
+            <p><b>1.</b> Get a free authenticator app on your phone: <i>Google Authenticator</i> or <i>Microsoft Authenticator</i>.</p>
+            <p><b>2.</b> ${qr ? 'In the app tap <b>+</b> then <b>Scan a QR code</b> and point it here:' : 'In the app tap <b>+</b> then <b>Enter a setup key</b>.'}</p>
+            ${qr ? `<p style="text-align:center"><img src="${qr}" width="220" height="220" alt="QR code to scan with your authenticator app" style="background:#fff;padding:6px;border:1px solid var(--line);border-radius:8px"></p>` : ''}
+            <p class="muted" style="margin:6px 0">${qr ? 'Cannot scan? Type this key instead' : 'Key'} (time based): <b style="letter-spacing:.08em;word-break:break-all;user-select:all">${esc(sec.match(/.{1,4}/g).join(' '))}</b><br>On this phone you can also <a href="${esc(uri)}">tap here to add it to the app</a>.</p>
+            <form action="/pos/security/enable" method="POST"><div class="field"><label for="c"><b>3.</b> Type the 6-digit number the app shows</label><input id="c" name="otp" inputmode="numeric" required maxlength="8" autocomplete="one-time-code" autofocus style="font-size:1.5rem;letter-spacing:.3em;text-align:center;max-width:240px"><small>It turns on by itself after 6 digits.</small></div><button class="btn ok" type="submit">Turn on</button></form></div>
+            <script nonce="${req.nonce || ''}">(function(){var i=document.getElementById('c');i.addEventListener('input',function(){if(/^\\d{6}$/.test(i.value.replace(/\\s/g,'')))i.form.submit();});})();</script>`;
+        }
         send(req, res, { title: 'Security', nav: 'security', body: `<h1>Security</h1>${notice(req)}${errBox(req)}${body}` });
     }));
     router.post('/security/start', ah(async (req, res) => {
@@ -1307,7 +1356,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         req.session.pos2faAt = Date.now(); req.session.posStepAt = Date.now();
         await saveSess(req);
         await audit(req, '2fa.enabled', '');
-        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Two-step login is on</h1><div class="panel" style="max-width:620px"><h2>Save your recovery codes</h2><p>If you lose your phone, each of these codes works once instead of the app code. <b>They are shown only now.</b> Write them down and keep them somewhere safe.</p><pre style="font-size:1.1rem;line-height:1.8">${codes.map(esc).join('\n')}</pre><a class="btn" href="/pos/security">I have saved them</a></div>` });
+        send(req, res, { title: 'Security', nav: 'security', body: `<h1>Two-step login is on</h1><div class="panel" style="max-width:620px"><h2>Save your recovery codes</h2><p>If you lose your phone, each of these codes works once instead of the app code. <b>They are shown only now.</b> Write them down and keep them somewhere safe.</p><pre id="rc" style="font-size:1.1rem;line-height:1.8">${codes.map(esc).join('\n')}</pre><p class="row noprint"><button class="btn ghost" id="rc-copy" type="button">Copy</button><button class="btn ghost" id="rc-print" type="button">Print</button><a class="btn" href="/pos/security">I have saved them</a></p></div><script nonce="${req.nonce || ''}">(function(){document.getElementById('rc-print').addEventListener('click',function(){window.print();});document.getElementById('rc-copy').addEventListener('click',function(){var t=document.getElementById('rc').textContent,b=this;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent='Copied';},function(){b.textContent='Select and copy by hand';});});})();</script>` });
     }));
     router.post('/security/disable', ah(async (req, res) => {
         const r = await verifyOwnerOtp(req, req.body.otp);
@@ -1417,6 +1466,8 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         <div class="panel" style="max-width:620px"><h2>Business-wide (all branches)</h2><form action="/pos/settings/business" method="POST">
             <div class="field"><label for="k">KRA PIN (printed on receipts)</label><input id="k" name="tax_pin" maxlength="40" value="${esc(b.tax_pin)}"></div>
             <div class="field"><label><input type="checkbox" name="vat" value="1" ${b.vat_enabled ? 'checked' : ''} style="width:auto"> My prices include ${VAT_RATE}% VAT (receipts show the VAT amount)</label><small>Switch this off only if the business is not registered for VAT.</small></div>
+            <div class="field"><label for="md">Biggest discount cashiers and managers may give (%)</label><input id="md" name="max_discount_pct" type="number" min="0" max="100" value="${Number(b.max_discount_pct == null ? 10 : b.max_discount_pct)}" style="max-width:120px"><small>Above this, only you (the owner) can sell. Every discount is recorded in the Audit Log.</small></div>
+            <div class="field"><label><input type="checkbox" name="manual_codes" value="1" ${b.allow_manual_codes === false ? '' : 'checked'} style="width:auto"> Allow cashiers to type an M-Pesa code from the customer's SMS</label><small>A typed code cannot be checked with Safaricom. Switch this off to accept M-Pesa only through the phone prompt, which is verified.</small></div>
             <button class="btn" type="submit">Save</button></form></div>
         <div class="panel" style="max-width:620px"><h2>Receipt logo</h2>
             <p>${logo ? `<img src="${logo}" alt="Your logo" style="max-height:90px;max-width:260px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:4px">` : '<span class="muted">No logo yet.</span>'}</p>
@@ -1464,8 +1515,9 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         res.redirect('/pos/settings?ok=' + encodeURIComponent('Saved.'));
     }));
     router.post('/settings/business', ah(async (req, res) => {
-        await q('UPDATE pos_shops SET tax_pin=$2, vat_enabled=$3 WHERE id=$1', [req.biz.id, str(req.body.tax_pin).slice(0, 40), req.body.vat === '1']);
-        await audit(req, 'settings.business', 'VAT ' + (req.body.vat === '1' ? 'on' : 'off') + ', KRA PIN updated');
+        const md = Math.min(100, Math.max(0, parseInt(req.body.max_discount_pct, 10) || 0));
+        await q('UPDATE pos_shops SET tax_pin=$2, vat_enabled=$3, max_discount_pct=$4, allow_manual_codes=$5 WHERE id=$1', [req.biz.id, str(req.body.tax_pin).slice(0, 40), req.body.vat === '1', md, req.body.manual_codes === '1']);
+        await audit(req, 'settings.business', 'VAT ' + (req.body.vat === '1' ? 'on' : 'off') + ', KRA PIN updated, max discount ' + md + '%, typed M-Pesa codes ' + (req.body.manual_codes === '1' ? 'allowed' : 'off'));
         res.redirect('/pos/settings?ok=' + encodeURIComponent('Saved.'));
     }));
     router.post('/settings/logo', ah(async (req, res) => {
