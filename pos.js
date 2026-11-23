@@ -180,6 +180,7 @@ async function initSchema(pool) {
     // ---- businesses, branches, staff, payment gateways, subscription and VAT ----
     try { await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS pos_sales_mpesa_ref_uq ON pos_sales (mpesa_ref) WHERE mpesa_ref IS NOT NULL'); }
     catch (e) { console.error('Could not add the one-use M-Pesa code index (old duplicate codes exist). Sales still check for repeats in code:', e.message); }
+    const hadBranchSub = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_sub_payments' AND column_name = 'shop_ids'`);
     const hadSub = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name = 'pos_shops' AND column_name = 'sub_until'`);
     for (const sql of [
         'ALTER TABLE pos_shops ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES pos_shops(id) ON DELETE CASCADE',   // set on branches: points at the head office
@@ -206,6 +207,8 @@ async function initSchema(pool) {
         'CREATE INDEX IF NOT EXISTS pos_payments_shop_idx ON pos_payments (shop_id, created_at DESC)',
         `CREATE TABLE IF NOT EXISTS pos_sub_payments (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, amount_kes INT NOT NULL, phone VARCHAR(20) NOT NULL, account_ref VARCHAR(20) NOT NULL UNIQUE, checkout_request_id VARCHAR(100), status VARCHAR(10) NOT NULL DEFAULT 'pending', receipt VARCHAR(40) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), paid_at TIMESTAMPTZ)`,
         'CREATE INDEX IF NOT EXISTS pos_sub_checkout_idx ON pos_sub_payments (checkout_request_id)',
+        'ALTER TABLE pos_sub_payments ADD COLUMN IF NOT EXISTS shop_ids INT[]',   // which shops (head office and/or branches) a payment extends
+        'ALTER TABLE pos_staff ADD COLUMN IF NOT EXISTS perms JSONB',   // NULL = the usual access for the role; otherwise the list of sections the owner allowed
         'ALTER TABLE pos_staff ADD COLUMN IF NOT EXISTS session_ver INT NOT NULL DEFAULT 0',   // bumped on password change or switch-off: ends that person's sessions
         `CREATE TABLE IF NOT EXISTS pos_auth_fails (key TEXT PRIMARY KEY, count INT NOT NULL DEFAULT 0, first_at TIMESTAMPTZ NOT NULL DEFAULT now(), locked_until TIMESTAMPTZ)`,
         `CREATE TABLE IF NOT EXISTS pos_audit (id BIGSERIAL PRIMARY KEY, business_id INT NOT NULL, shop_id INT, actor_kind VARCHAR(10) NOT NULL, actor_id INT, actor_name VARCHAR(80) NOT NULL DEFAULT '', action VARCHAR(40) NOT NULL, detail VARCHAR(300) NOT NULL DEFAULT '', ip VARCHAR(60) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
@@ -220,6 +223,7 @@ async function initSchema(pool) {
         `CREATE UNIQUE INDEX IF NOT EXISTS pos_void_one_pending ON pos_void_requests (sale_id) WHERE status = 'pending'`
     ]) await step(sql);
     // shops that were already using the POS before subscriptions existed keep working for a grace period
+    if (!hadBranchSub.rowCount) await step({ text: 'UPDATE pos_shops c SET sub_until = p.sub_until FROM pos_shops p WHERE c.parent_id = p.id AND c.sub_until IS NULL' });   // branches that existed before get the same end date once; from now on each branch has its own
     if (!hadSub.rowCount) await step({ text: 'UPDATE pos_shops SET sub_until = now() + make_interval(days => $1::int) WHERE parent_id IS NULL', values: [GRACE_DAYS] });
     for (const s of (await pool.query('SELECT id FROM pos_shops WHERE parent_id IS NULL AND code IS NULL')).rows) await assignCode(pool, s.id);
 }
@@ -278,7 +282,31 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
         ['Inventory', [['items', '/pos/items', 'Items'], ['categories', '/pos/categories', 'Categories'], ['stock', '/pos/stock', 'Stock In / Out & Adjustment'], ['history', '/pos/stock/history', 'Stock History'], ['low', '/pos/stock/low', 'Low Stock Alerts'], ['suppliers', '/pos/suppliers', 'Suppliers'], ['po', '/pos/purchase-orders', 'Purchase Orders']]],
         ['Money', [['expenses', '/pos/expenses', 'Expenses'], ['ecats', '/pos/expense-categories', 'Expense Categories'], ['recurring', '/pos/recurring', 'Recurring Expenses'], ['budgets', '/pos/budgets', 'Budgets'], ['assets', '/pos/assets', 'Assets'], ['reports', '/pos/reports', 'Reports'], ['notebook', '/pos/notebook', 'Notebook']]]
     ];
-    function navFor(role) {
+    // what the owner can switch on or off for each staff member: [key, label, help, URL pattern, for managers only?]
+    const SECTIONS = [
+        ['terminal', 'POS Terminal (sell)', 'Make sales and print receipts', /^\/(terminal|api\/items|api\/sales|api\/pay\/start|api\/pay\/[a-f0-9]{24}|sales\/\d+\/receipt)$/, false],
+        ['sales', 'Sales History', 'Cashiers see only their own sales', /^\/sales(\/|$)/, false],
+        ['dashboard', 'Dashboard', 'Today\'s totals and charts', /^\/app$/, false],
+        ['daily', 'Daily Sales & Cash Drawer', 'Z-report, opening and closing cash', /^\/(daily|drawer)(\/|$)/, false],
+        ['quotes', 'Quotes', 'Write and print quotations', /^\/quotes(\/|$)/, false],
+        ['inventory', 'Inventory', 'Items, categories, stock, suppliers, purchase orders', /^\/(items|categories|stock|suppliers|purchase-orders)(\/|$)/, false],
+        ['money', 'Expenses & Assets', 'Expenses, budgets, recurring costs, assets', /^\/(expenses|expense-categories|recurring|budgets|assets)(\/|$)/, false],
+        ['reports', 'Reports & Notebook', 'Profit and sales reports', /^\/(reports|notebook)(\/|$)/, false],
+        ['staff', 'Register cashiers', 'Add and manage cashiers of their branch', /^\/staff(\/|$)/, true]
+    ];
+    const SECTION_KEYS = SECTIONS.map(s => s[0]);
+    const NAV_SECTION = { app: 'dashboard', terminal: 'terminal', sales: 'sales', daily: 'daily', drawer: 'daily', quotes: 'quotes', items: 'inventory', categories: 'inventory', stock: 'inventory', history: 'inventory', low: 'inventory', suppliers: 'inventory', po: 'inventory', expenses: 'money', ecats: 'money', recurring: 'money', budgets: 'money', assets: 'money', reports: 'reports', notebook: 'reports', staff: 'staff' };
+    const ALWAYS_OK = /^\/(account|account\/password|install|start|offline)$/;
+    const PRESETS = { terminal: ['terminal'], cashier: ['terminal', 'sales'], everything: SECTION_KEYS };
+    const granted = (role, perms, key) => Array.isArray(perms) && perms.includes(key) && !(key === 'staff' && role !== 'manager');
+    function sectionAllows(role, perms, p) { return ALWAYS_OK.test(p) || SECTIONS.some(s => granted(role, perms, s[0]) && s[3].test(p)); }
+    function navFor(role, perms) {
+        if (role !== 'owner' && Array.isArray(perms)) {
+            const groups = BASE_NAV.map(([g, items]) => [g, items.filter(([k, , label]) => granted(role, perms, NAV_SECTION[k])).map(it => it[0] === 'sales' && role === 'cashier' ? [it[0], it[1], 'My Sales'] : it)]).filter(([, items]) => items.length);
+            const shop = []; if (granted(role, perms, 'staff')) shop.push(['staff', '/pos/staff', 'Cashiers']);
+            shop.push(['account', '/pos/account', 'My Account'], ['install', '/pos/install', 'Install App']);
+            return [...groups, ['Shop', shop]];
+        }
         if (role === 'cashier') return [['Sell', [['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'My Sales'], ['account', '/pos/account', 'My Account']]], ['App', [['install', '/pos/install', 'Install App']]]];
         const shop = [];
         if (role === 'owner') shop.push(['branches', '/pos/branches', 'Branches']);
@@ -292,12 +320,14 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
         const shop = req.shop;
         const role = (req.actor && req.actor.role) || 'owner', biz = req.biz || shop, isStaff = Boolean(req.actor && req.actor.kind === 'staff');
         const logoImg = biz && biz.logo && LOGO_OK.test(biz.logo) ? `<img src="${biz.logo}" alt="" style="max-height:36px;max-width:130px;display:block;margin-bottom:6px;background:#fff;border-radius:5px;padding:2px">` : '';
-        const switcher = role === 'owner' && req.branches && req.branches.length > 1 ? `<form action="/pos/branches/switch" method="POST" style="margin:0 0 6px"><label for="sw" style="color:#6b87a6;font-size:.7rem;padding:0 10px;text-transform:uppercase;letter-spacing:.06em">Branch</label><select id="sw" name="shop_id" style="margin:2px 8px 0;width:calc(100% - 16px);font-size:.85rem">${req.branches.map(b => `<option value="${b.id}"${shop && b.id === shop.id ? ' selected' : ''}>${esc(biz && b.id === biz.id ? b.name + ' (head office)' : b.name)}</option>`).join('')}</select></form>` : '';
+        const switcher = role === 'owner' && req.branches && req.branches.length > 1 ? `<form action="/pos/branches/switch" method="POST" style="margin:0 0 6px"><label for="sw" style="color:#6b87a6;font-size:.7rem;padding:0 10px;text-transform:uppercase;letter-spacing:.06em">Branch</label><select id="sw" name="shop_id" style="margin:2px 8px 0;width:calc(100% - 16px);font-size:.85rem">${req.branches.map(b => `<option value="${b.id}"${shop && b.id === shop.id ? ' selected' : ''}>${esc((biz && b.id === biz.id ? b.name + ' (head office)' : b.name) + (b.paid === false ? ' - unpaid' : ''))}</option>`).join('')}</select></form>` : '';
         const daysLeft = biz && biz.sub_until ? Math.ceil((new Date(biz.sub_until) - Date.now()) / 86400000) : null;
         const voidBanner = role === 'owner' && req.pendingVoids ? `<div class="alert noprint" role="status">${req.pendingVoids} void request${req.pendingVoids === 1 ? '' : 's'} waiting for your approval. <a href="/pos/voids">Review</a></div>` : '';
         const nudge2 = role === 'owner' && !isStaff && req.has2fa === false && vault.enabled && nav !== 'security' && !bare ? `<div class="alert noprint" role="status">Protect your shop money: <a href="/pos/security"><b>turn on 2-step login</b></a> (takes about a minute).</div>` : '';
-        const banner = nudge2 + voidBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
-        const links = navFor(role).map(([group, items]) => `<div class="nav-group">${esc(group)}</div>` +
+        const dueB = role === 'owner' && req.branches ? req.branches.filter(b => b.active && b.id !== (biz && biz.id) && !req.comped && (b.paid === false || (b.days !== null && b.days <= 5))) : [];
+        const dueBanner = dueB.length ? `<div class="alert noprint" role="status">${dueB.length === 1 ? 'Branch ' + esc(dueB[0].name) : dueB.length + ' branches'} ${dueB.some(b => b.paid === false) ? 'need' : 'will soon need'} a subscription payment. <a href="/pos/subscribe">Pay now</a></div>` : '';
+        const banner = nudge2 + voidBanner + dueBanner + (role === 'owner' && daysLeft !== null && daysLeft > 0 && daysLeft <= 5 ? `<div class="alert noprint" role="status">Your POS subscription ends in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. <a href="/pos/subscribe">Renew now</a></div>` : '');
+        const links = navFor(role, req.actor && req.actor.perms).map(([group, items]) => `<div class="nav-group">${esc(group)}</div>` +
             items.map(([key, href, label]) => `<a href="${href}"${key === 'install' ? ' id="nav-install"' : ''} class="${nav === key ? 'active' : ''}">${esc(label)}</a>`).join('')).join('');
         return `<!DOCTYPE html>
 <html lang="en"><head>
@@ -523,10 +553,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             const now = Date.now();
             const stale = () => { delete req.session.posStaff; return isApi(req) ? res.status(401).json({ error: 'Please sign in again.' }) : res.redirect('/pos/staff/login?expired=1'); };
             if (!st.at || now - st.at > STAFF_ABS_MS || now - (st.last || st.at) > STAFF_IDLE_MS) return stale();
-            const r = (await q('SELECT id, role, name, username, business_id, shop_id, session_ver FROM pos_staff WHERE id = $1 AND active', [st.id])).rows[0];
+            const r = (await q('SELECT id, role, name, username, business_id, shop_id, session_ver, perms FROM pos_staff WHERE id = $1 AND active', [st.id])).rows[0];
             if (!r || r.session_ver !== st.ver) return stale();   // switched off, deleted, or password changed: every old session ends
             if (now - (st.last || 0) > 60000) st.last = now;
-            req.actor = { kind: 'staff', role: r.role, staffId: r.id, name: r.name, username: r.username, businessId: r.business_id, shopId: r.shop_id };
+            req.actor = { kind: 'staff', role: r.role, staffId: r.id, name: r.name, username: r.username, businessId: r.business_id, shopId: r.shop_id, perms: Array.isArray(r.perms) ? r.perms.filter(k => SECTION_KEYS.includes(k)) : null };
             return next();
         }
         requireAuth(req, res, () => requireVerified(req, res, () => {
@@ -658,9 +688,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     // ----- who may open what -----
     const CASHIER_PAGES = [['GET', /^\/(app|terminal|sales|account|install|api\/items)$/], ['GET', /^\/sales\/\d+\/receipt$/], ['GET', /^\/api\/pay\/[a-f0-9]{24}$/], ['POST', /^\/(api\/sales|api\/pay\/start|account\/password)$/]];
     const OWNER_ONLY = /^\/(branches|gateways|subscribe|settings|voids|audit|security|payments|2fa)(\/|$)/;
-    function roleAllows(role, method, p) {
+    function roleAllows(role, method, p, perms) {
         if (role === 'owner') return true;
         if (OWNER_ONLY.test(p)) return false;
+        if (Array.isArray(perms)) return sectionAllows(role, perms, p);   // the owner chose exactly what this person may open
         if (role === 'manager') return true;
         return CASHIER_PAGES.some(([m, re]) => m === method && re.test(p));
     }
@@ -674,8 +705,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         if (a.kind === 'owner') {
             biz = await loadShop(req);
             if (!biz) return res.redirect('/pos/setup');
-            req.branches = (await q('SELECT id, name, active FROM pos_shops WHERE id = $1 OR parent_id = $1 ORDER BY (parent_id IS NULL) DESC, name', [biz.id])).rows;
-            const want = Number(req.session.posShopId), pick = req.branches.find(b => b.id === want && b.active) || req.branches[0];
+            req.branches = (await q('SELECT id, name, active, sub_until FROM pos_shops WHERE id = $1 OR parent_id = $1 ORDER BY (parent_id IS NULL) DESC, name', [biz.id])).rows;
+            const compB = await isComped(biz, a, req), nowB = Date.now();
+            for (const b of req.branches) { b.paid = compB || b.id === biz.id || Boolean(b.sub_until && new Date(b.sub_until) > nowB); b.days = b.sub_until ? Math.ceil((new Date(b.sub_until) - nowB) / 86400000) : null; }
+            const want = Number(req.session.posShopId), pick = req.branches.find(b => b.id === want && b.active && b.paid) || req.branches[0];   // a branch whose month ended cannot be opened until it is paid
             shop = pick.id === biz.id ? biz : (await q('SELECT * FROM pos_shops WHERE id = $1', [pick.id])).rows[0];
         } else {
             shop = (await q('SELECT * FROM pos_shops WHERE id = $1', [a.shopId])).rows[0];
@@ -685,14 +718,23 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         req.biz = biz; req.shop = shop;
         if (!biz.active) return send(req, res, { title: 'Account paused', body: '<h1>Your POS account is paused</h1><div class="panel"><p>Please contact Tencent Innovations on 0740 311 014 to reactivate it.</p></div>' }, 403);
         if (!shop.active) return send(req, res, { title: 'Branch paused', body: '<h1>This branch is paused</h1><div class="panel"><p>Please ask the business owner to switch it back on.</p></div>' }, 403);
-        if (!roleAllows(a.role, req.method, req.path)) return deny(req, res);
-        if (a.role === 'cashier' && req.path === '/app') return res.redirect('/pos/terminal');
+        if (a.kind === 'staff' && req.path === '/app' && Array.isArray(a.perms) && !roleAllows(a.role, 'GET', '/app', a.perms)) {   // no dashboard for this person: open the first page they may use
+            const first = navFor(a.role, a.perms)[0][1][0];
+            return res.redirect(first[1] === '/pos/app' ? '/pos/account' : first[1]);
+        }
+        if (!roleAllows(a.role, req.method, req.path, a.perms)) return deny(req, res);
+        if (a.role === 'cashier' && !Array.isArray(a.perms) && req.path === '/app') return res.redirect('/pos/terminal');
         req.subActive = Boolean(biz.sub_until && new Date(biz.sub_until) > new Date());
-        if (!req.subActive && await isComped(biz, a, req)) { req.subActive = true; req.comped = true; }
+        const comp = await isComped(biz, a, req);
+        if (!req.subActive && comp) { req.subActive = true; req.comped = true; }
         if (!req.subActive && !(a.role === 'owner' && /^\/subscribe(\/|$)/.test(req.path))) {
             if (isApi(req)) return res.status(402).json({ error: 'The POS subscription has ended. The owner must renew it.' });
             if (a.role === 'owner') return res.redirect('/pos/subscribe');
             return send(req, res, { title: 'Subscription ended', body: '<h1>The POS subscription has ended</h1><div class="panel"><p>Please ask the business owner to renew it. Your sales are safe and will be here when it is back on.</p></div>' }, 402);
+        }
+        if (a.kind === 'staff' && shop.parent_id && !comp && !(shop.sub_until && new Date(shop.sub_until) > new Date())) {   // each branch pays for itself
+            if (isApi(req)) return res.status(402).json({ error: "This branch's subscription has ended. The owner must renew it." });
+            return send(req, res, { title: 'Branch subscription ended', body: "<h1>This branch's subscription has ended</h1><div class=\"panel\"><p>Please ask the business owner to renew this branch. Your sales are safe and will be here when it is back on.</p></div>" }, 402);
         }
         if (a.role === 'owner' && req.method === 'GET' && !isApi(req)) req.pendingVoids = Number((await q(`SELECT count(*) n FROM pos_void_requests v JOIN pos_shops x ON x.id = v.shop_id WHERE v.status = 'pending' AND (x.id = $1 OR x.parent_id = $1)`, [biz.id])).rows[0].n);
         if (req.subActive) await runRecurring(shop.id).catch(e => console.error('Recurring expenses failed:', e.message));
@@ -1976,9 +2018,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const kes0 = n => Number(n).toLocaleString('en-KE');
     const subLastCheck = new Map();
     async function markSubPaid(id, receipt) {   // only the first caller extends the subscription, even if the callback and the status check arrive together
-        const done = await q(`WITH p AS (UPDATE pos_sub_payments SET status='paid', receipt=CASE WHEN $2 <> '' THEN $2 ELSE receipt END, paid_at=now() WHERE id=$1 AND status <> 'paid' RETURNING business_id)
-                 UPDATE pos_shops s SET sub_until = GREATEST(now(), COALESCE(s.sub_until, now())) + interval '1 month' FROM p WHERE s.id = p.business_id RETURNING s.id`, [id, String(receipt || '').slice(0, 40)]);
-        if (done.rows[0]) await auditRaw(done.rows[0].id, null, 'system', null, '', 'sub.paid', 'KES ' + (await q('SELECT amount_kes FROM pos_sub_payments WHERE id=$1', [id])).rows[0].amount_kes + ' ' + String(receipt || ''), '');
+        const done = await q(`WITH p AS (UPDATE pos_sub_payments SET status='paid', receipt=CASE WHEN $2 <> '' THEN $2 ELSE receipt END, paid_at=now() WHERE id=$1 AND status <> 'paid' RETURNING business_id, shop_ids)
+                 UPDATE pos_shops s SET sub_until = GREATEST(now(), COALESCE(s.sub_until, now())) + interval '1 month' FROM p
+                 WHERE s.id = ANY(COALESCE(p.shop_ids, ARRAY[p.business_id])) AND (s.id = p.business_id OR s.parent_id = p.business_id) RETURNING s.id, p.business_id`, [id, String(receipt || '').slice(0, 40)]);
+        if (done.rows[0]) await auditRaw(done.rows[0].business_id, null, 'system', null, '', 'sub.paid', 'KES ' + (await q('SELECT amount_kes FROM pos_sub_payments WHERE id=$1', [id])).rows[0].amount_kes + ' ' + String(receipt || ''), '');
         if (receipt) await q(`UPDATE pos_sub_payments SET receipt=$2 WHERE id=$1 AND receipt = ''`, [id, String(receipt).slice(0, 40)]);
     }
     // called from server.js when Safaricom's callback is not for a booking; returns true when it was ours
@@ -2004,11 +2047,16 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const compNote = req.comped ? '<div class="alert ok" role="status">This is a complimentary test account: the POS is switched on without a subscription payment.</div>' : '';
         const payId = parseCount(req.query.pay, { min: 1 });
         const fee = await feeFor(b.id);
+        const shopRows = req.branches.filter(x => x.active).map(x => { const hq = x.id === b.id, ok = x.paid !== false && (hq ? req.subActive : true), due = !x.sub_until || x.days <= 7; return { id: x.id, name: x.name, hq, until: x.sub_until, ok: Boolean(x.sub_until && new Date(x.sub_until) > new Date()), fee: hq ? SUB_FEE_KES : BRANCH_FEE_KES, pre: due }; });
+        if (!shopRows.some(s => s.pre)) shopRows.forEach(s => { s.pre = true; });   // nothing is due yet: renewing early pays for everything
         send(req, res, { title: 'Subscription', nav: 'subscription', body: `<h1>Subscription</h1>${notice(req)}${errBox(req)}
         ${compNote}<div class="panel" style="max-width:620px"><h2>${active ? 'Your POS is active' : 'Your POS is not active'}</h2>
-            <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${kes0(SUB_FEE_KES)} per month</b> for the main shop plus <b>KES ${kes0(BRANCH_FEE_KES)} per month for each branch</b> (cashiers are free). You have ${fee.branches} active branch${fee.branches === 1 ? '' : 'es'}, so you pay <b>KES ${kes0(fee.total)}</b>. Paying early adds a month to the end of your current period.</p>
+            <p>${active ? `Paid up to <b>${esc(dateFmt(until))}</b>.` : (until ? `It ended on <b>${esc(dateFmt(until))}</b>.` : 'Pay your first month to switch it on.')} The fee is <b>KES ${kes0(SUB_FEE_KES)} per month</b> for the main shop plus <b>KES ${kes0(BRANCH_FEE_KES)} per month for each branch</b> (cashiers are free). You have ${fee.branches} active branch${fee.branches === 1 ? '' : 'es'}, so all together it is <b>KES ${kes0(fee.total)}</b> a month. A branch whose month has ended stops working until it is paid; the others keep working. Paying early adds a month to the end of your current period.</p>
             ${payId ? `<div id="paybox" class="alert ok" role="status">Check your phone and enter your M-Pesa PIN. Waiting for the payment...</div>` : ''}
-            ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" class="row"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" type="submit">Pay KES ${kes0(fee.total)} with M-Pesa</button></form>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
+${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method="POST" id="subform"><p style="margin:10px 0 4px"><b>Choose what to pay for</b> (each shop has its own end date):</p>
+                <table><tr><th></th><th>Shop</th><th>Paid until</th><th class="num">Month fee</th></tr>${shopRows.map(s => `<tr><td><input type="checkbox" name="shop" value="${s.id}" data-fee="${s.fee}" ${s.pre ? 'checked' : ''} style="width:auto" aria-label="Pay for ${esc(s.name)}"></td><td>${esc(s.name)}${s.hq ? ' <span class="tag gray">main shop</span>' : ''}</td><td>${s.until ? esc(dateFmt(s.until)) : '<span class="tag bad">not paid yet</span>'}${s.until && !s.ok ? ' <span class="tag bad">ended</span>' : ''}</td><td class="num">${kes0(s.fee)}</td></tr>`).join('')}</table>
+                <div class="row" style="margin-top:10px"><div><label for="ph">M-Pesa number to pay from</label><input id="ph" name="phone" type="tel" required value="${esc(phone)}" placeholder="0712345678"></div><button class="btn ok" id="paybtn" type="submit">Pay with M-Pesa</button></div></form>
+                <script nonce="${req.nonce || ''}">(function(){var f=document.getElementById('subform'),b=document.getElementById('paybtn');function u(){var t=0;[].forEach.call(f.querySelectorAll('input[name=shop]:checked'),function(c){t+=Number(c.getAttribute('data-fee'));});b.textContent=t?'Pay KES '+t.toLocaleString('en-KE')+' with M-Pesa':'Choose a shop to pay for';b.disabled=!t;}f.addEventListener('change',u);u();})();</script>` : '<p class="alert">Online payment is not available right now. Please call 0740 311 014.</p>'}
         </div>
         ${active ? '<div class="panel" style="max-width:620px"><h2>Install the app</h2><p>Your POS can be installed on phones, tablets and computers. <a href="/pos/install">Open the install page</a>.</p></div>' : ''}
         <div class="panel tablewrap" style="max-width:620px"><h2>Payments</h2>${hist.length ? `<table><tr><th>Date</th><th class="num">Amount</th><th>Status</th><th>M-Pesa code</th></tr>${hist.map(h => `<tr><td>${esc(timeFmt(h.created_at))}</td><td class="num">${h.amount_kes.toLocaleString('en-KE')}</td><td><span class="tag ${h.status === 'paid' ? 'ok' : h.status === 'pending' ? 'warn' : 'bad'}">${esc(h.status)}</span></td><td>${esc(h.receipt)}</td></tr>`).join('')}</table>` : '<p class="muted">No payments yet.</p>'}</div>
@@ -2021,9 +2069,13 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const open = (await q(`SELECT id FROM pos_sub_payments WHERE business_id=$1 AND status='pending' AND created_at > now() - interval '2 minutes'`, [req.biz.id])).rows[0];
         if (open) return res.redirect('/pos/subscribe?pay=' + open.id);
         let row = null;
-        const fee = await feeFor(req.biz.id);
+        const want = [].concat(req.body.shop || []).map(x => parseCount(x, { min: 1 })).filter(Boolean);
+        const mine = (await q('SELECT id, parent_id FROM pos_shops WHERE (id=$1 OR parent_id=$1) AND active', [req.biz.id])).rows;
+        const ids = [...new Set(want)].filter(id => mine.some(m => m.id === id));
+        if (!ids.length) return back(res, '/pos/subscribe', '', 'Choose at least one shop to pay for.');
+        const fee = { total: ids.reduce((a, id) => a + (id === req.biz.id ? SUB_FEE_KES : BRANCH_FEE_KES), 0) };   // the price is always worked out here, never taken from the page
         for (let i = 0; i < 5 && !row; i++) {
-            try { row = (await q(`INSERT INTO pos_sub_payments (business_id, amount_kes, phone, account_ref) VALUES ($1,$2,$3,$4) RETURNING id, account_ref`, [req.biz.id, fee.total, phone, 'POS' + crypto.randomBytes(4).toString('hex').toUpperCase()])).rows[0]; }
+            try { row = (await q(`INSERT INTO pos_sub_payments (business_id, amount_kes, phone, account_ref, shop_ids) VALUES ($1,$2,$3,$4,$5) RETURNING id, account_ref`, [req.biz.id, fee.total, phone, 'POS' + crypto.randomBytes(4).toString('hex').toUpperCase(), ids])).rows[0]; }
             catch (e) { if (e.code !== '23505') throw e; }
         }
         if (!row) return back(res, '/pos/subscribe', '', 'Could not start the payment. Please try again.');
@@ -2169,7 +2221,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const USERNAME_OK = /^[A-Za-z0-9._-]{3,30}$/;
     router.get('/branches', ah(async (req, res) => {
         const today = todayNairobi();
-        const rows = (await q(`SELECT s.id, s.name, s.address, s.phone, s.active, (s.parent_id IS NULL) AS hq,
+        const rows = (await q(`SELECT s.id, s.name, s.address, s.phone, s.active, s.sub_until, (s.parent_id IS NULL) AS hq,
                 (SELECT count(*)::int FROM pos_staff t WHERE t.shop_id=s.id AND t.active) AS staff,
                 COALESCE((SELECT sum(total_cents) FROM pos_sales x WHERE x.shop_id=s.id AND x.status='completed' AND (x.created_at AT TIME ZONE '${TZ}')::date = $2),0)::bigint AS today
               FROM pos_shops s WHERE s.id=$1 OR s.parent_id=$1 ORDER BY (s.parent_id IS NULL) DESC, s.name`, [req.biz.id, today])).rows;
@@ -2179,7 +2231,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         <div class="alert" role="status">Each active branch costs <b>KES ${kes0(BRANCH_FEE_KES)} per month</b> on top of the main shop's KES ${kes0(SUB_FEE_KES)}. Your monthly total is now <b>KES ${kes0(bfee.total)}</b>. A new branch is included from your next payment. <a href="/pos/subscribe">Subscription</a></div>
         <div class="panel"><p style="margin-top:0">Staff sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with this business code: <b style="font-size:1.2rem;letter-spacing:.1em">${esc(req.biz.code || '')}</b></p>
             <p class="muted" style="margin-bottom:0">Today's sales across all branches: <b>${kes(total)}</b></p></div>
-        <div class="panel tablewrap"><table><tr><th>Branch</th><th>Address</th><th class="num">Staff</th><th class="num">Sales today</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.hq ? ' <span class="tag gray">head office</span>' : ''}${r.active ? '' : ' <span class="tag bad">paused</span>'}</td><td>${esc(r.address)}</td><td class="num">${r.staff}</td><td class="num">${fmt(r.today)}</td><td class="right">${r.active ? `<form action="/pos/branches/switch" method="POST" style="display:inline"><input type="hidden" name="shop_id" value="${r.id}"><button class="btn small" type="submit">Open</button></form>` : ''} ${r.hq ? '' : `<form action="/pos/branches/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Pause' : 'Resume'}</button></form>`}</td></tr>`).join('')}</table></div>
+        <div class="panel tablewrap"><table><tr><th>Branch</th><th>Address</th><th class="num">Staff</th><th class="num">Sales today</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.hq ? ' <span class="tag gray">head office</span>' : ''}${r.active ? '' : ' <span class="tag bad">paused</span>'}${r.hq || req.comped ? '' : (r.sub_until && new Date(r.sub_until) > new Date() ? ` <span class="tag ok">paid to ${esc(dateFmt(r.sub_until))}</span>` : ' <span class="tag bad">unpaid</span>')}</td><td>${esc(r.address)}</td><td class="num">${r.staff}</td><td class="num">${fmt(r.today)}</td><td class="right">${r.active && (r.hq || req.comped || (r.sub_until && new Date(r.sub_until) > new Date())) ? `<form action="/pos/branches/switch" method="POST" style="display:inline"><input type="hidden" name="shop_id" value="${r.id}"><button class="btn small" type="submit">Open</button></form>` : ''} ${r.hq ? '' : `<form action="/pos/branches/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Pause' : 'Resume'}</button></form>`}</td></tr>`).join('')}</table></div>
         <div class="panel" style="max-width:720px"><h2>Open a new branch</h2><form action="/pos/branches" method="POST"><div class="grid2">
             <div class="field"><label for="bn">Branch name</label><input id="bn" name="name" required maxlength="120" placeholder="e.g. Kisumu Branch"></div>
             <div class="field"><label for="ba">Address</label><input id="ba" name="address" maxlength="200"></div>
@@ -2217,11 +2269,11 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             throw e;
         } finally { client.release(); }
         await audit(req, 'branch.open', name);
-        back(res, '/pos/branches', 'Branch opened.');
+        back(res, '/pos/subscribe', 'Branch opened. Pay KES ' + kes0(BRANCH_FEE_KES) + ' below to switch it on.');
     }));
     router.post('/branches/switch', ah(async (req, res) => {
         const id = parseCount(req.body.shop_id, { min: 1 });
-        if (id && req.branches.some(b => b.id === id && b.active)) { req.session.posShopId = id; await saveSess(req); }
+        if (id && req.branches.some(b => b.id === id && b.active && b.paid)) { req.session.posShopId = id; await saveSess(req); }
         res.redirect('/pos/app');
     }));
     router.post('/branches/:id/toggle', ah(async (req, res) => {
@@ -2234,7 +2286,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const staffScope = req => req.actor.role === 'owner' ? { sql: '(t.business_id=$1)', params: [req.biz.id] } : { sql: '(t.shop_id=$1 AND t.role=\'cashier\')', params: [req.shop.id] };
     router.get('/staff', ah(async (req, res) => {
         const owner = req.actor.role === 'owner', sc = staffScope(req);
-        const rows = (await q(`SELECT t.id, t.name, t.username, t.role, t.active, t.last_login, s.name AS shop FROM pos_staff t JOIN pos_shops s ON s.id=t.shop_id WHERE ${sc.sql} ORDER BY s.name, t.role, t.name`, sc.params)).rows;
+        const rows = (await q(`SELECT t.id, t.name, t.username, t.role, t.active, t.last_login, t.perms, s.name AS shop FROM pos_staff t JOIN pos_shops s ON s.id=t.shop_id WHERE ${sc.sql} ORDER BY s.name, t.role, t.name`, sc.params)).rows;
         send(req, res, { title: 'Staff', nav: 'staff', body: `<h1>${owner ? 'Staff & Cashiers' : 'Cashiers'}</h1>${notice(req)}${errBox(req)}
         <div class="panel"><p style="margin:0">They sign in at <b>${esc(pubUrl('/pos/staff/login'))}</b> with business code <b>${esc(req.biz.code || '')}</b>, their username and their password.</p></div>
         <div class="panel" style="max-width:720px"><h2>Register ${owner ? 'a staff member' : 'a cashier'}</h2><form action="/pos/staff" method="POST"><div class="grid2">
@@ -2244,8 +2296,9 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             ${owner ? `<div class="field"><label for="sr">Role</label><select id="sr" name="role"><option value="cashier">Cashier (sells only)</option><option value="manager">Branch manager</option></select></div>
             <div class="field"><label for="ss">Works at</label><select id="ss" name="shop_id">${req.branches.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('')}</select></div>` : ''}</div>
             <button class="btn" type="submit">Register</button></form></div>
-        <div class="panel tablewrap">${rows.length ? `<table><tr><th>Name</th><th>Username</th><th>Role</th><th>Branch</th><th>Last sign-in</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.active ? '' : ' <span class="tag bad">off</span>'}</td><td>${esc(r.username)}</td><td>${esc(r.role)}</td><td>${esc(r.shop)}</td><td class="nowrap">${r.last_login ? esc(timeFmt(r.last_login)) : '-'}</td><td class="right nowrap">
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>Name</th><th>Username</th><th>Role</th>${owner ? '<th>Can open</th>' : ''}<th>Branch</th><th>Last sign-in</th><th></th></tr>${rows.map(r => `<tr><td>${esc(r.name)}${r.active ? '' : ' <span class="tag bad">off</span>'}</td><td>${esc(r.username)}</td><td>${esc(r.role)}</td>${owner ? `<td>${Array.isArray(r.perms) ? esc(r.perms.length === 1 && r.perms[0] === 'terminal' ? 'POS terminal only' : r.perms.length + ' of ' + SECTION_KEYS.length + ' areas') : (r.role === 'manager' ? 'Everything in the branch' : 'Terminal + own sales')}</td>` : ''}<td>${esc(r.shop)}</td><td class="nowrap">${r.last_login ? esc(timeFmt(r.last_login)) : '-'}</td><td class="right nowrap">
             <form action="/pos/staff/${r.id}/password" method="POST" style="display:inline"><input name="password" type="password" placeholder="New password" minlength="8" maxlength="72" required style="width:130px;display:inline-block" autocomplete="new-password"> <button class="btn small ghost" type="submit">Reset</button></form>
+            ${owner ? `<a class="btn small ghost" href="/pos/staff/${r.id}/access">What they see</a>` : ''}
             <form action="/pos/staff/${r.id}/toggle" method="POST" style="display:inline"><button class="btn small ghost" type="submit">${r.active ? 'Switch off' : 'Switch on'}</button></form>
             <form action="/pos/staff/${r.id}/delete" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Delete</button></form></td></tr>`).join('')}</table>` : '<p class="muted">No one registered yet.</p>'}</div>` });
     }));
@@ -2262,6 +2315,33 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         catch (e) { if (e.code === '23505') return back(res, '/pos/staff', '', 'That username is already used in your business. Choose another.'); throw e; }
         await audit(req, 'staff.add', `${username} (${role})`);
         back(res, '/pos/staff', name + ' can now sign in.');
+    }));
+    // the owner decides what each person can open
+    const staffForAccess = async req => (await q('SELECT id, name, username, role, perms FROM pos_staff WHERE id=$1 AND business_id=$2', [parseCount(req.params.id, { min: 1 }) || 0, req.biz.id])).rows[0];
+    router.get('/staff/:id/access', ah(async (req, res) => {
+        if (req.actor.role !== 'owner') return deny(req, res);
+        const t = await staffForAccess(req); if (!t) return back(res, '/pos/staff', '', 'That person was not found.');
+        const cur = Array.isArray(t.perms) ? t.perms : (t.role === 'manager' ? SECTION_KEYS : PRESETS.cashier);
+        send(req, res, { title: 'What they see', nav: 'staff', body: `<h1>What ${esc(t.name)} can see</h1>${notice(req)}${errBox(req)}
+        <div class="panel" style="max-width:640px"><p style="margin-top:0">Tick the parts of the POS that <b>${esc(t.name)}</b> (${esc(t.username)}, ${esc(t.role)}) may open. Anything not ticked is hidden from the menu and blocked, even if they type the address. It takes effect on their very next click.</p>
+        <form action="/pos/staff/${t.id}/access" method="POST">
+            ${SECTIONS.filter(s => !s[4] || t.role === 'manager').map(s => `<div class="field" style="margin-bottom:8px"><label><input type="checkbox" name="sec" value="${s[0]}" ${cur.includes(s[0]) ? 'checked' : ''} style="width:auto"> <b>${esc(s[1])}</b></label><small>${esc(s[2])}</small></div>`).join('')}
+            <p class="row"><button class="btn ok" type="submit">Save</button>
+            <button class="btn ghost" type="submit" name="preset" value="terminal">POS terminal only</button>
+            <button class="btn ghost" type="submit" name="preset" value="cashier">Terminal + own sales</button>
+            <button class="btn ghost" type="submit" name="preset" value="default">Back to the usual for a ${esc(t.role)}</button></p>
+        </form><p class="muted">Payment settings, branches, subscription, audit log and security always stay with you, the owner.</p><p><a href="/pos/staff">Back to staff</a></p></div>` });
+    }));
+    router.post('/staff/:id/access', ah(async (req, res) => {
+        if (req.actor.role !== 'owner') return deny(req, res);
+        const t = await staffForAccess(req); if (!t) return back(res, '/pos/staff', '', 'That person was not found.');
+        const b = req.body || {}; let perms;
+        if (b.preset === 'default') perms = null;
+        else if (PRESETS[b.preset]) perms = PRESETS[b.preset].filter(k => k !== 'staff' || t.role === 'manager');
+        else { const sel = [].concat(b.sec || []).map(String); perms = SECTION_KEYS.filter(k => sel.includes(k) && (k !== 'staff' || t.role === 'manager')); if (!perms.length) return back(res, '/pos/staff/' + t.id + '/access', '', 'Tick at least one part, or switch the person off instead.'); }
+        await q('UPDATE pos_staff SET perms=$2::jsonb WHERE id=$1 AND business_id=$3', [t.id, perms === null ? null : JSON.stringify(perms), req.biz.id]);
+        await audit(req, 'staff.access', `${t.username}: ${perms === null ? 'usual for role' : perms.join(', ')}`);
+        back(res, '/pos/staff/' + t.id + '/access', 'Saved.');
     }));
     const staffAct = (path, sqlFor) => router.post('/staff/:id/' + path, ah(async (req, res) => {
         const id = parseCount(req.params.id, { min: 1 }), sc = staffScope(req);
