@@ -958,7 +958,12 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         const body = `<h1 class="noprint">POS Terminal</h1>
         <div class="pos-wrap">
             <div>
-                <div class="panel" style="margin-bottom:0"><label for="find">Search items, or scan a barcode and press Enter</label><input id="find" type="search" autocomplete="off" autofocus placeholder="Type a name or scan..."><div class="chips" id="chips"></div></div>
+                <div class="panel" style="margin-bottom:0"><label for="find">Search items, or scan a barcode and press Enter</label><input id="find" type="search" autocomplete="off" autofocus placeholder="Type a name or scan..."><button type="button" class="btn ghost" id="cam-open" style="margin-top:8px">&#128247; Scan with phone camera</button><div class="chips" id="chips"></div></div>
+                <div id="cam" role="dialog" aria-label="Camera barcode scanner" style="display:none;position:fixed;inset:0;z-index:100;background:#000;flex-direction:column">
+                    <video id="cam-v" playsinline muted style="flex:1;min-height:0;width:100%;object-fit:cover"></video>
+                    <div style="position:absolute;left:12%;right:12%;top:38%;height:22%;border:3px solid #22c55e;border-radius:10px;pointer-events:none"></div>
+                    <div style="background:#0b1b2e;color:#fff;padding:12px 14px;display:flex;gap:10px;align-items:center"><span id="cam-msg" style="flex:1" aria-live="polite">Point the camera at a barcode</span><button type="button" class="btn ok" id="cam-done">Done</button></div>
+                </div>
                 <div class="pos-items" id="grid" aria-live="polite"></div>
             </div>
             <div class="panel cart">
@@ -968,10 +973,10 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 <div class="tot"><span>Discount (KES)</span><input id="disc" inputmode="decimal" style="width:110px;text-align:right" placeholder="0"></div>
                 <div class="tot big"><span>Total</span><span id="total">0.00</span></div>
                 ${vatOn ? `<div class="tot muted"><small>Includes VAT ${VAT_RATE}%</small><small id="vat">0.00</small></div>` : ''}
-                <div class="pay" style="grid-template-columns:repeat(${stkOn ? 3 : 2},1fr)"><button type="button" id="m-cash" class="on">Cash</button><button type="button" id="m-mpesa">M-Pesa code</button>${stkOn ? '<button type="button" id="m-stk">Phone prompt</button>' : ''}</div>
+                <div class="pay" style="grid-template-columns:repeat(${stkOn ? 3 : 2},1fr)"><button type="button" id="m-cash" class="on">Cash</button>${stkOn ? '<button type="button" id="m-stk">M-Pesa: enter number</button>' : ''}<button type="button" id="m-mpesa">${stkOn ? 'M-Pesa: typed code' : 'M-Pesa code'}</button></div>
                 <div id="cashbox" class="field"><label for="tender">Cash received (KES)</label><input id="tender" inputmode="decimal" placeholder="0"><div class="tot" style="margin-top:6px"><span>Change</span><b id="change">0.00</b></div></div>
                 <div id="mpesabox" class="field" style="display:none"><label for="mref">M-Pesa code (from the customer's SMS)</label><input id="mref" maxlength="10" autocapitalize="characters" placeholder="e.g. SHK4A1B2C3"></div>
-                <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer M-Pesa number</label><input id="sphone" type="tel" placeholder="0712345678"><small>The customer gets a prompt on their phone and types their PIN.</small></div>
+                <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer M-Pesa number</label><input id="sphone" type="tel" placeholder="0712345678"><small>Type the customer's number and press Enter. They get the M-Pesa prompt on their phone and type their PIN. The sale completes by itself when they pay.</small></div>
                 <div class="field" id="cpbox"><label for="cphone">Customer phone (optional, to share the receipt)</label><input id="cphone" type="tel" placeholder="0712345678"></div>
                 <div id="err" class="alert" role="alert" style="display:none"></div>
                 <button class="btn ok" id="done" type="button" style="width:100%;padding:13px;font-size:1rem" disabled>Complete sale</button>
@@ -1075,7 +1080,31 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 var hit = items.filter(function (i) { return i.barcode && i.barcode.toLowerCase() === f; })[0]; if (!hit) { var m = items.filter(function (i) { return i.name.toLowerCase().indexOf(f) >= 0; }); if (m.length === 1) hit = m[0]; }
                 if (hit) { add(hit); $('find').value = ''; draw(); } else showErr('No item matches "' + $('find').value.trim() + '".');
             });
+            // phone camera barcode scanning (needs a browser with BarcodeDetector, such as Chrome on Android)
+            (function () {
+                var camBox = $('cam'), vid = $('cam-v'), msg = $('cam-msg'), stream = null, timer = null, det = null, last = '', lastAt = 0;
+                function stop() { if (timer) { clearInterval(timer); timer = null; } if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; } vid.srcObject = null; camBox.style.display = 'none'; $('find').focus(); }
+                function beep() { try { var a = new (window.AudioContext || window.webkitAudioContext)(), o = a.createOscillator(); o.frequency.value = 880; o.connect(a.destination); o.start(); setTimeout(function () { o.stop(); a.close(); }, 120); } catch (_) { } if (navigator.vibrate) navigator.vibrate(60); }
+                function found(code) {
+                    var now = Date.now(); if (code === last && now - lastAt < 2000) return; last = code; lastAt = now;
+                    var c = code.toLowerCase(), hit = items.filter(function (i) { return i.barcode && i.barcode.toLowerCase() === c; })[0];
+                    if (hit) { add(hit); draw(); beep(); msg.textContent = 'Added: ' + hit.name + '. Scan the next item or press Done.'; }
+                    else { msg.textContent = 'No item has the barcode ' + code + '.'; }
+                }
+                $('cam-open').addEventListener('click', function () {
+                    if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { showErr('This browser cannot scan with the camera. Use Chrome on an Android phone, or a barcode scanner.'); return; }
+                    showErr('');
+                    try { det = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'qr_code'] }); } catch (_) { det = new BarcodeDetector(); }
+                    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false }).then(function (s) {
+                        stream = s; vid.srcObject = s; camBox.style.display = 'flex'; msg.textContent = 'Point the camera at a barcode'; vid.play().catch(function () { });
+                        timer = setInterval(function () { if (vid.readyState < 2) return; det.detect(vid).then(function (r) { if (r && r[0] && r[0].rawValue) found(String(r[0].rawValue).trim()); }).catch(function () { }); }, 250);
+                    }).catch(function () { showErr('The camera could not be opened. Allow camera access for this site in the browser settings, then try again.'); });
+                });
+                $('cam-done').addEventListener('click', stop);
+                document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && stream) stop(); });
+            })();
             ['disc', 'tender'].forEach(function (id) { $(id).addEventListener('input', render); });
+            if ($('sphone')) $('sphone').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (!$('done').disabled) $('done').click(); } });
             $('m-cash').addEventListener('click', function () { setMethod('cash'); }); $('m-mpesa').addEventListener('click', function () { setMethod('mpesa'); }); if ($('m-stk')) $('m-stk').addEventListener('click', function () { setMethod('stk'); });
             $('wcancel').addEventListener('click', stopWait);
             $('clear').addEventListener('click', reset); $('mnew').addEventListener('click', function () { $('modal').classList.remove('show'); reset(); });
