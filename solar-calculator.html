@@ -736,6 +736,62 @@
       </section>
     </div>
 
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Solar Array &amp; Charge Controller Sizing</h2>
+          <p class="card-subtitle">Panels needed from peak sun hours, performance ratio and panel size</p>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="param-row-2 param-group">
+          <div>
+            <label class="param-label" for="inputSunHours" style="display:block; margin-bottom:6px;">Peak Sun Hours (h/day)</label>
+            <input type="number" id="inputSunHours" class="form-control" min="1" max="10" step="0.1" value="5" />
+            <div class="param-help">Use the worst month for year-round use. Check your site; much of Kenya is roughly 4.5–6.</div>
+          </div>
+          <div>
+            <label class="param-label" for="inputPanelWatts" style="display:block; margin-bottom:6px;">Panel Size (W each)</label>
+            <input type="number" id="inputPanelWatts" class="form-control" min="10" max="1000" step="5" value="550" />
+            <div class="param-help">Rated wattage of one panel, e.g. 200, 400, 550.</div>
+          </div>
+        </div>
+        <div class="param-group">
+          <div class="param-label-row">
+            <label class="param-label" for="inputPR">Performance Ratio</label>
+            <span class="param-value-badge" id="labelPR">75%</span>
+          </div>
+          <input type="range" id="inputPR" min="50" max="95" step="1" value="75" />
+          <div class="param-help">Real output vs. rated: heat, dust, cable and inverter losses. 70–80% is typical.</div>
+        </div>
+
+        <div class="kpi-grid" style="margin-bottom:0;">
+          <div class="kpi-card accent-amber">
+            <div class="kpi-label"><span>Required Array</span></div>
+            <div class="kpi-value" id="kpiArrayWp">0 Wp</div>
+            <div class="kpi-sub" id="kpiArraySub"></div>
+          </div>
+          <div class="kpi-card accent-navy">
+            <div class="kpi-label"><span>Panels Needed</span></div>
+            <div class="kpi-value" id="kpiPanelCount">0 panels</div>
+            <div class="kpi-sub" id="kpiPanelSub"></div>
+          </div>
+          <div class="kpi-card accent-emerald">
+            <div class="kpi-label"><span>Daily Solar Yield</span></div>
+            <div class="kpi-value" id="kpiYield">0 kWh</div>
+            <div class="kpi-sub" id="kpiYieldSub"></div>
+          </div>
+          <div class="kpi-card accent-blue">
+            <div class="kpi-label"><span>MPPT Charge Controller</span></div>
+            <div class="kpi-value" id="kpiController">0 A</div>
+            <div class="kpi-sub" id="kpiControllerSub"></div>
+          </div>
+        </div>
+
+        <div class="tech-note-box" id="arrayNote"></div>
+      </div>
+    </section>
+
     <footer class="app-footer">
       Solar Load Profile &amp; Sizing Estimator by Tencent Innovations • Results are planning estimates: confirm cable sizes, protection and the final design before buying or installing
     </footer>
@@ -783,6 +839,8 @@
       const STANDARD_INVERTER_KW = [0.5, 1.0, 1.5, 2.0, 3.0, 3.5, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0];
 
       const DISCHARGE_C_OPTIONS = [0.1, 0.15, 0.2, 0.3, 0.5, 1];
+      const CONTROLLER_HEADROOM = 1.25; // controller current rating = 125% of array current
+      const STANDARD_CONTROLLER_A = [10, 20, 30, 40, 50, 60, 80, 100];
       const DOD_MIN = 30, DOD_MAX = 95;
 
       const APPLIANCE_LIBRARY = [
@@ -871,7 +929,10 @@
         dodPct: 90,
         backupScope: "all",
         dischargeC: 0.5,
-        systemVoltage: 48
+        systemVoltage: 48,
+        sunHours: 5,
+        performanceRatio: 75,
+        panelWatts: 550
       };
 
       function clamp(value, min, max, fallback) {
@@ -903,7 +964,10 @@
               dodPct: dod,
               systemVoltage: [12, 24, 48].includes(Number(parsed.systemVoltage)) ? Number(parsed.systemVoltage) : 48,
               backupScope: parsed.backupScope === "essential" ? "essential" : "all",
-              dischargeC: DISCHARGE_C_OPTIONS.includes(Number(parsed.dischargeC)) ? Number(parsed.dischargeC) : (dod >= 70 ? 0.5 : 0.15)
+              dischargeC: DISCHARGE_C_OPTIONS.includes(Number(parsed.dischargeC)) ? Number(parsed.dischargeC) : (dod >= 70 ? 0.5 : 0.15),
+              sunHours: clamp(parsed.sunHours, 1, 10, 5),
+              performanceRatio: Math.round(clamp(parsed.performanceRatio, 50, 95, 75)),
+              panelWatts: clamp(parsed.panelWatts, 10, 1000, 550)
             };
           }
         } catch (e) {
@@ -1138,6 +1202,18 @@
         const totalBatteryAh = Math.max(energyBatteryAh, minAhForCurrent);
         const totalBatteryKwh = (totalBatteryAh * state.systemVoltage) / 1000;
 
+        // Solar array: energy the array must make per day = load / (sun hours x performance ratio)
+        const pr = state.performanceRatio / 100;
+        const requiredArrayWp = totalDailyWh > 0 ? totalDailyWh / (state.sunHours * pr) : 0;
+        const panelCount = requiredArrayWp > 0 ? Math.ceil(requiredArrayWp / state.panelWatts) : 0;
+        const installedArrayWp = panelCount * state.panelWatts;
+        const dailyYieldWh = installedArrayWp * state.sunHours * pr;
+        const controllerAmps = (installedArrayWp / state.systemVoltage) * CONTROLLER_HEADROOM;
+        const controllerRating = controllerAmps > 0
+          ? (STANDARD_CONTROLLER_A.find((a) => a >= controllerAmps) || STANDARD_CONTROLLER_A[STANDARD_CONTROLLER_A.length - 1])
+          : 0;
+        const controllerCount = controllerRating > 0 ? Math.ceil(controllerAmps / controllerRating) : 0;
+
         return {
           enrichedLoads,
           totalRunningW,
@@ -1160,7 +1236,9 @@
           currentLimited,
           dischargeC,
           totalBatteryKwh,
-          totalBatteryAh
+          totalBatteryAh,
+          requiredArrayWp, panelCount, installedArrayWp, dailyYieldWh,
+          controllerAmps, controllerRating, controllerCount
         };
       }
 
@@ -1382,6 +1460,7 @@
           `;
         }
 
+        renderArray(m);
         renderBreakdownChart(m);
       }
 
@@ -1418,6 +1497,24 @@
         }).join("");
       }
 
+      function renderArray(m) {
+        const $ = (id) => document.getElementById(id);
+        const none = m.panelCount === 0;
+        $("kpiArrayWp").textContent = `${fmtNum(m.requiredArrayWp)} Wp`;
+        $("kpiArraySub").textContent = `${fmtNum(m.totalDailyWh)} Wh ÷ (${state.sunHours} h × ${state.performanceRatio}%)`;
+        $("kpiPanelCount").textContent = `${m.panelCount} × ${fmtNum(state.panelWatts)} W`;
+        $("kpiPanelSub").textContent = none ? "Add loads to size the array" : `Installed array: ${fmtNum(m.installedArrayWp)} Wp (${fmtNum(m.installedArrayWp / 1000, 2)} kWp)`;
+        $("kpiYield").textContent = `${fmtNum(m.dailyYieldWh / 1000, 2)} kWh/day`;
+        const surplus = m.totalDailyWh > 0 ? ((m.dailyYieldWh / m.totalDailyWh) - 1) * 100 : 0;
+        $("kpiYieldSub").textContent = none ? "" : `${fmtNum(surplus, 0)}% above the daily load of ${fmtNum(m.totalDailyWh)} Wh`;
+        $("kpiController").textContent = none ? "0 A"
+          : `${m.controllerCount > 1 ? m.controllerCount + " × " : ""}${m.controllerRating} A`;
+        $("kpiControllerSub").textContent = none ? "" : `Needs ≥ ${fmtNum(m.controllerAmps, 1)} A at ${state.systemVoltage}V (25% headroom)`;
+        $("arrayNote").innerHTML = none
+          ? `<strong>Technician Note:</strong> Add appliances to size the solar array.`
+          : `<strong>Technician Note:</strong> Install <strong>${m.panelCount} × ${fmtNum(state.panelWatts)} W</strong> panels with ${m.controllerCount > 1 ? `<strong>${m.controllerCount} × ${m.controllerRating} A</strong> MPPT controllers (split the array between them)` : `a <strong>${m.controllerRating} A</strong> MPPT controller`} on the ${state.systemVoltage}V bank. Before buying, check the panel string's cold-weather Voc against the controller's maximum PV input voltage, and the array's short-circuit current against its PV current limit. Panel wiring (series/parallel) is not calculated here.`;
+      }
+
       function fullRender() {
         renderTableRows();
         updateCalculationsUI();
@@ -1444,6 +1541,11 @@
         el.voltageBtns.forEach((b) => {
           b.classList.toggle("active", Number(b.dataset.voltage) === state.systemVoltage);
         });
+
+        document.getElementById("inputSunHours").value = state.sunHours;
+        document.getElementById("inputPanelWatts").value = state.panelWatts;
+        document.getElementById("inputPR").value = state.performanceRatio;
+        document.getElementById("labelPR").textContent = `${state.performanceRatio}%`;
       }
 
       function addLoadItem(itemData) {
@@ -1722,6 +1824,20 @@
         });
       });
 
+      document.getElementById("inputSunHours").addEventListener("input", (e) => {
+        state.sunHours = clamp(e.target.value, 1, 10, 5);
+        updateCalculationsUI();
+      });
+      document.getElementById("inputPanelWatts").addEventListener("input", (e) => {
+        state.panelWatts = clamp(e.target.value, 10, 1000, 550);
+        updateCalculationsUI();
+      });
+      document.getElementById("inputPR").addEventListener("input", (e) => {
+        state.performanceRatio = Number(e.target.value);
+        document.getElementById("labelPR").textContent = `${state.performanceRatio}%`;
+        updateCalculationsUI();
+      });
+
       /* ======================================================================
          7. EXPORT CSV & PRINT
          ====================================================================== */
@@ -1766,6 +1882,13 @@
         rows.push(["System DC Voltage (V)", `${state.systemVoltage}V`]);
         rows.push(["Recommended Total Battery Capacity (kWh)", m.totalBatteryKwh.toFixed(2)]);
         rows.push(["Recommended Total Battery Capacity (Ah)", Math.ceil(m.totalBatteryAh)]);
+        rows.push(["Peak Sun Hours (h/day)", state.sunHours]);
+        rows.push(["Performance Ratio (%)", `${state.performanceRatio}%`]);
+        rows.push(["Required Array (Wp)", Math.round(m.requiredArrayWp)]);
+        rows.push(["Panel Size (W)", state.panelWatts]);
+        rows.push(["Panels Needed", m.panelCount]);
+        rows.push(["Installed Array (Wp)", m.installedArrayWp]);
+        rows.push(["MPPT Controller", `${m.controllerCount} x ${m.controllerRating} A`]);
 
         const csvContent = rows.map((r) => r.join(",")).join("\n");
         const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8;" });
