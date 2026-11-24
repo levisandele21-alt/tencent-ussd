@@ -31,6 +31,9 @@ const PORT = process.env.PORT || 10000;
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 const LINK_SECRET = process.env.LINK_SECRET || '';   // must be its own secret, never the M-Pesa callback secret
 const SESSION_SECRET = process.env.SESSION_SECRET || '';
+// Site administrators (comma-separated emails). Defaults to your alert address.
+const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || process.env.NOTIFY_TO || process.env.MAIL_FROM_EMAIL || process.env.GMAIL_USER || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+const isAdminUser = u => Boolean(u && u.verified && u.email && ADMIN_EMAILS.has(String(u.email).toLowerCase()));
 if (LINK_SECRET.length < 16) console.error('LINK_SECRET is missing or shorter than 16 characters: shareable booking links are switched off.');
 if (SESSION_SECRET.length < 32) console.error('SESSION_SECRET is missing or shorter than 32 characters: everyone is logged out whenever the server restarts. Add a long random value in Render.');
 
@@ -300,7 +303,7 @@ const DUMMY_HASH = bcrypt.hashSync('this-is-not-a-real-password', BCRYPT_COST); 
 const validEmail = e => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
 
 // Only go back to our own pages after login (stops //evil.com style redirects)
-const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos', '/pos/app', '/pos/terminal', '/pos/subscribe']);
+const NEXT_ALLOWED = new Set(['/', '/wifi', '/cctv', '/smart-locks', '/electric-fence', '/solar', '/survey', '/requests', '/terms', '/contact', '/pos', '/pos/app', '/pos/terminal', '/pos/subscribe', '/solar-calculator', '/solar-calculator/app']);
 function safeNext(value) {
     const v = typeof value === 'string' ? value : '';
     if (!v.startsWith('/') || v.startsWith('//') || v.includes('\\')) return '/survey';
@@ -310,7 +313,7 @@ function safeNext(value) {
 
 function requireAuth(req, res, next) {
     if (req.session && req.session.user) return next();
-    if (req.method === 'GET') return res.redirect('/login?next=' + encodeURIComponent(safeNext(req.path)));
+    if (req.method === 'GET') return res.redirect('/login?next=' + encodeURIComponent(safeNext(req.originalUrl.split('?')[0])));
     return res.redirect('/login');
 }
 function requireDb(req, res, next) {
@@ -337,6 +340,19 @@ async function requireVerified(req, res, next) {
     } catch (err) { next(err); }
 }
 
+// Admin-only pages: signed in, email confirmed (checked in the database) and listed in ADMIN_EMAILS.
+// Everyone else sees the normal "not found" page, so the page's existence is not revealed.
+async function requireAdmin(req, res, next) {
+    try {
+        const u = req.session && req.session.user;
+        if (!u) return res.redirect('/login?next=' + encodeURIComponent(safeNext(req.originalUrl.split('?')[0])));
+        const r = await pool.query('SELECT email, email_verified FROM users WHERE id = $1', [u.id]);
+        const row = r.rows[0];
+        if (row && isAdminUser({ email: row.email, verified: row.email_verified })) return next();
+        return errorPage(req, res, 404, 'Page not found', 'We could not find that page.');
+    } catch (err) { next(err); }
+}
+
 // Passwords
 const COMMON_PASSWORDS = new Set(['password', 'password1', 'password123', '12345678', '123456789', '1234567890', 'qwertyuiop', 'qwerty123', '11111111', '00000000', 'iloveyou1', 'tencent123']);
 function passwordProblem(password, confirm, email = '') {
@@ -350,6 +366,7 @@ function passwordProblem(password, confirm, email = '') {
 // Lockout: 6 wrong passwords for the same email within 15 minutes locks sign-in for that email for 15 minutes.
 // Unknown emails are counted the same way, so the lock message never reveals whether an account exists.
 // Resetting the password through the emailed link clears the lock.
+const emailCooldown = new Map();   // "kind:userId" -> last send time
 const LOCK_AFTER = 6, LOCK_MS = 15 * 60 * 1000;
 const loginFails = new Map();   // email -> { count, first, lockedUntil }
 function lockedMinutes(email) {
@@ -372,7 +389,6 @@ setInterval(() => {
 }, 10 * 60 * 1000).unref();
 
 // One-time links sent by email (confirm email, reset password). Only a hash is stored, so a database leak cannot be used to take over accounts.
-const emailCooldown = new Map();   // "kind:userId" -> last send time
 const sha256 = v => crypto.createHash('sha256').update(v).digest('hex');
 const TOKEN_FORMAT = /^[A-Za-z0-9_-]{43}$/;
 async function createAuthToken(userId, kind, ttlMs) {
@@ -1047,7 +1063,7 @@ app.get('/payments/status/:id', statusLimiter, requireDb, ah(async (req, res) =>
         try {
             const q = await stkQuery(b.checkoutRequestId);
             if (String(q.ResultCode) === '0') await markPaid(b.id, '', true);
-            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '') await markFailed(b.id, q.ResultDesc || 'Payment cancelled');
+            else if (q.ResultCode !== undefined && String(q.ResultCode) !== '' && String(q.ResultCode) !== '4999') await markFailed(b.id, q.ResultDesc || 'Payment cancelled');   // 4999 = still processing on some shortcodes
         } catch (_) { /* still processing, or temporarily unavailable: stay pending */ }
         b = (await getBookingForUser(b.id, req.session.user.id)) || b;
     }
@@ -1259,6 +1275,7 @@ function renderPage(req, { title, activeNav, content, showMpesaPopup = false }) 
             <li><a href="/electric-fence" class="${activeNav === 'electric-fence' ? 'active' : ''}">⚡ Electric Fence</a></li>
             <li><a href="/solar" class="${activeNav === 'solar' ? 'active' : ''}">☀️ Solar Solutions</a></li>
             <li><a href="/pos" class="${activeNav === 'pos' ? 'active' : ''}">🧾 POS for Shops</a></li>
+            ${isAdminUser(user) ? `<li><a href="/solar-calculator" class="${activeNav === 'solar-calculator' ? 'active' : ''}">🧮 Solar Calculator (Admin)</a></li>` : ''}
             <li><a href="/survey" class="${activeNav === 'survey' ? 'active' : ''}">📋 Book Site Survey</a></li>
             ${user ? `<li><a href="/requests" class="${activeNav === 'requests' ? 'active' : ''}">📊 My Requests & Receipts</a></li>` : ''}
             <li><a href="/contact" class="${activeNav === 'contact' ? 'active' : ''}">📞 Contact Us</a></li>
@@ -1376,8 +1393,8 @@ function registerForm(req, { error = '', values = {} } = {}) {
                     <div class="form-group"><label for="r-name">Full Name</label><input id="r-name" type="text" name="name" required maxlength="80" autocomplete="name" placeholder="John Otieno" value="${esc(values.name || '')}"></div>
                     <div class="form-group"><label for="r-email">Email Address (your receipts are sent here)</label><input id="r-email" type="email" name="email" required maxlength="254" autocomplete="email" placeholder="john@example.com" value="${esc(values.email || '')}"></div>
                     <div class="form-group"><label for="r-phone">M-Pesa Phone Number</label><input id="r-phone" type="tel" name="phone" required autocomplete="tel" placeholder="0712345678" value="${esc(values.phone || '')}"></div>
-                    <div class="form-group"><label for="r-pass">Password</label><input id="r-pass" type="password" name="password" required minlength="8" maxlength="72" autocomplete="new-password"><small>At least 8 characters.</small></div>
-                    <div class="form-group"><label for="r-pass2">Confirm Password</label><input id="r-pass2" type="password" name="confirm" required minlength="8" maxlength="72" autocomplete="new-password"></div>
+                    <div class="form-group"><label for="r-pass">Password</label><input id="r-pass" type="password" name="password" required minlength="10" maxlength="72" autocomplete="new-password"><small>At least 10 characters.</small></div>
+                    <div class="form-group"><label for="r-pass2">Confirm Password</label><input id="r-pass2" type="password" name="confirm" required minlength="10" maxlength="72" autocomplete="new-password"></div>
                     <button type="submit" class="cta-btn block">Register</button>
                 </form>
                 <p style="margin-top: 15px; text-align:center;">Already have an account? <a href="/login">Login here</a></p>
@@ -1554,8 +1571,8 @@ function resetForm(token, error = '') {
             ${error ? `<div class="alert" role="alert">${esc(error)}</div>` : ''}
             <form action="/reset-password" method="POST">
                 <input type="hidden" name="token" value="${esc(token)}">
-                <div class="form-group"><label for="p-pass">New Password</label><input id="p-pass" type="password" name="password" required minlength="8" maxlength="72" autocomplete="new-password"><small>At least 8 characters.</small></div>
-                <div class="form-group"><label for="p-pass2">Confirm New Password</label><input id="p-pass2" type="password" name="confirm" required minlength="8" maxlength="72" autocomplete="new-password"></div>
+                <div class="form-group"><label for="p-pass">New Password</label><input id="p-pass" type="password" name="password" required minlength="10" maxlength="72" autocomplete="new-password"><small>At least 10 characters.</small></div>
+                <div class="form-group"><label for="p-pass2">Confirm New Password</label><input id="p-pass2" type="password" name="confirm" required minlength="10" maxlength="72" autocomplete="new-password"></div>
                 <button type="submit" class="cta-btn block">Change Password</button>
             </form>
         </div></div>`;
@@ -2138,9 +2155,12 @@ app.get('/terms', (req, res) => {
 });
 
 
-// USSD endpoint (the USSD gateway posts here; no login, no cookies)
-app.post('/ussd', (req, res) => {
-    const { text, phoneNumber } = req.body;
+// USSD endpoint (the USSD gateway posts here; no login, no cookies).
+// Switched off until a USSD shortcode exists: set USSD_ENABLED=1 in Render to turn it on.
+// NOTE: this flow does not yet create a booking or send an STK push, so do not enable it before that is built.
+app.post('/ussd', (req, res, next) => {
+    if (process.env.USSD_ENABLED !== '1') return next();   // falls through to the 404 page
+    const { text, phoneNumber } = req.body || {};
     let response = '';
 
     if (text === '') {
@@ -2175,7 +2195,7 @@ app.post('/ussd', (req, res) => {
         response = `CON Site Survey: KES 3,000
 (Prices can change by location & urgency)
 1. Confirm & Pay via M-PESA`;
-    } else if (text.endsWith('*1')) {
+    } else if (typeof text === 'string' && text.endsWith('*1')) {
         response = `END Thank you! An M-PESA payment prompt has been sent to ${phoneNumber}. An engineer will call you shortly.`;
     } else {
         response = `END Invalid selection. Please dial again.`;
@@ -2218,6 +2238,10 @@ if (POS) {
 // ---------------------------------------------------------------
 // 20. Not found, errors, start
 // ---------------------------------------------------------------
+// Admin-only solar calculator (needs solar-calculator.js and solar-calculator.html next to this file)
+try { require('./solar-calculator')({ app, renderPage, guard: [requireDb, requireAdmin] }); }
+catch (e) { console.error('Solar calculator not loaded:', e.message); }
+
 app.use((req, res) => errorPage(req, res, 404, 'Page not found', 'We could not find that page.'));
 
 // One place that catches every error, so a database hiccup cannot crash the server
@@ -2236,8 +2260,8 @@ app.use((err, req, res, next) => {   // eslint-disable-line no-unused-vars
 (async () => {
     await initDb();   // wait for the tables before taking traffic (it keeps retrying in the background if the database is down)
     if (!(MAIL.brevoKey && MAIL.fromEmail) && !(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)) {
-    console.error('EMAIL IS NOT SET UP: confirmation links, password resets and receipts cannot be sent. Add BREVO_API_KEY and MAIL_FROM_EMAIL in Render.');
-}
-if (!PUBLIC_BASE_URL) console.error('PUBLIC_BASE_URL is not set: confirmation and reset emails cannot be sent. Add it in Render, for example https://your-site.onrender.com');
-app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
+        console.error('EMAIL IS NOT SET UP: confirmation links, password resets and receipts cannot be sent. Add BREVO_API_KEY and MAIL_FROM_EMAIL in Render.');
+    }
+    if (!PUBLIC_BASE_URL) console.error('PUBLIC_BASE_URL is not set: confirmation and reset emails cannot be sent. Add it in Render, for example https://your-site.onrender.com');
+    app.listen(PORT, () => console.log(`Tencent Innovations server running on port ${PORT}`));
 })();
