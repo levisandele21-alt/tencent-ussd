@@ -4,15 +4,63 @@
 //   GET /solar-calculator/app   the calculator (solar-calculator.html, next to this file)
 // The calculator runs in the browser; nothing entered is sent to the server.
 // Mounted from server.js with guard middleware [requireDb, requireAdmin].
+//
+// The routes are always registered. If solar-calculator.html is missing or broken, administrators
+// see the reason on screen (and in the server log) instead of a confusing "Page not found".
 const fs = require('fs');
 const path = require('path');
 
+const HTML_FILE = path.join(__dirname, 'solar-calculator.html');
+const esc = v => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
 module.exports = function mountSolar({ app, renderPage, guard = [], basePath = '/solar-calculator' }) {
-    const html = fs.readFileSync(path.join(__dirname, 'solar-calculator.html'), 'utf8');
-    if (html.split('<script>').length !== 2) console.error('Solar calculator: expected exactly one <script> tag; the page may be blocked by the Content-Security-Policy.');
     const title = 'Solar Load Profile & Sizing Calculator';
+    let html = '';
+    let loadError = '';
+
+    // Reads the calculator page. Called at start-up and again on request while it is still missing,
+    // so uploading the file later fixes the page without needing a restart.
+    function loadHtml() {
+        try {
+            const text = fs.readFileSync(HTML_FILE, 'utf8');
+            // The page must have exactly one plain inline script: a nonce is added to it so the site's
+            // Content-Security-Policy lets it run.
+            const scripts = text.match(/<script\b/gi) || [];
+            if (scripts.length !== 1 || !text.includes('<script>')) {
+                throw new Error('solar-calculator.html must contain exactly one plain <script> tag (found ' + scripts.length + ')');
+            }
+            html = text;
+            loadError = '';
+            return true;
+        } catch (e) {
+            html = '';
+            loadError = e.code === 'ENOENT'
+                ? 'solar-calculator.html was not found next to solar-calculator.js (looked in ' + __dirname + ')'
+                : e.message;
+            return false;
+        }
+    }
+
+    if (loadHtml()) console.log('Solar calculator ready at ' + basePath);
+    else console.error('Solar calculator page not loaded: ' + loadError);
+
+    const unavailable = (req, res) => {
+        const content = `
+        <div class="general-container">
+            <h2>Solar calculator unavailable</h2>
+            <p class="intro-text">The calculator page could not be loaded.</p>
+            <div class="alert" role="alert">${esc(loadError)}</div>
+            <p style="color:var(--muted);">Check that <strong>solar-calculator.html</strong> is in your GitHub repository, in the same folder as <strong>server.js</strong>, with exactly that name, then redeploy.</p>
+            <a href="/" class="cta-btn">Back to Home</a>
+        </div>`;
+        res.status(503).set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' })
+            .send(renderPage(req, { title: 'Solar calculator unavailable', activeNav: 'solar-calculator', content }));
+    };
 
     app.get(basePath, ...guard, (req, res) => {
+        if (!html && !loadHtml()) return unavailable(req, res);
         res.set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' });
         const content = `
         <div class="general-container">
@@ -38,6 +86,7 @@ module.exports = function mountSolar({ app, renderPage, guard = [], basePath = '
     });
 
     app.get(basePath + '/app', ...guard, (req, res) => {
+        if (!html && !loadHtml()) return unavailable(req, res);
         // a new script nonce is issued per page, so this page is never cached
         const body = req.nonce ? html.replace('<script>', () => `<script nonce="${req.nonce}">`) : html;
         res.set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' }).send(body);
