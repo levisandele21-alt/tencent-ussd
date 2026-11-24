@@ -8,6 +8,7 @@ const express = require('express');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const GW = require('./pos-gateways');
+const SMS = require('./pos-sms');
 const SEC = require('./pos-security');
 const PAYSTACK_ON = process.env.POS_ENABLE_PAYSTACK === '1';   // Paystack code is not verified against their live service, so it stays off unless you switch it on
 const COMMON_PW = new Set(['password', 'password1', '12345678', '123456789', '1234567890', 'qwerty123', '11111111', '00000000', 'abcd1234', 'tencent123', 'welcome123']);
@@ -16,6 +17,8 @@ const TZ = 'Africa/Nairobi';
 const VAT_RATE = 16;   // percent. Selling prices already include this VAT.
 const vatOf = gross => Math.round(Number(gross) * VAT_RATE / (100 + VAT_RATE));   // VAT inside a VAT-inclusive amount, in cents
 const envInt = (name, fallback) => { const n = Number(process.env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
+const SMS_PROMO_CAP = envInt('POS_SMS_PROMO_CAP', envInt('POS_SMS_DAILY_CAP', 1000));   // most promotions one business can send in a day (the owner can set a lower limit)
+const SMS_TX_CAP = envInt('POS_SMS_TX_CAP', 2000);   // receipts, alerts and tests: a separate budget, so a big promotion never stops receipts
 const BRANCH_FEE_KES = envInt('POS_BRANCH_FEE', 2000);   // extra per month for every active branch besides the head office
 const SUB_FEE_KES = envInt('POS_MONTHLY_FEE', 3000);   // monthly subscription, paid to the platform M-Pesa account in server.js
 const GRACE_DAYS = envInt('POS_GRACE_DAYS', 30);       // shops that already existed before subscriptions started get this many free days
@@ -219,6 +222,23 @@ async function initSchema(pool) {
         `CREATE TABLE IF NOT EXISTS pos_owner_security (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT FALSE, last_counter BIGINT NOT NULL DEFAULT 0, recovery JSONB NOT NULL DEFAULT '[]', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
         `ALTER TABLE pos_owner_security ADD COLUMN IF NOT EXISTS method VARCHAR(8) NOT NULL DEFAULT 'app'`,
         `CREATE TABLE IF NOT EXISTS pos_email_otp (user_id INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, tries INT NOT NULL DEFAULT 0, sent_log JSONB NOT NULL DEFAULT '[]')`,
+        `CREATE TABLE IF NOT EXISTS pos_sms_settings (business_id INT PRIMARY KEY REFERENCES pos_shops(id) ON DELETE CASCADE, cfg JSONB NOT NULL DEFAULT '{}', secrets TEXT NOT NULL DEFAULT '', enabled BOOLEAN NOT NULL DEFAULT FALSE, send_receipts BOOLEAN NOT NULL DEFAULT TRUE, alert_phone VARCHAR(20) NOT NULL DEFAULT '', alert_daily BOOLEAN NOT NULL DEFAULT FALSE, alert_low BOOLEAN NOT NULL DEFAULT FALSE, last_daily DATE, last_low DATE, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        `CREATE TABLE IF NOT EXISTS pos_customers (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, name VARCHAR(80) NOT NULL DEFAULT '', phone VARCHAR(20) NOT NULL, optin BOOLEAN NOT NULL DEFAULT FALSE, optin_at TIMESTAMPTZ, optin_source VARCHAR(20) NOT NULL DEFAULT '', optout_at TIMESTAMPTZ, token VARCHAR(16) NOT NULL, last_sale_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (business_id, phone))`,
+        'ALTER TABLE pos_customers ADD COLUMN IF NOT EXISTS sales_count INT NOT NULL DEFAULT 0',
+        'ALTER TABLE pos_customers ADD COLUMN IF NOT EXISTS spent_cents BIGINT NOT NULL DEFAULT 0',
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_customers_token_uq ON pos_customers (token)',
+        `CREATE TABLE IF NOT EXISTS pos_sms_log (id BIGSERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, shop_id INT, kind VARCHAR(10) NOT NULL, to_phone VARCHAR(20) NOT NULL, body TEXT NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'queued', provider_ref VARCHAR(60) NOT NULL DEFAULT '', error VARCHAR(160) NOT NULL DEFAULT '', attempts INT NOT NULL DEFAULT 0, next_try TIMESTAMPTZ, claimed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), sent_at TIMESTAMPTZ)`,
+        'CREATE INDEX IF NOT EXISTS pos_sms_log_biz_idx ON pos_sms_log (business_id, created_at DESC)',
+        'ALTER TABLE pos_sms_log ADD COLUMN IF NOT EXISTS dedupe_key TEXT',
+        'ALTER TABLE pos_sms_log ADD COLUMN IF NOT EXISTS campaign_id INT',
+        'CREATE UNIQUE INDEX IF NOT EXISTS pos_sms_log_dedupe_uq ON pos_sms_log (business_id, dedupe_key) WHERE dedupe_key IS NOT NULL',
+        'ALTER TABLE pos_sms_settings ADD COLUMN IF NOT EXISTS promo_daily_limit INT',
+        // people who replied STOP (or used the stop link): kept even if the customer row is deleted, so no import can ever add them back
+        `CREATE TABLE IF NOT EXISTS pos_sms_suppress (business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, phone VARCHAR(20) NOT NULL, source VARCHAR(12) NOT NULL DEFAULT 'link', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (business_id, phone))`,
+        `INSERT INTO pos_sms_suppress (business_id, phone, source, created_at) SELECT business_id, phone, 'link', optout_at FROM pos_customers WHERE optout_at IS NOT NULL ON CONFLICT DO NOTHING`,
+        `CREATE TABLE IF NOT EXISTS pos_sms_campaigns (id SERIAL PRIMARY KEY, business_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, segment VARCHAR(12) NOT NULL, message VARCHAR(300) NOT NULL, fingerprint VARCHAR(64) NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'draft', queued INT NOT NULL DEFAULT 0, created_by VARCHAR(80) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+        'CREATE INDEX IF NOT EXISTS pos_sms_campaigns_biz_idx ON pos_sms_campaigns (business_id, created_at DESC)',
+        `CREATE INDEX IF NOT EXISTS pos_sms_log_queue_idx ON pos_sms_log (id) WHERE status IN ('queued','sending')`,
         `CREATE TABLE IF NOT EXISTS pos_void_requests (id SERIAL PRIMARY KEY, shop_id INT NOT NULL REFERENCES pos_shops(id) ON DELETE CASCADE, sale_id INT NOT NULL REFERENCES pos_sales(id) ON DELETE CASCADE, reason VARCHAR(200) NOT NULL, requested_by VARCHAR(80) NOT NULL DEFAULT '', staff_id INT, status VARCHAR(10) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), decided_at TIMESTAMPTZ, decided_by VARCHAR(80) NOT NULL DEFAULT '')`,
         `CREATE UNIQUE INDEX IF NOT EXISTS pos_void_one_pending ON pos_void_requests (sale_id) WHERE status = 'pending'`
     ]) await step(sql);
@@ -278,7 +298,7 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
 
     // ----- layout -----
     const BASE_NAV = [
-        ['Main', [['app', '/pos/app', 'Dashboard'], ['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'Sales History'], ['daily', '/pos/daily', 'Daily Sales (Z-Report)'], ['drawer', '/pos/drawer', 'Cash Drawer'], ['quotes', '/pos/quotes', 'Quotes']]],
+        ['Main', [['app', '/pos/app', 'Dashboard'], ['terminal', '/pos/terminal', 'POS Terminal'], ['sales', '/pos/sales', 'Sales History'], ['daily', '/pos/daily', 'Daily Sales (Z-Report)'], ['drawer', '/pos/drawer', 'Cash Drawer'], ['quotes', '/pos/quotes', 'Quotes'], ['customers', '/pos/customers', 'Customers']]],
         ['Inventory', [['items', '/pos/items', 'Items'], ['categories', '/pos/categories', 'Categories'], ['stock', '/pos/stock', 'Stock In / Out & Adjustment'], ['history', '/pos/stock/history', 'Stock History'], ['low', '/pos/stock/low', 'Low Stock Alerts'], ['suppliers', '/pos/suppliers', 'Suppliers'], ['po', '/pos/purchase-orders', 'Purchase Orders']]],
         ['Money', [['expenses', '/pos/expenses', 'Expenses'], ['ecats', '/pos/expense-categories', 'Expense Categories'], ['recurring', '/pos/recurring', 'Recurring Expenses'], ['budgets', '/pos/budgets', 'Budgets'], ['assets', '/pos/assets', 'Assets'], ['reports', '/pos/reports', 'Reports'], ['notebook', '/pos/notebook', 'Notebook']]]
     ];
@@ -292,10 +312,11 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
         ['inventory', 'Inventory', 'Items, categories, stock, suppliers, purchase orders', /^\/(items|categories|stock|suppliers|purchase-orders)(\/|$)/, false],
         ['money', 'Expenses & Assets', 'Expenses, budgets, recurring costs, assets', /^\/(expenses|expense-categories|recurring|budgets|assets)(\/|$)/, false],
         ['reports', 'Reports & Notebook', 'Profit and sales reports', /^\/(reports|notebook)(\/|$)/, false],
+        ['customers', 'Customers', 'Customer list and who agreed to SMS offers', /^\/customers(\/|$)/, false],
         ['staff', 'Register cashiers', 'Add and manage cashiers of their branch', /^\/staff(\/|$)/, true]
     ];
     const SECTION_KEYS = SECTIONS.map(s => s[0]);
-    const NAV_SECTION = { app: 'dashboard', terminal: 'terminal', sales: 'sales', daily: 'daily', drawer: 'daily', quotes: 'quotes', items: 'inventory', categories: 'inventory', stock: 'inventory', history: 'inventory', low: 'inventory', suppliers: 'inventory', po: 'inventory', expenses: 'money', ecats: 'money', recurring: 'money', budgets: 'money', assets: 'money', reports: 'reports', notebook: 'reports', staff: 'staff' };
+    const NAV_SECTION = { app: 'dashboard', terminal: 'terminal', sales: 'sales', daily: 'daily', drawer: 'daily', quotes: 'quotes', customers: 'customers', items: 'inventory', categories: 'inventory', stock: 'inventory', history: 'inventory', low: 'inventory', suppliers: 'inventory', po: 'inventory', expenses: 'money', ecats: 'money', recurring: 'money', budgets: 'money', assets: 'money', reports: 'reports', notebook: 'reports', staff: 'staff' };
     const ALWAYS_OK = /^\/(account|account\/password|install|start|offline)$/;
     const PRESETS = { terminal: ['terminal'], cashier: ['terminal', 'sales'], everything: SECTION_KEYS };
     const granted = (role, perms, key) => Array.isArray(perms) && perms.includes(key) && !(key === 'staff' && role !== 'manager');
@@ -311,7 +332,7 @@ function mountPos({ app, getPool, esc, str, ah, rateLimit, requireAuth, requireD
         const shop = [];
         if (role === 'owner') shop.push(['branches', '/pos/branches', 'Branches']);
         shop.push(['staff', '/pos/staff', role === 'owner' ? 'Staff & Cashiers' : 'Cashiers']);
-        if (role === 'owner') shop.push(['gateways', '/pos/gateways', 'Payment Gateways'], ['voids', '/pos/voids', 'Void Requests'], ['audit', '/pos/audit', 'Audit Log'], ['security', '/pos/security', 'Security (2-step login)'], ['subscription', '/pos/subscribe', 'Subscription'], ['settings', '/pos/settings', 'Shop Settings & Logo']);
+        if (role === 'owner') shop.push(['gateways', '/pos/gateways', 'Payment Gateways'], ['sms', '/pos/sms', 'SMS & Promotions'], ['voids', '/pos/voids', 'Void Requests'], ['audit', '/pos/audit', 'Audit Log'], ['security', '/pos/security', 'Security (2-step login)'], ['subscription', '/pos/subscribe', 'Subscription'], ['settings', '/pos/settings', 'Shop Settings & Logo']);
         else shop.push(['account', '/pos/account', 'My Account']);
         shop.push(['install', '/pos/install', 'Install App']);
         return [...BASE_NAV, ['Shop', shop]];
@@ -544,6 +565,19 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     router.get('/start', (req, res) => res.redirect(req.session && (req.session.posStaff || req.session.user) ? '/pos/app' : '/pos/staff/login'));
 
     // ----- everything below needs a signed-in owner (confirmed email) or a staff member -----
+    // ----- public "stop messages" link that goes at the end of every promotion -----
+    const stopLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: 'Too many requests. Please try again later.' });
+    router.get('/u/:token', stopLimiter, requireDb, ah(async (req, res) => {
+        const c = /^[a-f0-9]{16}$/.test(req.params.token) ? (await q('SELECT c.optin, b.name FROM pos_customers c JOIN pos_shops b ON b.id = c.business_id WHERE c.token=$1', [req.params.token])).rows[0] : null;
+        if (!c) return send(req, res, { title: 'Link not valid', bare: true, body: '<h1>This link is not valid</h1><div class="panel"><p>It may have been removed.</p></div>' }, 404);
+        send(req, res, { title: 'Stop messages', bare: true, body: c.optin ? `<h1>Stop messages from ${esc(c.name)}?</h1><div class="panel"><form action="/pos/u/${req.params.token}" method="POST"><button class="btn" type="submit">Yes, stop sending me offers</button></form></div>` : `<h1>You will not get offers from ${esc(c.name)}</h1><div class="panel"><p>You are already unsubscribed.</p></div>` });
+    }));
+    router.post('/u/:token', stopLimiter, requireDb, ah(async (req, res) => {
+        const r = /^[a-f0-9]{16}$/.test(req.params.token) ? await q('UPDATE pos_customers SET optin=FALSE, optout_at=now() WHERE token=$1 RETURNING business_id, phone', [req.params.token]) : { rowCount: 0 };
+        if (r.rowCount) await q(`INSERT INTO pos_sms_suppress (business_id, phone, source) VALUES ($1,$2,'link') ON CONFLICT DO NOTHING`, [r.rows[0].business_id, r.rows[0].phone]);
+        if (r.rowCount) await auditRaw(r.rows[0].business_id, null, 'system', null, '', 'sms.optout', 'A customer used the stop link', '');
+        send(req, res, { title: 'Stopped', bare: true, body: '<h1>Done</h1><div class="panel"><p>You will not get any more offers by SMS.</p></div>' });
+    }));
     router.use(requireDb);
     const isApi = req => req.path.startsWith('/api/');
     const OTP_VALID_MS = 12 * 3600 * 1000, STEP_VALID_MS = 10 * 60 * 1000;
@@ -687,7 +721,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
 
     // ----- who may open what -----
     const CASHIER_PAGES = [['GET', /^\/(app|terminal|sales|account|install|api\/items)$/], ['GET', /^\/sales\/\d+\/receipt$/], ['GET', /^\/api\/pay\/[a-f0-9]{24}$/], ['POST', /^\/(api\/sales|api\/pay\/start|account\/password)$/]];
-    const OWNER_ONLY = /^\/(branches|gateways|subscribe|settings|voids|audit|security|payments|2fa)(\/|$)/;
+    const OWNER_ONLY = /^\/(branches|gateways|subscribe|settings|voids|audit|security|payments|2fa|sms)(\/|$)/;
     function roleAllows(role, method, p, perms) {
         if (role === 'owner') return true;
         if (OWNER_ONLY.test(p)) return false;
@@ -954,7 +988,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
     const LIVE_PROVIDERS = PAYSTACK_ON ? ['mpesa', 'paystack'] : ['mpesa'];
     const hasGateway = async bizId => vault.enabled && (await q('SELECT 1 FROM pos_gateways WHERE business_id=$1 AND active AND provider = ANY($2::text[]) LIMIT 1', [bizId, LIVE_PROVIDERS])).rowCount > 0;
     router.get('/terminal', ah(async (req, res) => {
-        const stkOn = await hasGateway(req.biz.id), vatOn = Boolean(req.biz.vat_enabled);
+        const stkOn = await hasGateway(req.biz.id), vatOn = Boolean(req.biz.vat_enabled), smsOn = smsReady(await loadSms(req.biz.id));
         const body = `<h1 class="noprint">POS Terminal</h1>
         <div class="pos-wrap">
             <div>
@@ -977,7 +1011,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 <div id="cashbox" class="field"><label for="tender">Cash received (KES)</label><input id="tender" inputmode="decimal" placeholder="0"><div class="tot" style="margin-top:6px"><span>Change</span><b id="change">0.00</b></div></div>
                 <div id="mpesabox" class="field" style="display:none"><label for="mref">M-Pesa code (from the customer's SMS)</label><input id="mref" maxlength="10" autocapitalize="characters" placeholder="e.g. SHK4A1B2C3"></div>
                 <div id="stkbox" class="field" style="display:none"><label for="sphone">Customer M-Pesa number</label><input id="sphone" type="tel" placeholder="0712345678"><small>Type the customer's number and press Enter. They get the M-Pesa prompt on their phone and type their PIN. The sale completes by itself when they pay.</small></div>
-                <div class="field" id="cpbox"><label for="cphone">Customer phone (optional, to share the receipt)</label><input id="cphone" type="tel" placeholder="0712345678"></div>
+                <div class="field" id="cpbox"><label for="cphone">Customer phone (optional${smsOn ? ", the receipt is sent by SMS" : ", to share the receipt"})</label><input id="cphone" type="tel" placeholder="0712345678"></div>${smsOn ? '<div class="field" id="optbox"><label style="font-weight:400"><input type="checkbox" id="coptin" style="width:auto"> Customer agrees to get offers by SMS (uses the phone number above, or the M-Pesa prompt number)</label></div>' : ''}
                 <div id="err" class="alert" role="alert" style="display:none"></div>
                 <button class="btn ok" id="done" type="button" style="width:100%;padding:13px;font-size:1rem" disabled>Complete sale</button>
                 <button class="btn ghost" id="clear" type="button" style="width:100%;margin-top:8px">Clear sale</button>
@@ -1045,7 +1079,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 $('cashbox').style.display = m === 'cash' ? '' : 'none'; $('mpesabox').style.display = m === 'mpesa' ? '' : 'none'; $('stkbox').style.display = m === 'stk' ? '' : 'none'; $('cpbox').style.display = m === 'stk' ? 'none' : '';
                 $('done').textContent = m === 'stk' ? 'Send M-Pesa prompt' : 'Complete sale'; showErr('');
             }
-            function reset() { cart = []; $('disc').value = ''; $('tender').value = ''; $('mref').value = ''; $('cphone').value = ''; if ($('sphone')) $('sphone').value = ''; showErr(''); setMethod('cash'); render(); $('find').value = ''; draw(); load(); $('find').focus(); }
+            function reset() { cart = []; $('disc').value = ''; $('tender').value = ''; $('mref').value = ''; $('cphone').value = ''; if ($('coptin')) $('coptin').checked = false; if ($('sphone')) $('sphone').value = ''; showErr(''); setMethod('cash'); render(); $('find').value = ''; draw(); load(); $('find').focus(); }
             function lines() { return cart.map(function (l) { return { id: l.id, qty: l.qty }; }); }
             function finished(d) {
                 $('mtext').textContent = 'Receipt #' + d.receiptNo + ' - KES ' + fmt(d.total) + (d.change ? ' - Change KES ' + fmt(d.change) : '');
@@ -1067,7 +1101,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             function startStk() {
                 var phone = $('sphone').value.trim(); if (!phone) { showErr("Enter the customer's M-Pesa number."); return; }
                 busy = true; $('done').disabled = true; showErr('');
-                fetch('/pos/api/pay/start', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: lines(), discount: $('disc').value, phone: phone }) })
+                fetch('/pos/api/pay/start', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: lines(), discount: $('disc').value, phone: phone, customerOptin: Boolean($('coptin') && $('coptin').checked) }) })
                 .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
                 .then(function (x) {
                     if (!x.ok) { busy = false; showErr(x.d.error || 'The prompt could not be sent.'); render(); return; }
@@ -1115,7 +1149,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
                 if (method === 'mpesa' && !/^[A-Za-z0-9]{10}$/.test($('mref').value.trim())) { showErr("The M-Pesa code is 10 letters and numbers, as in the customer's SMS."); return; }
                 busy = true; $('done').disabled = true; $('done').textContent = 'Saving...'; showErr('');
                 fetch('/pos/api/sales', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-                    lines: lines(), discount: $('disc').value, method: method, tendered: $('tender').value, mpesaRef: $('mref').value.trim(), customerPhone: $('cphone').value.trim() }) })
+                    lines: lines(), discount: $('disc').value, method: method, tendered: $('tender').value, mpesaRef: $('mref').value.trim(), customerPhone: $('cphone').value.trim(), customerOptin: Boolean($('coptin') && $('coptin').checked) }) })
                 .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
                 .then(function (x) {
                     busy = false; $('done').textContent = 'Complete sale';
@@ -1219,6 +1253,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             }
             const sale = await insertSale(client, req.shop, req.biz, { lines: priced.lines, discount, method, mref, phone, paid, change, staffId: who.staffId, cashierName: who.name });
             await client.query('COMMIT');
+            afterSale({ biz: req.biz, shop: req.shop, saleId: sale.id, no: sale.no, total: sale.total, method, mref, phone, optin: b.customerOptin === true });
             if (discount > 0) await audit(req, 'sale.discount', `Receipt #${sale.no}: KES ${fmt(discount)} off KES ${fmt(subtotal)}`);
             res.json({ ok: true, saleId: sale.id, receiptNo: sale.no, total: sale.total, change, receiptUrl: `/pos/sales/${sale.id}/receipt`, whatsapp: whatsappLink(req.shop, phone, sale.no, sale.total, method) });
         } catch (err) {
@@ -1256,7 +1291,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
         if (amountKes < 1) return bad('The total is too small to charge.');
         const who = cashierOf(req), id = crypto.randomBytes(12).toString('hex');
         await q('INSERT INTO pos_payments (id, shop_id, gateway_id, staff_id, cashier_name, amount_kes, phone, status, cart) VALUES ($1,$2,$3,$4,$5,$6,$7,\'pending\',$8::jsonb)',
-            [id, req.shop.id, gw.id, who.staffId, who.name, amountKes, phone, JSON.stringify({ lines: priced.lines, discount, customerPhone: phone })]);
+            [id, req.shop.id, gw.id, who.staffId, who.name, amountKes, phone, JSON.stringify({ lines: priced.lines, discount, customerPhone: phone, customerOptin: b.customerOptin === true })]);
         try {
             const r = await GW.PROVIDERS[gw.provider].charge(gw, { amountKes, phone, ref: gw.provider === 'mpesa' ? id.slice(0, 12).toUpperCase() : id, desc: 'Sale payment', callbackUrl: callbackUrlFor(gw), email: (req.session.user && req.session.user.email) || 'pos@tencent.invalid' });
             await q('UPDATE pos_payments SET provider_ref=$2, updated_at=now() WHERE id=$1', [id, r.providerRef]);
@@ -1303,6 +1338,7 @@ self.addEventListener('fetch',function(e){if(e.request.mode==='navigate'){e.resp
             const sale = await insertSale(client, shop, biz, { lines: cart.lines, discount: cart.discount, method: 'mpesa', mref, phone: cart.customerPhone || '', paid: p.amount_kes * 100, change: 0, staffId: p.staff_id, cashierName: p.cashier_name });
             await client.query(`UPDATE pos_payments SET status='paid', receipt=$2, sale_id=$3, updated_at=now() WHERE id=$1`, [id, String(receipt || '').slice(0, 40), sale.id]);
             await client.query('COMMIT');
+            afterSale({ biz, shop, saleId: sale.id, no: sale.no, total: sale.total, method: 'mpesa', mref, phone: cart.customerPhone || '', optin: cart.customerOptin === true });
             if (sale.oversold.length) await auditRaw(shop.parent_id || shop.id, shop.id, 'system', null, '', 'stock.negative', 'Paid sale after stock ran out: ' + sale.oversold.join(', '), '');
             await auditRaw(shop.parent_id || shop.id, shop.id, 'system', null, '', 'payment.sale', `receipt #${sale.no} code ${mref || ''}`, '');
         } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; } finally { client.release(); }
@@ -2143,10 +2179,11 @@ ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method
         return false;
     }
     router.post('/gateways/unlock', ah(async (req, res) => {
+        const dest = req.body.to === 'sms' ? '/pos/sms' : '/pos/gateways';
         if (!req.has2fa) return back(res, '/pos/security', '', 'Turn on two-step login first.');
         const r = await verifyOwnerOtp(req, req.body.otp);
         await saveSess(req);
-        back(res, '/pos/gateways', r.ok ? 'Unlocked for 10 minutes.' : '', r.ok ? '' : (r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.'));
+        back(res, dest, r.ok ? 'Unlocked for 10 minutes.' : '', r.ok ? '' : (r.locked ? 'Too many wrong codes. Wait 15 minutes.' : 'That code is not right.'));
     }));
     router.get('/gateways', ah(async (req, res) => {
         const gws = (await q('SELECT id, provider, cfg, active, is_default, callback_token FROM pos_gateways WHERE business_id=$1 ORDER BY id', [req.biz.id])).rows;
@@ -2437,7 +2474,354 @@ ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method
     // 3) gateway secrets sealed with an old key are re-sealed with the current key
     // 4) old throttle rows are removed
     let lastHousekeeping = 0;
+    // =====================================================================================
+    // SMS: receipts, promotions to customers who agreed, owner alerts. Sent through the shop's own account with the SMS company it chooses (see pos-sms.js).
+    // Every message is first written to pos_sms_log as "queued", then a background worker sends it, so a slow SMS company never slows a sale.
+    // =====================================================================================
+    async function loadSms(bizId) {
+        const r = (await q('SELECT * FROM pos_sms_settings WHERE business_id=$1', [bizId])).rows[0];
+        if (!r) return null;
+        let secrets = null;
+        if (r.secrets && vault.enabled) { try { secrets = vault.open(r.secrets, `${bizId}:sms`); } catch (e) { console.error('POS: SMS keys unreadable for business', bizId + ':', e.message); } }
+        return { ...r, secrets };
+    }
+    const smsReady = s => Boolean(s && s.enabled && SMS.configured(s.cfg, s.secrets));
+    // Two separate daily budgets, so a big promotion can never use up the day's receipts:
+    //   receipts, alerts and tests share SMS_TX_CAP; promotions have their own limit (the owner can lower it, never above the platform's).
+    const smsUsed = async (bizId, promo) => Number((await q(`SELECT count(*) n FROM pos_sms_log WHERE business_id=$1 AND (kind = 'promo') = $3 AND status <> 'skipped' AND (created_at AT TIME ZONE '${TZ}')::date = $2`, [bizId, todayNairobi(), promo])).rows[0].n);
+    const promoLimit = s => Math.max(0, Math.min(SMS_PROMO_CAP, s && s.promo_daily_limit != null ? Number(s.promo_daily_limit) : SMS_PROMO_CAP));
+    // rows: [{ phone, body, key }]. A repeated key for the same business is ignored, so the same message is never queued twice.
+    // Returns { ok: n queued, dup: n ignored } or { error }.
+    async function queueSms(bizId, shopId, kind, rows, settings) {
+        rows = rows.map(r => ({ phone: r.phone, body: SMS.clean(r.body).slice(0, 480), key: r.key || null })).filter(r => r.phone && r.body);
+        if (!rows.length) return { ok: 0, dup: 0 };
+        const promo = kind === 'promo', used = await smsUsed(bizId, promo), limit = promo ? promoLimit(settings || await loadSms(bizId)) : SMS_TX_CAP;
+        if (used + rows.length > limit) {
+            const msg = promo ? `That would pass today's promotion limit of ${limit} messages (${used} already used). Choose a smaller group or try tomorrow.` : `Today's limit of ${limit} receipts and alerts was reached.`;
+            if (!promo) await q(`INSERT INTO pos_sms_log (business_id, shop_id, kind, to_phone, body, status, error, dedupe_key) SELECT $1,$2,$3,t.phone,t.body,'failed',$6,t.key FROM unnest($4::text[], $5::text[], $7::text[]) AS t(phone, body, key) ON CONFLICT (business_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`, [bizId, shopId || null, kind, rows.map(r => r.phone), rows.map(r => r.body), msg.slice(0, 160), rows.map(r => r.key)]);   // visible in the log, not silent
+            return { error: msg };
+        }
+        const r = await q(`INSERT INTO pos_sms_log (business_id, shop_id, kind, to_phone, body, dedupe_key) SELECT $1,$2,$3,t.phone,t.body,t.key FROM unnest($4::text[], $5::text[], $6::text[]) AS t(phone, body, key)
+                           ON CONFLICT (business_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING id`, [bizId, shopId || null, kind, rows.map(r => r.phone), rows.map(r => r.body), rows.map(r => r.key)]);
+        setImmediate(() => drainSms().catch(e => console.error('SMS send failed:', e.message)));
+        return { ok: r.rowCount, dup: rows.length - r.rowCount };
+    }
+    let draining = false;
+    async function drainSms() {
+        if (draining) return; draining = true;
+        const deadline = Date.now() + 50000;   // keep going while there is work; the next check picks up the rest
+        try {
+            // a message stuck in "sending" after a crash may or may not have gone out: never send it again by itself, ask the owner
+            await q(`UPDATE pos_sms_log SET status='unknown', error='Not sure if this was sent (the server stopped while sending). Check with your SMS company, then use Send again.' WHERE status='sending' AND claimed_at < now() - interval '10 minutes'`);
+            const cache = new Map();
+            const settingsFor = async id => { if (!cache.has(id)) cache.set(id, await loadSms(id)); return cache.get(id); };
+            while (Date.now() < deadline) {
+                // receipts, alerts and tests always go first; promotions fill the rest
+                const rows = (await q(`UPDATE pos_sms_log SET status='sending', claimed_at=now(), attempts=attempts+1 WHERE id IN (SELECT id FROM pos_sms_log WHERE status='queued' AND (next_try IS NULL OR next_try <= now()) ORDER BY (kind = 'promo'), id LIMIT 30 FOR UPDATE SKIP LOCKED) RETURNING *`)).rows;
+                if (!rows.length) break;
+                // opt-outs are re-checked right now: someone who replied STOP after the promotion was queued must not get it
+                const promoRows = rows.filter(m => m.kind === 'promo');
+                if (promoRows.length) {
+                    const still = new Set((await q(`SELECT business_id || ':' || phone AS k FROM pos_customers WHERE optin AND (business_id, phone) IN (SELECT * FROM unnest($1::int[], $2::text[]))`, [promoRows.map(m => m.business_id), promoRows.map(m => m.to_phone)])).rows.map(r => r.k));
+                    const skip = promoRows.filter(m => !still.has(m.business_id + ':' + m.to_phone));
+                    if (skip.length) await q(`UPDATE pos_sms_log SET status='skipped', error='Customer opted out before this was sent' WHERE id = ANY($1::bigint[])`, [skip.map(m => m.id)]);
+                    const skipIds = new Set(skip.map(m => m.id)); rows.splice(0, rows.length, ...rows.filter(m => !skipIds.has(m.id)));
+                }
+                for (let i = 0; i < rows.length; i += 15) {
+                    await Promise.all(rows.slice(i, i + 15).map(async m => {
+                        const s = await settingsFor(m.business_id);
+                        if (!smsReady(s)) return q(`UPDATE pos_sms_log SET status='failed', error='SMS is switched off or not connected' WHERE id=$1`, [m.id]);
+                        const r = await SMS.send(s.cfg, s.secrets, m.to_phone, m.body);
+                        if (r.ok) return q(`UPDATE pos_sms_log SET status='sent', provider_ref=$2, sent_at=now(), error='' WHERE id=$1`, [m.id, r.ref]);
+                        if (r.unknown) return q(`UPDATE pos_sms_log SET status='unknown', error=$2 WHERE id=$1`, [m.id, String(r.error).slice(0, 160)]);
+                        if (r.transient && m.attempts < 3) return q(`UPDATE pos_sms_log SET status='queued', next_try = now() + make_interval(secs => $2::int), error=$3 WHERE id=$1`, [m.id, 30 * m.attempts, String(r.error).slice(0, 160)]);
+                        return q(`UPDATE pos_sms_log SET status='failed', error=$2 WHERE id=$1`, [m.id, String(r.error).slice(0, 160)]);
+                    }));
+                }
+            }
+        } finally { draining = false; }
+    }
+    const newToken = () => crypto.randomBytes(8).toString('hex');
+    // Saves or updates a customer. "reconsent" is only true when the customer ticked the box in person at the till.
+    async function saveCustomer(bizId, phone, optin, name, { reconsent = false, sale = null } = {}) {
+        const src = typeof optin === 'string' ? optin.slice(0, 12) : 'terminal';
+        let want = Boolean(optin);
+        // someone who stopped can only be added back by ticking the box in person at the till: never by import or by typing them in
+        if (want && !reconsent && (await q('SELECT 1 FROM pos_sms_suppress WHERE business_id=$1 AND phone=$2', [bizId, phone])).rowCount) want = false;
+        const r = await q(`INSERT INTO pos_customers (business_id, phone, name, token, optin, optin_at, optin_source, last_sale_at, sales_count, spent_cents) VALUES ($1,$2,$3,$4,$5::boolean, CASE WHEN $5::boolean THEN now() END, CASE WHEN $5::boolean THEN $6 ELSE '' END, CASE WHEN $8::bigint IS NULL THEN NULL ELSE now() END, CASE WHEN $8::bigint IS NULL THEN 0 ELSE 1 END, COALESCE($8::bigint, 0))
+            ON CONFLICT (business_id, phone) DO UPDATE SET
+                last_sale_at = CASE WHEN $8::bigint IS NULL THEN pos_customers.last_sale_at ELSE now() END,
+                sales_count = pos_customers.sales_count + CASE WHEN $8::bigint IS NULL THEN 0 ELSE 1 END,
+                spent_cents = pos_customers.spent_cents + COALESCE($8::bigint, 0),
+                name = CASE WHEN pos_customers.name = '' THEN EXCLUDED.name ELSE pos_customers.name END,
+                optin = CASE WHEN pos_customers.optout_at IS NOT NULL AND NOT $7::boolean THEN FALSE ELSE pos_customers.optin OR EXCLUDED.optin END,
+                optin_at = CASE WHEN EXCLUDED.optin AND NOT pos_customers.optin AND (pos_customers.optout_at IS NULL OR $7::boolean) THEN now() ELSE pos_customers.optin_at END,
+                optin_source = CASE WHEN EXCLUDED.optin AND NOT pos_customers.optin AND (pos_customers.optout_at IS NULL OR $7::boolean) THEN $6 ELSE pos_customers.optin_source END,
+                optout_at = CASE WHEN EXCLUDED.optin AND $7::boolean THEN NULL ELSE pos_customers.optout_at END
+            RETURNING id, optin`, [bizId, phone, String(name || '').slice(0, 80), newToken(), want, src, reconsent, sale]);
+        if (want && reconsent) await q('DELETE FROM pos_sms_suppress WHERE business_id=$1 AND phone=$2', [bizId, phone]);   // they asked to join again, in person
+        return r.rows[0];
+    }
+    // after a sale is saved: remember the customer, and send the receipt SMS when the shop has it switched on
+    async function afterSale({ biz, shop, saleId, no, total, method, mref, phone, optin }) {
+        try {
+            if (!phone) return;
+            await saveCustomer(biz.id, phone, Boolean(optin), '', { reconsent: Boolean(optin), sale: Number(total) || 0 });   // a tick at the till is the customer agreeing in person
+            const s = await loadSms(biz.id);
+            if (!smsReady(s) || !s.send_receipts) return;
+            await queueSms(biz.id, shop.id, 'receipt', [{ phone, key: 'receipt:' + saleId, body: `${biz.name}: Receipt #${no}, KES ${fmt(total)} paid by ${method === 'cash' ? 'cash' : 'M-Pesa'}${mref ? ' (' + mref + ')' : ''}. Thank you!` }], s);
+        } catch (e) { console.error('SMS after-sale step failed:', e.message); }
+    }
+    // owner alerts. Each is sent once per day, and if the server was down at the usual hour it is sent when it is back:
+    //   daily sales: from 8pm (if still due the next morning, yesterday's is sent), low stock: from 8am
+    const ymdAdd = (ymd, days) => new Date(Date.parse(ymd + 'T00:00:00Z') + days * 86400000).toISOString().slice(0, 10);
+    async function smsAlerts() {
+        const hour = new Date(Date.now() + 3 * 3600e3).getUTCHours(), today = todayNairobi();
+        const dailyDay = hour >= 20 ? today : ymdAdd(today, -1), lowDue = hour >= 8;
+        const list = (await q(`SELECT s.*, b.name AS biz_name FROM pos_sms_settings s JOIN pos_shops b ON b.id = s.business_id WHERE s.enabled AND s.alert_phone <> '' AND ((s.alert_daily AND (s.last_daily IS NULL OR s.last_daily < $1::date)) OR ($3::boolean AND s.alert_low AND (s.last_low IS NULL OR s.last_low < $2::date)))`, [dailyDay, today, lowDue])).rows;
+        for (const s of list) {
+            if (s.alert_daily && (await q('UPDATE pos_sms_settings SET last_daily=$2::date WHERE business_id=$1 AND (last_daily IS NULL OR last_daily < $2::date) RETURNING 1', [s.business_id, dailyDay])).rowCount) {
+                const t = (await q(`SELECT count(*)::int n, COALESCE(sum(x.total_cents),0)::bigint total, COALESCE(sum(x.total_cents) FILTER (WHERE x.method='cash'),0)::bigint cash FROM pos_sales x JOIN pos_shops sh ON sh.id = x.shop_id WHERE (sh.id=$1 OR sh.parent_id=$1) AND x.status='completed' AND (x.created_at AT TIME ZONE '${TZ}')::date = $2`, [s.business_id, dailyDay])).rows[0];
+                await queueSms(s.business_id, null, 'alert', [{ phone: s.alert_phone, key: 'daily:' + dailyDay, body: `${s.biz_name} ${dailyDay === today ? 'today' : 'on ' + dailyDay}: ${t.n} sale${t.n === 1 ? '' : 's'}, KES ${fmt(t.total)} (cash ${fmt(t.cash)}, M-Pesa ${fmt(Number(t.total) - Number(t.cash))}).` }], s);
+            }
+            if (lowDue && s.alert_low && (await q('UPDATE pos_sms_settings SET last_low=$2::date WHERE business_id=$1 AND (last_low IS NULL OR last_low < $2::date) RETURNING 1', [s.business_id, today])).rowCount) {
+                const low = (await q(`SELECT i.name, i.stock FROM pos_items i JOIN pos_shops sh ON sh.id = i.shop_id WHERE (sh.id=$1 OR sh.parent_id=$1) AND i.active AND i.track_stock AND i.stock <= i.reorder_level ORDER BY i.stock, i.name LIMIT 40`, [s.business_id])).rows;
+                if (low.length) await queueSms(s.business_id, null, 'alert', [{ phone: s.alert_phone, key: 'low:' + today, body: `Low stock at ${s.biz_name}: ${low.slice(0, 6).map(i => `${i.name} (${i.stock})`).join(', ')}${low.length > 6 ? ` and ${low.length - 6} more` : ''}.` }], s);
+            }
+        }
+    }
+    // who a promotion goes to. Always only people who agreed (and have not since stopped).
+    const SEGMENTS = {
+        all: ['Everyone who agreed', 'c.optin'],
+        recent: ['Bought in the last 30 days', `c.optin AND c.last_sale_at > now() - interval '30 days'`],
+        lapsed: ['Not bought for 60+ days (win them back)', `c.optin AND c.last_sale_at IS NOT NULL AND c.last_sale_at < now() - interval '60 days'`],
+        newer: ['Joined in the last 14 days', `c.optin AND c.created_at > now() - interval '14 days'`],
+        regulars: ['Regulars (5 or more purchases)', 'c.optin AND c.sales_count >= 5']
+    };
+    const audienceFor = async (bizId, segment) => (await q(`SELECT c.phone, c.token, c.name FROM pos_customers c WHERE c.business_id=$1 AND ${SEGMENTS[segment][1]} ORDER BY c.id LIMIT 5000`, [bizId])).rows;
+    const firstName = n => { const w = String(n || '').trim().split(/\s+/)[0].replace(/[^A-Za-z'-]/g, '').slice(0, 20); return w ? w[0].toUpperCase() + w.slice(1) : 'friend'; };
+    const renderPromo = (biz, text, c) => { const t = text.replace(/\{\{name\}\}/gi, firstName(c.name)).replace(/\{\{shop\}\}/gi, biz.name); return `${/\{\{shop\}\}/i.test(text) ? '' : biz.name + ': '}${t} Stop: ${pubUrl('/pos/u/' + c.token)}`; };
+    const smsParts = len => len <= 160 ? 1 : Math.ceil(len / 153);
+
+    // ----- SMS settings page (owner only) -----
+    const SMS_STATUS_TAG = { queued: 'warn', sending: 'warn', sent: 'ok', failed: 'bad', unknown: 'warn', skipped: 'gray' };
+    router.get('/sms', ah(async (req, res) => {
+        const s = await loadSms(req.biz.id), fresh = stepFresh(req);
+        const [{ n: opted }, { n: total }] = [(await q('SELECT count(*)::int n FROM pos_customers WHERE business_id=$1 AND optin', [req.biz.id])).rows[0], (await q('SELECT count(*)::int n FROM pos_customers WHERE business_id=$1', [req.biz.id])).rows[0]];
+        const usedTx = await smsUsed(req.biz.id, false), usedPromo = await smsUsed(req.biz.id, true), plim = promoLimit(s);
+        const segCounts = (await q(`SELECT ${Object.entries(SEGMENTS).map(([k, v]) => `count(*) FILTER (WHERE ${v[1]})::int AS ${k}`).join(', ')} FROM pos_customers c WHERE c.business_id=$1`, [req.biz.id])).rows[0];
+        const log = (await q('SELECT id, kind, to_phone, status, error, body, created_at FROM pos_sms_log WHERE business_id=$1 ORDER BY id DESC LIMIT 40', [req.biz.id])).rows;
+        const cfg = (s && s.cfg) || {}, ready = smsReady(s), curProv = SMS.PROVIDERS[cfg.provider] ? cfg.provider : 'africastalking';
+        const unlock = !vault.enabled ? '<div class="alert" role="alert">SMS keys cannot be saved until the site administrator sets POS_CRED_KEY.</div>'
+            : !req.has2fa ? '<div class="alert" role="alert">Saving SMS keys and sending promotions need two-step login. <a href="/pos/security">Turn it on</a> (about a minute).</div>'
+            : fresh ? '<div class="alert ok" role="status">Unlocked: you can save SMS keys and send promotions for the next few minutes.</div>'
+            : `<div class="panel" style="max-width:720px"><form action="/pos/gateways/unlock" method="POST" class="row"><input type="hidden" name="to" value="sms"><div><label for="otp">Two-step code (needed to save keys or send promotions)</label><input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="20"></div><button class="btn" type="submit">Unlock</button></form></div>`;
+        send(req, res, { title: 'SMS & Promotions', nav: 'sms', body: `<h1>SMS & Promotions</h1>${notice(req)}${errBox(req)}${unlock}
+        <div class="panel" style="max-width:720px"><h2>1. Connect your SMS account${ready ? ' (' + esc(SMS.providerOf(cfg).label) + ')' : ''} ${ready ? '<span class="tag ok">on</span>' : '<span class="tag gray">off</span>'}</h2>
+            <p class="muted" style="margin-top:0">Messages are sent through <b>your own account</b> with the SMS company you pick, and are paid for from that account. Create the account on the company's website, then copy the keys here. Send yourself a test message before real customers.</p>
+            <form action="/pos/sms/connect" method="POST"><div class="field" style="max-width:320px"><label for="prov">SMS company</label><select id="prov" name="provider">${Object.entries(SMS.PROVIDERS).map(([k, v]) => `<option value="${k}"${curProv === k ? ' selected' : ''}>${esc(v.label)}</option>`).join('')}</select></div>
+            ${Object.entries(SMS.PROVIDERS).map(([k, v]) => `<div class="prov-box" data-prov="${k}"${curProv === k ? '' : ' hidden'}><p class="muted" style="margin:0 0 8px">${esc(v.help)}</p><div class="grid2">${v.fields.map(f => {
+                const val = f.secret ? '' : (curProv === k ? (cfg[f.key] || '') : '');
+                const input = f.textarea ? `<textarea name="f_${k}_${f.key}" rows="4" maxlength="1500" placeholder="${esc(f.hint || '')}">${esc(val)}</textarea>` : f.choices ? `<select name="f_${k}_${f.key}">${f.choices.map(([cv, cl]) => `<option value="${cv}"${(cfg[f.key] || f.choices[0][0]) === cv && curProv === k ? ' selected' : ''}>${esc(cl)}</option>`).join('')}</select>`
+                    : `<input name="f_${k}_${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" maxlength="200" value="${esc(val)}" ${f.optional || (f.secret && s && s.secrets && curProv === k) ? '' : 'required'} placeholder="${f.secret && s && s.secrets && curProv === k ? 'saved: leave blank to keep' : ''}">`;
+                return `<div class="field"><label>${esc(f.label)}</label>${input}${f.hint && !f.textarea ? `<small>${esc(f.hint)}</small>` : ''}</div>`; }).join('')}</div></div>`).join('')}
+                <script nonce="${req.nonce || ''}">(function(){var s=document.getElementById('prov');function u(){[].forEach.call(document.querySelectorAll('.prov-box'),function(b){var on=b.getAttribute('data-prov')===s.value;b.hidden=!on;[].forEach.call(b.querySelectorAll('input,select'),function(i){i.disabled=!on;});});}s.addEventListener('change',u);u();})();</script>
+                <label style="display:block;margin:6px 0"><input type="checkbox" name="enabled" value="1" style="width:auto" ${s && s.enabled ? 'checked' : ''}> Switch SMS on for this business</label>
+                <button class="btn" type="submit">Save</button>
+                ${s && s.secrets ? '<button class="btn ghost" type="submit" formaction="/pos/sms/check">Check the keys</button>' : ''}</form></div>
+        <div class="panel" style="max-width:720px"><h2>2. What to send automatically</h2>
+            <form action="/pos/sms/options" method="POST">
+                <label style="display:block;margin:6px 0"><input type="checkbox" name="send_receipts" value="1" style="width:auto" ${!s || s.send_receipts ? 'checked' : ''}> Send an SMS receipt when the cashier enters the customer's phone number</label>
+                <div class="field"><label for="ap">Your own phone number (for alerts to you)</label><input id="ap" name="alert_phone" type="tel" maxlength="20" value="${esc((s && s.alert_phone) || '')}" placeholder="0712345678"></div>
+                <label style="display:block;margin:6px 0"><input type="checkbox" name="alert_daily" value="1" style="width:auto" ${s && s.alert_daily ? 'checked' : ''}> Text me the day's sales total at 8pm</label>
+                <label style="display:block;margin:6px 0"><input type="checkbox" name="alert_low" value="1" style="width:auto" ${s && s.alert_low ? 'checked' : ''}> Text me the low-stock list at 8am</label>
+                <div class="field" style="max-width:320px"><label for="pl">Most promotion messages per day</label><input id="pl" name="promo_daily_limit" type="number" min="1" max="${SMS_PROMO_CAP}" value="${plim}"><small>Receipts and alerts have their own limit (${SMS_TX_CAP} a day) and are never held back by promotions. Highest you can set: ${SMS_PROMO_CAP}.</small></div>
+                <button class="btn" type="submit">Save</button>
+                ${ready && s.alert_phone ? '<button class="btn ghost" type="submit" formaction="/pos/sms/test-send">Send myself a test SMS</button>' : ''}</form></div>
+        <div class="panel" style="max-width:720px"><h2>3. Send a promotion</h2>
+            ${ready ? `<p class="muted" style="margin-top:0">Only customers who agreed (and have not stopped) can receive this. Every message ends with a link to stop. Promotions today: <b>${usedPromo}</b> of ${plim}. Receipts and alerts today: ${usedTx} of ${SMS_TX_CAP}.</p>
+            <form action="/pos/sms/promo/preview" method="POST"><div class="field" style="max-width:420px"><label for="seg">Who should get it?</label><select id="seg" name="segment">${Object.entries(SEGMENTS).map(([k, v]) => `<option value="${k}">${esc(v[0])} (${segCounts[k]})</option>`).join('')}</select></div>
+            <div class="field"><label for="m">Message (10 to 200 letters, no emojis)</label><textarea id="m" name="message" rows="3" maxlength="200" required placeholder="e.g. Hi {{name}}, this weekend: 10% off all drinks at {{shop}}!"></textarea><small>You can type {{name}} for the customer's first name and {{shop}} for your business name. Without {{shop}}, your business name is added at the start. The stop link is added at the end.</small></div>
+            <button class="btn" type="submit">Preview</button> <small class="muted">You see exactly who and what before anything is sent.</small></form>` : '<p class="muted">Connect and switch on SMS first (step 1).</p>'}</div>
+        <div class="panel tablewrap"><h2>Recent messages</h2>${log.length ? `<table><tr><th>When</th><th>To</th><th>Type</th><th>Message</th><th>Status</th><th></th></tr>${log.map(l => `<tr><td class="nowrap">${esc(timeFmt(l.created_at))}</td><td class="nowrap">${esc(l.to_phone)}</td><td>${esc(l.kind)}</td><td>${esc(String(l.body).slice(0, 80))}${l.body.length > 80 ? '...' : ''}</td><td><span class="tag ${SMS_STATUS_TAG[l.status] || 'gray'}">${esc(l.status)}</span>${l.error ? ' <small>' + esc(l.error) + '</small>' : ''}</td><td>${l.status === 'unknown' || l.status === 'failed' ? `<form action="/pos/sms/log/${l.id}/retry" method="POST"><button class="btn small ghost" type="submit">Send again</button></form>` : ''}</td></tr>`).join('')}</table>` : '<p class="muted">No messages yet.</p>'}</div>` });
+    }));
+    router.post('/sms/connect', ah(async (req, res) => {
+        if (!vault.enabled) return back(res, '/pos/sms', '', 'SMS keys cannot be saved until the site administrator sets POS_CRED_KEY.');
+        if (needStep(req, res, '/pos/sms')) return;
+        const old = await loadSms(req.biz.id), b = req.body || {};
+        const prov = SMS.PROVIDERS[b.provider] ? b.provider : '', P = SMS.PROVIDERS[prov];
+        if (!P) return back(res, '/pos/sms', '', 'Choose your SMS company.');
+        const sameProv = old && old.cfg && (old.cfg.provider || 'africastalking') === prov;
+        const cfg = { provider: prov }, apiSecrets = {};
+        for (const f of P.fields) {
+            let v = str(b[`f_${prov}_${f.key}`]);
+            if (f.secret && !v && sameProv && old.secrets) v = old.secrets[f.key] || '';   // blank means "keep what is saved"
+            if (f.choices && !f.choices.some(c => c[0] === v)) v = f.choices[0][0];
+            if (!(f.optional && !v) && f.re && !f.re.test(v)) return back(res, '/pos/sms', '', f.bad || ('Check the ' + f.label + '.'));
+            if (f.secret) apiSecrets[f.key] = v; else cfg[f.key] = v;
+        }
+        if (['other', 'login', 'signed'].includes(prov)) {
+            const sample = { to: '254700000000', plus_to: '+254700000000', message: 'test', sender: 'x', key: 'x', token: 'x', user: 'x', pass: 'x', timestamp: '1', body: '{}', signature: 'x' };
+            const jsonOf = (tpl) => { try { JSON.parse(SMS.fill(tpl, sample, 'json')); return true; } catch (_) { return false; } };
+            if (cfg.method === 'POST' && cfg.format === 'json' && cfg.body && !jsonOf(cfg.body)) return back(res, '/pos/sms', '', 'The JSON body is not valid JSON. Check the quotes and commas.');
+            if (prov === 'login' && cfg.format === 'json' && !jsonOf(cfg.loginBody)) return back(res, '/pos/sms', '', 'The login body is not valid JSON. Check the quotes and commas.');
+            if (cfg.method === 'POST' && !cfg.body) return back(res, '/pos/sms', '', 'A POST needs a body. Copy it from the company\'s API page.');
+            if (!/\{\{message\}\}/.test(cfg.url + cfg.body)) return back(res, '/pos/sms', '', 'The address or body must contain {{message}} so the text can be inserted.');
+            if (!/\{\{(to|plus_to)\}\}/.test(cfg.url + cfg.body)) return back(res, '/pos/sms', '', 'The address or body must contain {{to}} so the phone number can be inserted.');
+            if (prov === 'login' && !/\{\{token\}\}/.test(cfg.url + cfg.body + cfg.headerValue)) return back(res, '/pos/sms', '', 'Use {{token}} in the send address, body or header value, so the login token is used.');
+        }
+        await q(`INSERT INTO pos_sms_settings (business_id, cfg, secrets, enabled) VALUES ($1,$2::jsonb,$3,$4)
+                 ON CONFLICT (business_id) DO UPDATE SET cfg=EXCLUDED.cfg, secrets=EXCLUDED.secrets, enabled=EXCLUDED.enabled, updated_at=now()`, [req.biz.id, JSON.stringify(cfg), vault.seal(apiSecrets, `${req.biz.id}:sms`), b.enabled === '1']);
+        await audit(req, 'sms.connect', `${prov}, ${b.enabled === '1' ? 'on' : 'off'}`);   // never the key
+        alertOwner(req, 'SMS account details were saved' + (b.enabled === '1' ? ' and SMS was switched on' : ''));
+        try { const bal = await SMS.balance(cfg, apiSecrets); back(res, '/pos/sms', 'Saved. ' + (/^balance/.test(bal) ? 'The keys were accepted (' + bal + ').' : 'Note: ' + bal + '.')); }
+        catch (e) { back(res, '/pos/sms', 'Saved, but the keys were NOT accepted (' + String(e.message).slice(0, 80) + '). Check them and save again.'); }
+    }));
+    router.post('/sms/check', ah(async (req, res) => {
+        const s = await loadSms(req.biz.id);
+        if (!s || !s.secrets) return back(res, '/pos/sms', '', 'Save your keys first.');
+        try { const bal = await SMS.balance(s.cfg, s.secrets); back(res, '/pos/sms', /^balance/.test(bal) ? 'The keys work: ' + bal : 'Note: ' + bal); } catch (e) { back(res, '/pos/sms', '', String(e.message).slice(0, 120)); }
+    }));
+    router.post('/sms/options', ah(async (req, res) => {
+        const b = req.body || {}, phoneRaw = str(b.alert_phone).replace(/[\s-]/g, ''), phone = phoneRaw ? kePhone(phoneRaw) : '';
+        if (phoneRaw && !phone) return back(res, '/pos/sms', '', 'Your alert phone number is not valid. Use a Kenyan number such as 0712345678.');
+        const lim = b.promo_daily_limit === undefined || b.promo_daily_limit === '' ? null : parseCount(b.promo_daily_limit, { min: 1, max: SMS_PROMO_CAP });
+        if (b.promo_daily_limit !== undefined && b.promo_daily_limit !== '' && lim === null) return back(res, '/pos/sms', '', `The promotion limit must be a number from 1 to ${SMS_PROMO_CAP}.`);
+        // turning an alert on starts from the next normal time: it does not fire at once for a time that already passed
+        const hour = new Date(Date.now() + 3 * 3600e3).getUTCHours(), today = todayNairobi(), yest = ymdAdd(today, -1);
+        const r = await q(`UPDATE pos_sms_settings SET send_receipts=$2, alert_phone=$3,
+              last_daily = CASE WHEN $4::boolean AND NOT alert_daily THEN (CASE WHEN $6::int >= 20 THEN $8::date ELSE $9::date END) ELSE last_daily END, alert_daily=$4,
+              last_low = CASE WHEN $5::boolean AND NOT alert_low THEN (CASE WHEN $6::int >= 8 THEN $8::date ELSE $9::date END) ELSE last_low END, alert_low=$5,
+              promo_daily_limit = COALESCE($7::int, promo_daily_limit), updated_at=now() WHERE business_id=$1`,
+            [req.biz.id, b.send_receipts === '1', phone, b.alert_daily === '1', b.alert_low === '1', hour, lim, today, yest]);
+        if (!r.rowCount) return back(res, '/pos/sms', '', 'Connect your SMS account first (step 1).');
+        await audit(req, 'sms.options', `receipts ${b.send_receipts === '1' ? 'on' : 'off'}, alerts ${b.alert_daily === '1' ? 'daily ' : ''}${b.alert_low === '1' ? 'low-stock' : ''}${lim ? ', promo limit ' + lim : ''}`.trim());
+        back(res, '/pos/sms', 'Saved.');
+    }));
+    router.post('/sms/test-send', ah(async (req, res) => {
+        const s = await loadSms(req.biz.id);
+        if (!smsReady(s) || !s.alert_phone) return back(res, '/pos/sms', '', 'Switch SMS on and save your phone number first.');
+        if ((await q(`SELECT count(*) n FROM pos_sms_log WHERE business_id=$1 AND kind='test' AND created_at > now() - interval '1 hour'`, [req.biz.id])).rows[0].n >= 5) return back(res, '/pos/sms', '', 'Enough test messages for now. Try again in an hour.');
+        const r = await queueSms(req.biz.id, req.shop.id, 'test', [{ phone: s.alert_phone, body: `${req.biz.name}: this is a test message from your POS.` }]);
+        back(res, '/pos/sms', r.error ? '' : 'Test message queued. It should arrive in a few seconds (see Recent messages).', r.error || '');
+    }));
+    // Step 1: the owner writes the message and picks a group. Nothing is sent: a draft is saved and shown back with the real numbers.
+    router.post('/sms/promo/preview', ah(async (req, res) => {
+        if (needStep(req, res, '/pos/sms')) return;
+        const s = await loadSms(req.biz.id);
+        if (!smsReady(s)) return back(res, '/pos/sms', '', 'Connect and switch on SMS first.');
+        const seg = SEGMENTS[req.body.segment] ? req.body.segment : '', text = SMS.clean(req.body.message).replace(/\n+/g, ' ');
+        if (!seg) return back(res, '/pos/sms', '', 'Choose who should get the message.');
+        if (text.length < 10 || text.length > 200) return back(res, '/pos/sms', '', 'The message must be between 10 and 200 letters (plain text, no emojis).');
+        const bad = text.match(/\{\{\s*([a-z_]*)\s*\}\}/gi);
+        if (bad && bad.some(t => !/^\{\{(name|shop)\}\}$/i.test(t))) return back(res, '/pos/sms', '', 'Only {{name}} and {{shop}} can be used in the message.');
+        const fp = crypto.createHash('sha256').update(seg + '|' + text).digest('hex');
+        const id = (await q('INSERT INTO pos_sms_campaigns (business_id, segment, message, fingerprint, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING id', [req.biz.id, seg, text, fp, String(req.actor.name || '').slice(0, 80)])).rows[0].id;
+        res.redirect('/pos/sms/promo/' + id);
+    }));
+    router.get('/sms/promo/:id', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const c = id ? (await q('SELECT * FROM pos_sms_campaigns WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rows[0] : null;
+        if (!c) return back(res, '/pos/sms', '', 'That promotion was not found.');
+        const s = await loadSms(req.biz.id), aud = await audienceFor(req.biz.id, c.segment), used = await smsUsed(req.biz.id, true), plim = promoLimit(s);
+        const sample = aud.length ? renderPromo(req.biz, c.message, aud[0]) : '', longest = aud.reduce((m, x) => Math.max(m, renderPromo(req.biz, c.message, x).length), 0);
+        const recent = (await q(`SELECT 1 FROM pos_sms_campaigns WHERE business_id=$1 AND fingerprint=$2 AND id<>$3 AND status IN ('sending','sent') AND created_at > now() - interval '24 hours' LIMIT 1`, [req.biz.id, c.fingerprint, c.id])).rowCount;
+        const over = used + aud.length > plim, can = c.status === 'draft' && aud.length && !over && !recent && Date.now() - new Date(c.created_at) < 3600e3;
+        send(req, res, { title: 'Check your promotion', nav: 'sms', body: `<h1>Check your promotion</h1>${notice(req)}${errBox(req)}
+        <div class="panel" style="max-width:720px">
+            <p><b>Who:</b> ${esc(SEGMENTS[c.segment][0])}: <b>${aud.length}</b> customer${aud.length === 1 ? '' : 's'} (each one agreed, and none has stopped)</p>
+            <p><b>What the first customer receives:</b></p><p style="background:#f1f5f9;padding:10px;border-radius:8px;word-break:break-word">${esc(sample) || '<i>nobody in this group</i>'}</p>
+            <p class="muted">Longest message: ${longest} characters, which your SMS company may bill as ${smsParts(longest)} message${smsParts(longest) === 1 ? '' : 's'} each. Promotions today: ${used} of ${plim}. This would use ${aud.length}.</p>
+            ${c.status !== 'draft' ? `<div class="alert" role="status">This promotion was already ${esc(c.status)}. It cannot be sent again.</div>`
+            : over ? `<div class="alert" role="alert">This would pass today's limit of ${plim}. Choose a smaller group, or try tomorrow.</div>`
+            : recent ? '<div class="alert" role="alert">The same message was already sent to this group in the last 24 hours, so it is blocked. Change the message or the group.</div>'
+            : !aud.length ? '<div class="alert" role="alert">Nobody in this group can receive it.</div>'
+            : !can ? '<div class="alert" role="alert">This preview is more than an hour old. Start again.</div>' : ''}
+            <form action="/pos/sms/promo/${c.id}/send" method="POST" class="row"><label style="display:block;margin:6px 0;width:100%"><input type="checkbox" name="confirm" value="1" style="width:auto" required> I confirm these customers agreed to get messages from my shop.</label>
+            <button class="btn ok" type="submit" ${can ? '' : 'disabled'}>Send to ${aud.length} customer${aud.length === 1 ? '' : 's'}</button> <a class="btn ghost" href="/pos/sms">Back</a></form></div>` });
+    }));
+    // Step 2: send. The draft is claimed with one atomic UPDATE, so a double-click, a second tab or a refresh can only ever send it once.
+    router.post('/sms/promo/:id/send', ah(async (req, res) => {
+        if (needStep(req, res, '/pos/sms')) return;
+        const id = parseCount(req.params.id, { min: 1 }), page = '/pos/sms/promo/' + id;
+        if (!id) return back(res, '/pos/sms', '', 'That promotion was not found.');
+        if (req.body.confirm !== '1') return back(res, page, '', 'Tick the box to confirm your customers agreed to get messages.');
+        const s = await loadSms(req.biz.id);
+        if (!smsReady(s)) return back(res, '/pos/sms', '', 'Connect and switch on SMS first.');
+        const claimed = (await q(`UPDATE pos_sms_campaigns c SET status='sending' WHERE c.id=$1 AND c.business_id=$2 AND c.status='draft' AND c.created_at > now() - interval '1 hour'
+              AND NOT EXISTS (SELECT 1 FROM pos_sms_campaigns o WHERE o.business_id=c.business_id AND o.fingerprint=c.fingerprint AND o.id<>c.id AND o.status IN ('sending','sent') AND o.created_at > now() - interval '24 hours') RETURNING *`, [id, req.biz.id])).rows[0];
+        if (!claimed) return back(res, page, '', 'This promotion was already sent, was sent in the last 24 hours, or the preview is too old.');
+        const aud = await audienceFor(req.biz.id, claimed.segment), today = todayNairobi();
+        const r = aud.length ? await queueSms(req.biz.id, req.shop.id, 'promo', aud.map(c => ({ phone: c.phone, key: `promo:${claimed.fingerprint.slice(0, 20)}:${today}:${c.phone}`, body: renderPromo(req.biz, claimed.message, c) })), s) : { error: 'Nobody in this group can receive it.' };
+        if (r.error) { await q(`UPDATE pos_sms_campaigns SET status='draft' WHERE id=$1`, [id]); return back(res, page, '', r.error); }
+        await q(`UPDATE pos_sms_campaigns SET status='sent', queued=$2 WHERE id=$1`, [id, r.ok]);
+        await audit(req, 'sms.promo', `${r.ok} customers (${claimed.segment}): ${claimed.message.slice(0, 80)}`);
+        alertOwner(req, `A promotional SMS was queued for ${r.ok} customers`);
+        back(res, '/pos/sms', `Sending to ${r.ok} customer${r.ok === 1 ? '' : 's'}${r.dup ? ` (${r.dup} skipped: already sent today)` : ''}. Watch the status under Recent messages.`);
+    }));
+    // a message that failed, or may or may not have been sent, is only sent again when the owner says so
+    router.post('/sms/log/:id/retry', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const r = id ? await q(`UPDATE pos_sms_log SET status='queued', attempts=0, next_try=NULL, error='' WHERE id=$1 AND business_id=$2 AND status IN ('unknown','failed')`, [id, req.biz.id]) : { rowCount: 0 };
+        if (r.rowCount) { await audit(req, 'sms.retry', '#' + id); setImmediate(() => drainSms().catch(() => {})); }
+        back(res, '/pos/sms', r.rowCount ? 'Queued to send again.' : 'That message cannot be sent again.');
+    }));
+
+    // ----- customers (owner and managers; cashiers only if the owner allows it) -----
+    router.get('/customers', ah(async (req, res) => {
+        const search = str(req.query.q).slice(0, 40), like = '%' + search.replace(/[%_\\]/g, ' ') + '%';
+        const rows = (await q(`SELECT id, name, phone, optin, optin_at, optout_at, last_sale_at FROM pos_customers WHERE business_id=$1 AND ($2 = '%%' OR name ILIKE $2 OR phone LIKE $2) ORDER BY last_sale_at DESC NULLS LAST, id DESC LIMIT 300`, [req.biz.id, like])).rows;
+        const opted = (await q('SELECT count(*)::int n FROM pos_customers WHERE business_id=$1 AND optin', [req.biz.id])).rows[0].n;
+        send(req, res, { title: 'Customers', nav: 'customers', body: `<h1>Customers</h1>${notice(req)}${errBox(req)}
+        <div class="panel"><form method="GET" class="row"><div><label for="q">Search name or phone</label><input id="q" name="q" value="${esc(search)}"></div><button class="btn" type="submit">Search</button></form>
+            <p class="muted" style="margin-bottom:0">${opted} customer${opted === 1 ? '' : 's'} agreed to receive offers by SMS. Customers are added when a cashier enters a phone number at the terminal.</p></div>
+        <div class="panel" style="max-width:720px"><h2>Add a customer</h2><form action="/pos/customers" method="POST"><div class="grid2"><div class="field"><label for="cn">Name</label><input id="cn" name="name" maxlength="80"></div><div class="field"><label for="cp">Phone</label><input id="cp" name="phone" type="tel" required maxlength="20" placeholder="0712345678"></div></div>
+            <label style="display:block;margin:6px 0"><input type="checkbox" name="optin" value="1" style="width:auto"> This customer agreed to receive offers by SMS</label><button class="btn" type="submit">Save</button></form></div>
+        ${req.actor.role === 'owner' ? `<div class="panel" style="max-width:720px"><h2>Import a list</h2><form action="/pos/customers/import" method="POST"><div class="field"><label for="imp">One customer per line: phone, or name and phone (e.g. Jane, 0712345678). Up to 500 lines.</label><textarea id="imp" name="list" rows="5" maxlength="30000" required></textarea></div>
+            <label style="display:block;margin:6px 0"><input type="checkbox" name="optin" value="1" style="width:auto"> These customers agreed to receive offers by SMS</label>
+            <small class="muted">Anyone who ever replied STOP or used the stop link is never added back by an import, even if you tick the box.</small><p><button class="btn" type="submit">Import</button></p></form></div>` : ''}
+        <div class="panel tablewrap">${rows.length ? `<table><tr><th>Name</th><th>Phone</th><th>Offers by SMS</th><th>Last purchase</th><th></th></tr>${rows.map(c => `<tr><td>${esc(c.name || '-')}</td><td class="nowrap">${esc(c.phone)}</td><td>${c.optin ? `<span class="tag ok">agreed ${esc(dateFmt(c.optin_at))}</span>` : (c.optout_at ? `<span class="tag bad">stopped ${esc(dateFmt(c.optout_at))}</span>` : '<span class="tag gray">no</span>')}</td><td>${c.last_sale_at ? esc(dateFmt(c.last_sale_at)) : '-'}</td><td class="right">${c.optin ? `<form action="/pos/customers/${c.id}/stop" method="POST" style="display:inline"><button class="btn small ghost" type="submit">Stop offers</button></form> ` : ''}<form action="/pos/customers/${c.id}/delete" method="POST" style="display:inline"><button class="btn small bad" type="submit">Delete</button></form></td></tr>`).join('')}</table>` : '<p class="muted">No customers yet.</p>'}</div>` });
+    }));
+    router.post('/customers', ah(async (req, res) => {
+        const phone = kePhone(req.body.phone);
+        if (!phone) return back(res, '/pos/customers', '', 'The phone number is not valid. Use a Kenyan number such as 0712345678.');
+        await saveCustomer(req.biz.id, phone, req.body.optin === '1' ? 'manual' : false, req.body.name);
+        await audit(req, 'customer.add', phone.slice(0, 6) + '***' + (req.body.optin === '1' ? ' (agreed to SMS)' : ''));
+        back(res, '/pos/customers', 'Saved.');
+    }));
+    router.post('/customers/import', ah(async (req, res) => {
+        if (req.actor.role !== 'owner') return deny(req, res);
+        const agreed = req.body.optin === '1', seen = new Set(), items = [];
+        let badLines = 0;
+        for (const line of String(req.body.list || '').split(/\r?\n/).slice(0, 500)) {
+            if (!line.trim()) continue;
+            const parts = line.split(/[,;\t]/).map(x => x.trim()), phone = kePhone(parts[parts.length - 1]);
+            if (!phone) { badLines++; continue; }
+            if (seen.has(phone)) continue;
+            seen.add(phone); items.push({ phone, name: parts.length > 1 ? parts[0] : '' });
+        }
+        if (!items.length) return back(res, '/pos/customers', '', 'No valid Kenyan phone numbers were found. Use lines like 0712345678 or Jane, 0712345678.');
+        const stopped = new Set((await q(`SELECT phone FROM pos_sms_suppress WHERE business_id=$1 AND phone = ANY($2::text[]) UNION SELECT phone FROM pos_customers WHERE business_id=$1 AND optout_at IS NOT NULL AND phone = ANY($2::text[])`, [req.biz.id, items.map(i => i.phone)])).rows.map(r => r.phone));
+        let kept = 0;
+        for (const it of items) { await saveCustomer(req.biz.id, it.phone, agreed ? 'import' : false, it.name); if (agreed && stopped.has(it.phone)) kept++; }
+        await audit(req, 'customer.import', `${items.length} numbers${agreed ? ', agreed to SMS' : ''}${kept ? ', ' + kept + ' stayed stopped' : ''}`);
+        back(res, '/pos/customers', `Imported ${items.length} number${items.length === 1 ? '' : 's'}.${kept ? ` ${kept} had asked to stop before and stay stopped.` : ''}${badLines ? ` ${badLines} line${badLines === 1 ? ' was' : 's were'} not valid and skipped.` : ''}`);
+    }));
+    router.post('/customers/:id/stop', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        const r = id ? await q('UPDATE pos_customers SET optin=FALSE, optout_at=now() WHERE id=$1 AND business_id=$2 RETURNING phone', [id, req.biz.id]) : { rowCount: 0 };
+        if (r.rowCount) await q(`INSERT INTO pos_sms_suppress (business_id, phone, source) VALUES ($1,$2,'owner') ON CONFLICT DO NOTHING`, [req.biz.id, r.rows[0].phone]);
+        back(res, '/pos/customers', 'This customer will not get offers.');
+    }));
+    router.post('/customers/:id/delete', ah(async (req, res) => {
+        const id = parseCount(req.params.id, { min: 1 });
+        if (id && (await q('DELETE FROM pos_customers WHERE id=$1 AND business_id=$2', [id, req.biz.id])).rowCount) await audit(req, 'customer.delete', '#' + id);
+        back(res, '/pos/customers', 'Deleted.');
+    }));
+
     async function sweep() {
+        smsAlerts().catch(e => console.error('SMS alerts failed:', e.message));
+        drainSms().catch(e => console.error('SMS send failed:', e.message));
         const pend = (await q(`SELECT * FROM pos_payments WHERE status='pending' AND provider_ref IS NOT NULL AND created_at < now() - interval '25 seconds' AND created_at > now() - interval '30 minutes' ORDER BY created_at LIMIT 25`)).rows;
         for (const p of pend) {
             const gw = await loadGateway('id=$1', [p.gateway_id]);
@@ -2467,7 +2851,7 @@ ${platform && platform.mpesaConfigured() ? `<form action="/pos/subscribe" method
             }
         }
     }
-    if (process.env.POS_NO_JOBS !== '1') { const t = setInterval(() => sweep().catch(e => console.error('POS background check failed:', e.message)), 30000); if (t.unref) t.unref(); }
+    if (process.env.POS_NO_JOBS !== '1') { const d = setInterval(() => drainSms().catch(e => console.error('SMS send failed:', e.message)), 5000); if (d.unref) d.unref(); const t = setInterval(() => sweep().catch(e => console.error('POS background check failed:', e.message)), 30000); if (t.unref) t.unref(); }
 
     return { handlePlatformCallback };
 }
