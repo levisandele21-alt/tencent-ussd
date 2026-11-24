@@ -1,0 +1,1796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Solar Load Profile &amp; Sizing Calculator</title>
+  <style>
+    :root {
+      --navy-950: #091322;
+      --navy-900: #0f172a;
+      --navy-800: #1e293b;
+      --navy-700: #334155;
+      --slate-700: #334155;
+      --slate-600: #475569;
+      --slate-500: #64748b;
+      --slate-400: #94a3b8;
+      --slate-300: #cbd5e1;
+      --slate-200: #e2e8f0;
+      --slate-100: #f1f5f9;
+      --slate-50: #f8fafc;
+      --white: #ffffff;
+
+      --amber-600: #d97706;
+      --amber-500: #f59e0b;
+      --amber-400: #fbbf24;
+      --amber-100: #fef3c7;
+      --amber-50: #fffbeb;
+
+      --emerald-600: #059669;
+      --emerald-500: #10b981;
+      --emerald-100: #d1fae5;
+      --emerald-50: #ecfdf5;
+
+      --blue-600: #2563eb;
+      --blue-100: #dbeafe;
+      --blue-50: #eff6ff;
+
+      --rose-600: #e11d48;
+      --rose-50: #fff1f2;
+
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+      --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.07);
+      --shadow-lg: 0 12px 28px rgba(15, 23, 42, 0.14);
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: var(--font-sans);
+      background-color: var(--slate-50);
+      color: var(--navy-900);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .app-container { max-width: 1240px; margin: 0 auto; padding: 16px; }
+    @media (min-width: 768px) { .app-container { padding: 24px; } }
+
+    .app-header {
+      background: linear-gradient(135deg, var(--navy-950) 0%, var(--navy-800) 100%);
+      color: var(--white);
+      border-radius: var(--radius-lg);
+      padding: 20px 24px;
+      margin-bottom: 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      box-shadow: var(--shadow-md);
+    }
+    .brand-group { display: flex; align-items: center; gap: 14px; }
+    .brand-icon {
+      width: 44px; height: 44px; border-radius: 11px;
+      background: linear-gradient(135deg, var(--amber-400), var(--amber-600));
+      color: var(--navy-950);
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+      box-shadow: 0 4px 10px rgba(245, 158, 11, 0.35);
+    }
+    .brand-title { margin: 0; font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
+    .brand-subtitle { margin: 2px 0 0; font-size: 0.85rem; color: var(--slate-300); }
+    .header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+      padding: 9px 14px; font-size: 0.85rem; font-weight: 600;
+      border-radius: var(--radius-sm); border: 1px solid transparent; cursor: pointer;
+      transition: all 0.16s ease; font-family: inherit; white-space: nowrap; min-height: 38px;
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { background-color: var(--amber-500); color: var(--navy-950); border-color: var(--amber-500); }
+    .btn-primary:hover { background-color: var(--amber-400); }
+    .btn-header-ghost { background-color: rgba(255, 255, 255, 0.1); color: var(--white); border-color: rgba(255, 255, 255, 0.18); }
+    .btn-header-ghost:hover { background-color: rgba(255, 255, 255, 0.18); }
+    .btn-secondary { background-color: var(--white); color: var(--navy-800); border-color: var(--slate-300); }
+    .btn-secondary:hover { background-color: var(--slate-100); border-color: var(--slate-400); }
+    .btn-danger-ghost { background-color: transparent; color: var(--rose-600); border-color: var(--slate-200); }
+    .btn-danger-ghost:hover { background-color: var(--rose-50); border-color: #fecdd3; }
+    .btn-icon-only {
+      padding: 7px; min-width: 34px; min-height: 34px; border-radius: var(--radius-sm);
+      background: transparent; border: 1px solid transparent; color: var(--slate-500); cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; transition: all 0.15s ease;
+    }
+    .btn-icon-only:hover { background-color: var(--rose-50); color: var(--rose-600); }
+
+    .kpi-grid { display: grid; grid-template-columns: repeat(1, 1fr); gap: 14px; margin-bottom: 20px; }
+    @media (min-width: 600px) { .kpi-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (min-width: 1024px) { .kpi-grid { grid-template-columns: repeat(4, 1fr); } }
+
+    .kpi-card {
+      background: var(--white); border: 1px solid var(--slate-200); border-radius: var(--radius-md);
+      padding: 16px 18px; box-shadow: var(--shadow-sm);
+      display: flex; flex-direction: column; justify-content: space-between;
+      position: relative; overflow: hidden;
+    }
+    .kpi-card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--slate-300); }
+    .kpi-card.accent-amber::before { background: var(--amber-500); }
+    .kpi-card.accent-navy::before { background: var(--navy-800); }
+    .kpi-card.accent-emerald::before { background: var(--emerald-500); }
+    .kpi-card.accent-blue::before { background: var(--blue-600); }
+    .kpi-label {
+      font-size: 0.76rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--slate-500); margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    }
+    .kpi-value { font-size: 1.55rem; font-weight: 800; color: var(--navy-900); letter-spacing: -0.02em; line-height: 1.15; }
+    .kpi-sub { margin-top: 8px; font-size: 0.78rem; color: var(--slate-600); line-height: 1.4; }
+    .kpi-badge-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .mini-pill { font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
+    .mini-pill.essential { background: var(--emerald-50); color: var(--emerald-600); border: 1px solid var(--emerald-100); }
+    .mini-pill.non-essential { background: var(--slate-100); color: var(--slate-600); border: 1px solid var(--slate-200); }
+
+    .card {
+      background: var(--white); border: 1px solid var(--slate-200); border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-sm); margin-bottom: 20px; overflow: hidden;
+    }
+    .card-header {
+      padding: 14px 20px; border-bottom: 1px solid var(--slate-200); background: var(--white);
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .card-title { margin: 0; font-size: 1rem; font-weight: 700; color: var(--navy-900); display: flex; align-items: center; gap: 8px; }
+    .card-subtitle { margin: 2px 0 0; font-size: 0.8rem; color: var(--slate-500); }
+    .card-body { padding: 18px 20px; }
+
+    .preset-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+    .preset-chip {
+      display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border-radius: 999px;
+      border: 1px solid var(--slate-200); background: var(--slate-50); color: var(--navy-800);
+      font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease; font-family: inherit;
+    }
+    .preset-chip:hover { background: var(--amber-50); border-color: var(--amber-400); color: var(--navy-950); transform: translateY(-1px); }
+    .preset-watts {
+      font-size: 0.72rem; font-weight: 700; color: var(--slate-500); background: var(--white);
+      padding: 1px 6px; border-radius: 999px; border: 1px solid var(--slate-200);
+    }
+
+    .quick-entry-panel { background: var(--slate-50); border-bottom: 1px solid var(--slate-200); padding: 16px 20px; }
+    .quick-entry-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+    .quick-entry-label { font-size: 0.82rem; font-weight: 700; color: var(--navy-800); display: flex; align-items: center; gap: 6px; }
+    .converter-toggle-btn {
+      font-size: 0.78rem; font-weight: 600; color: var(--blue-600); background: var(--blue-50);
+      border: 1px solid var(--blue-100); padding: 5px 10px; border-radius: 999px; cursor: pointer;
+      font-family: inherit; transition: all 0.15s ease;
+    }
+    .converter-toggle-btn:hover { background: var(--blue-100); }
+    .converter-drawer {
+      display: none; background: var(--white); border: 1px solid var(--blue-100); border-left: 4px solid var(--blue-600);
+      border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 12px; gap: 14px; flex-wrap: wrap; align-items: flex-end;
+    }
+    .converter-drawer.open { display: flex; }
+    .conv-group { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; padding-right: 14px; border-right: 1px solid var(--slate-200); }
+    .conv-group:last-child { border-right: none; padding-right: 0; }
+    .mini-field { display: flex; flex-direction: column; gap: 3px; }
+    .mini-field label { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--slate-500); }
+    .mini-field input, .mini-field select {
+      padding: 6px 8px; border: 1px solid var(--slate-300); border-radius: var(--radius-sm);
+      font-size: 0.82rem; font-family: inherit; width: 82px; background: var(--white);
+    }
+    .quick-entry-grid { display: grid; grid-template-columns: 1fr; gap: 10px; align-items: end; }
+    @media (min-width: 768px) {
+      .quick-entry-grid { grid-template-columns: 2fr 1.25fr 0.65fr 0.9fr 1.1fr 0.85fr 1fr auto; }
+    }
+    .entry-field { display: flex; flex-direction: column; gap: 4px; }
+    .entry-field label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; color: var(--slate-600); }
+    .entry-field input, .entry-field select {
+      width: 100%; padding: 8px 10px; border: 1px solid var(--slate-300); border-radius: var(--radius-sm);
+      font-size: 0.85rem; font-family: inherit; color: var(--navy-900); background: var(--white); min-height: 38px;
+    }
+    .entry-field input:focus, .entry-field select:focus { outline: none; border-color: var(--amber-500); box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15); }
+
+    .table-toolbar {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 12px 20px; background: var(--white); border-bottom: 1px solid var(--slate-200);
+    }
+    .search-box-wrap { position: relative; flex: 1 1 240px; max-width: 340px; }
+    .search-box-wrap svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--slate-400); pointer-events: none; }
+    .search-input {
+      width: 100%; padding: 7px 10px 7px 32px; border: 1px solid var(--slate-300);
+      border-radius: var(--radius-sm); font-size: 0.84rem; font-family: inherit;
+    }
+    .search-input:focus { outline: none; border-color: var(--amber-500); }
+    .cat-tag {
+      display: inline-block; font-size: 0.69rem; font-weight: 700; padding: 2px 7px; border-radius: 4px;
+      background: var(--slate-100); color: var(--slate-600); margin-top: 4px;
+    }
+    .cat-subtotal-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 20px; background: var(--slate-50);
+      border-top: 1px solid var(--slate-200); font-size: 0.76rem;
+    }
+    .cat-sub-pill {
+      background: var(--white); border: 1px solid var(--slate-200); border-radius: 999px;
+      padding: 3px 10px; color: var(--navy-800); font-weight: 600;
+    }
+    .cat-sub-pill span { color: var(--emerald-600); font-weight: 700; }
+
+    .modal-dialog.library-dialog { max-width: 860px; max-height: 88vh; display: flex; flex-direction: column; }
+    .library-controls {
+      padding: 12px 20px; background: var(--slate-50); border-bottom: 1px solid var(--slate-200);
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .library-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+    .lib-tab {
+      padding: 6px 11px; border-radius: 999px; border: 1px solid var(--slate-300); background: var(--white);
+      color: var(--slate-600); font-size: 0.78rem; font-weight: 700; cursor: pointer; font-family: inherit; transition: all 0.15s ease;
+    }
+    .lib-tab.active { background: var(--navy-900); color: var(--white); border-color: var(--navy-900); }
+    .library-list { padding: 14px 20px; overflow-y: auto; display: grid; grid-template-columns: 1fr; gap: 8px; }
+    @media (min-width: 640px) { .library-list { grid-template-columns: repeat(2, 1fr); } }
+    .lib-item-card {
+      border: 1px solid var(--slate-200); border-radius: var(--radius-sm); padding: 10px 12px;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--white);
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .lib-item-card:hover { border-color: var(--amber-400); background: var(--amber-50); }
+    .lib-item-info { min-width: 0; }
+    .lib-item-title { font-size: 0.85rem; font-weight: 700; color: var(--navy-900); margin-bottom: 2px; }
+    .lib-item-specs { font-size: 0.75rem; color: var(--slate-500); }
+
+    .table-wrapper { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table.load-table { width: 100%; border-collapse: collapse; min-width: 820px; font-size: 0.86rem; }
+    .load-table th {
+      text-align: left; padding: 11px 12px; background: var(--slate-50); color: var(--slate-600);
+      font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+      border-bottom: 1px solid var(--slate-200); white-space: nowrap;
+    }
+    .load-table td { padding: 10px 12px; border-bottom: 1px solid var(--slate-100); vertical-align: middle; }
+    .load-table tbody tr:hover { background-color: #fafcff; }
+    .load-table tfoot td {
+      background: var(--slate-50); font-weight: 700; padding: 12px; border-top: 2px solid var(--slate-200); color: var(--navy-900);
+    }
+    .num-col { text-align: right; }
+    .center-col { text-align: center; }
+    .table-input {
+      width: 100%; padding: 7px 9px; border: 1px solid var(--slate-300); border-radius: var(--radius-sm);
+      font-size: 0.85rem; font-family: inherit; color: var(--navy-900); background: var(--white);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .table-input:focus { outline: none; border-color: var(--amber-500); box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.16); }
+    .table-input.num-input { text-align: right; width: 78px; font-variant-numeric: tabular-nums; }
+    .table-input.qty-input { text-align: center; width: 62px; }
+    .table-select {
+      padding: 7px 8px; border: 1px solid var(--slate-300); border-radius: var(--radius-sm);
+      font-size: 0.83rem; font-family: inherit; color: var(--navy-900); background: var(--white); cursor: pointer;
+    }
+    .table-select:focus { outline: none; border-color: var(--amber-500); }
+    .cat-toggle {
+      display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 999px;
+      font-size: 0.76rem; font-weight: 700; cursor: pointer; border: 1px solid transparent;
+      transition: all 0.15s ease; font-family: inherit; white-space: nowrap;
+    }
+    .cat-toggle.essential { background: var(--emerald-50); color: var(--emerald-600); border-color: #a7f3d0; }
+    .cat-toggle.essential:hover { background: var(--emerald-100); }
+    .cat-toggle.non-essential { background: var(--slate-100); color: var(--slate-600); border-color: var(--slate-300); }
+    .cat-toggle.non-essential:hover { background: var(--slate-200); }
+    .computed-cell { font-weight: 700; font-variant-numeric: tabular-nums; color: var(--navy-900); white-space: nowrap; }
+    .surge-cell { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--slate-600); white-space: nowrap; }
+    .empty-state { text-align: center; padding: 36px 20px; color: var(--slate-500); }
+
+    .split-grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+    @media (min-width: 960px) { .split-grid { grid-template-columns: 1.05fr 1.15fr; } }
+    .param-group { margin-bottom: 18px; }
+    .param-group:last-child { margin-bottom: 0; }
+    .param-label-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    .param-label { font-size: 0.85rem; font-weight: 700; color: var(--navy-800); }
+    .param-value-badge {
+      font-size: 0.82rem; font-weight: 700; color: var(--amber-600); background: var(--amber-50);
+      border: 1px solid var(--amber-100); padding: 2px 9px; border-radius: 999px;
+    }
+    .param-help { font-size: 0.76rem; color: var(--slate-500); margin-top: 4px; }
+    input[type="range"] { width: 100%; accent-color: var(--amber-500); cursor: pointer; height: 6px; }
+    .param-row-2 { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    @media (min-width: 520px) { .param-row-2 { grid-template-columns: 1fr 1fr; } }
+    .form-control {
+      width: 100%; padding: 9px 11px; border: 1px solid var(--slate-300); border-radius: var(--radius-sm);
+      font-size: 0.86rem; font-family: inherit; color: var(--navy-900); background: var(--white);
+    }
+    .form-control:focus { outline: none; border-color: var(--amber-500); box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15); }
+    .segmented-control {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; background: var(--slate-100);
+      padding: 4px; border-radius: var(--radius-sm); border: 1px solid var(--slate-200);
+    }
+    .seg-btn {
+      padding: 7px 8px; border: none; border-radius: 4px; background: transparent; font-size: 0.83rem;
+      font-weight: 700; color: var(--slate-600); cursor: pointer; transition: all 0.15s ease; font-family: inherit;
+    }
+    .seg-btn.active { background: var(--navy-900); color: var(--white); box-shadow: var(--shadow-sm); }
+    .tech-note-box {
+      background: var(--blue-50); border: 1px solid var(--blue-100); border-left: 4px solid var(--blue-600);
+      border-radius: var(--radius-sm); padding: 12px 14px; margin-top: 16px; font-size: 0.82rem; color: var(--navy-800);
+    }
+    .tech-note-box strong { color: var(--navy-950); }
+
+    .split-bar-container { margin-bottom: 20px; }
+    .split-bar-track {
+      height: 14px; width: 100%; background: var(--slate-200); border-radius: 999px; overflow: hidden; display: flex; margin: 8px 0;
+    }
+    .split-bar-essential { background: var(--emerald-500); height: 100%; transition: width 0.3s ease; }
+    .split-bar-nonessential { background: var(--amber-500); height: 100%; transition: width 0.3s ease; }
+    .split-legend { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 0.78rem; font-weight: 600; color: var(--slate-600); }
+    .legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+    .bar-list { display: flex; flex-direction: column; gap: 12px; }
+    .bar-item-header { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.83rem; margin-bottom: 4px; gap: 8px; }
+    .bar-item-name { font-weight: 600; color: var(--navy-800); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-item-meta { font-size: 0.78rem; font-weight: 700; color: var(--slate-600); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .bar-track { height: 9px; background: var(--slate-100); border-radius: 999px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; transition: width 0.3s ease; }
+    .bar-fill.essential { background: linear-gradient(90deg, var(--navy-800), var(--emerald-600)); }
+    .bar-fill.non-essential { background: linear-gradient(90deg, var(--amber-600), var(--amber-400)); }
+
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(9, 19, 34, 0.62); backdrop-filter: blur(2px);
+      display: none; align-items: center; justify-content: center; padding: 16px; z-index: 1000;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal-dialog {
+      background: var(--white); border-radius: var(--radius-lg); width: 100%; max-width: 640px;
+      box-shadow: var(--shadow-lg); overflow: hidden; animation: modalIn 0.18s ease-out;
+    }
+    @keyframes modalIn { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    .modal-header { padding: 16px 20px; border-bottom: 1px solid var(--slate-200); display: flex; align-items: center; justify-content: space-between; }
+    .modal-title { margin: 0; font-size: 1.05rem; font-weight: 700; color: var(--navy-900); }
+
+    .toast {
+      position: fixed; bottom: 20px; right: 20px; background: var(--navy-900); color: var(--white);
+      padding: 11px 16px; border-radius: var(--radius-md); font-size: 0.85rem; font-weight: 600;
+      box-shadow: var(--shadow-lg); display: flex; align-items: center; gap: 8px; z-index: 1200;
+      opacity: 0; transform: translateY(10px); pointer-events: none; transition: all 0.2s ease;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .app-footer { text-align: center; font-size: 0.78rem; color: var(--slate-500); padding: 8px 0 20px; }
+
+    @media print {
+      body { background: #fff; font-size: 11pt; }
+      .app-container { max-width: 100%; padding: 0; }
+      .header-actions, .presets-section, .quick-entry-panel, .table-toolbar, .table-actions,
+      .delete-col, .btn-icon-only, .modal-backdrop, .toast { display: none !important; }
+      .app-header { background: #0f172a !important; color: #fff !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; box-shadow: none; }
+      .card, .kpi-card { box-shadow: none; border: 1px solid #cbd5e1; break-inside: avoid; }
+      .kpi-grid { grid-template-columns: repeat(4, 1fr); }
+      .table-input, .table-select { border: none; padding: 0; background: transparent; appearance: none; }
+      .split-grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="brand-group">
+        <div class="brand-icon" aria-hidden="true">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2"/><path d="M12 20v2"/>
+            <path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/>
+            <path d="M2 12h2"/><path d="M20 12h2"/>
+            <path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">Solar Load Profile &amp; Sizing Calculator</h1>
+          <p class="brand-subtitle">Audit connected appliances, peak startup surge, inverter capacity &amp; battery bank sizing</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button type="button" class="btn btn-header-ghost" id="btnExportCsv" title="Download CSV load table">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export CSV
+        </button>
+        <button type="button" class="btn btn-header-ghost" id="btnPrint" title="Print or save PDF report">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+          Print / PDF
+        </button>
+        <a class="btn btn-secondary" href="/" style="text-decoration:none">&larr; Tencent Innovations</a>
+      </div>
+    </header>
+
+    <section class="kpi-grid" aria-label="Load Summary Metrics">
+      <div class="kpi-card accent-navy">
+        <div>
+          <div class="kpi-label">
+            <span>Raw Daily Energy</span>
+            <span id="kpiItemCount">10 units</span>
+          </div>
+          <div class="kpi-value" id="kpiRawEnergy">2.14 kWh/day</div>
+          <div class="kpi-sub" id="kpiRawWh">2,135 Wh/day before system losses</div>
+        </div>
+        <div class="kpi-badge-row">
+          <span class="mini-pill essential" id="kpiEssentialBadge">Essential: 1,620 Wh</span>
+          <span class="mini-pill non-essential" id="kpiNonEssentialBadge">Non-Ess: 515 Wh</span>
+        </div>
+      </div>
+
+      <div class="kpi-card accent-amber">
+        <div>
+          <div class="kpi-label">
+            <span>Design Energy Target</span>
+            <span id="kpiMarginTag">+20% margin</span>
+          </div>
+          <div class="kpi-value" id="kpiAdjustedEnergy">2.56 kWh/day</div>
+          <div class="kpi-sub" id="kpiAdjustedSub">2,562 Wh/day incl. losses &amp; safety buffer</div>
+        </div>
+      </div>
+
+      <div class="kpi-card accent-blue">
+        <div>
+          <div class="kpi-label">
+            <span>Recommended Inverter</span>
+            <span id="kpiSurgeTag">Peak Surge: 580 W</span>
+          </div>
+          <div class="kpi-value" id="kpiInverterSize">0.5 kW / 0.63 kVA</div>
+          <div class="kpi-sub" id="kpiRunningLoad">Connected running load: 340 W</div>
+        </div>
+      </div>
+
+      <div class="kpi-card accent-emerald">
+        <div>
+          <div class="kpi-label">
+            <span>Recommended Battery Bank</span>
+            <span id="kpiBattSpecTag">48V • 90% DoD</span>
+          </div>
+          <div class="kpi-value" id="kpiBatteryKwh">2.85 kWh</div>
+          <div class="kpi-sub" id="kpiBatteryAh">≈ 60 Ah @ 48V (1d autonomy)</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card presets-section">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Quick-Add Common Appliances</h2>
+          <p class="card-subtitle">Click a common appliance or browse the 55+ categorized residential, commercial &amp; agricultural appliance library</p>
+        </div>
+        <button type="button" class="btn btn-primary" id="btnOpenLibrary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          Browse All Appliances (55+)
+        </button>
+      </div>
+      <div class="card-body">
+        <div class="preset-grid" id="presetGrid"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Appliance Load Audit Table</h2>
+          <p class="card-subtitle">Add unlimited appliances below, edit inline, or filter by category (auto-saved in this browser)</p>
+        </div>
+        <div class="table-actions" style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="btn btn-secondary" id="btnAddCustom">+ Add Empty Row</button>
+          <button type="button" class="btn btn-secondary" id="btnResetSample" title="Restore starter sample loads">Reset Sample</button>
+          <button type="button" class="btn btn-danger-ghost" id="btnClearAll">Clear All</button>
+        </div>
+      </div>
+
+      <div class="quick-entry-panel">
+        <div class="quick-entry-top">
+          <span class="quick-entry-label">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+            Add Any Custom Appliance
+          </span>
+          <button type="button" class="converter-toggle-btn" id="btnToggleConverter">
+            ⚡ Nameplate Converter (Amps / HP → Watts)
+          </button>
+        </div>
+
+        <div class="converter-drawer" id="converterDrawer">
+          <div class="conv-group">
+            <div class="mini-field">
+              <label for="convAmps">Amps (A)</label>
+              <input type="number" id="convAmps" min="0" step="0.1" placeholder="e.g. 2.5" />
+            </div>
+            <div class="mini-field">
+              <label for="convVolts">Volts (V)</label>
+              <input type="number" id="convVolts" min="1" step="1" value="230" />
+            </div>
+            <div class="mini-field">
+              <label for="convPf">Power Factor</label>
+              <input type="number" id="convPf" min="0.1" max="1" step="0.05" value="0.9" />
+            </div>
+            <button type="button" class="btn btn-secondary" id="btnApplyAmps" style="min-height:33px; padding:5px 10px; font-size:0.78rem;">
+              Use Watts (single-phase)
+            </button>
+          </div>
+
+          <div class="conv-group">
+            <div class="mini-field">
+              <label for="convHp">Motor HP</label>
+              <input type="number" id="convHp" min="0" step="0.25" placeholder="e.g. 1.5" />
+            </div>
+            <button type="button" class="btn btn-secondary" id="btnApplyHp" style="min-height:33px; padding:5px 10px; font-size:0.78rem;">
+              HP → Watts (÷ 80% efficiency)
+            </button>
+          </div>
+        </div>
+
+        <form id="customAddForm" class="quick-entry-grid">
+          <div class="entry-field">
+            <label for="newAppName">Appliance Name *</label>
+            <input type="text" id="newAppName" placeholder="e.g., Posho Mill, Submersible Pump, Chest Freezer..." required />
+          </div>
+          <div class="entry-field">
+            <label for="newAppGroup">Category</label>
+            <select id="newAppGroup">
+              <option value="Lighting & Security">Lighting &amp; Security</option>
+              <option value="Kitchen & Refrigeration">Kitchen &amp; Refrigeration</option>
+              <option value="Living & Office" selected>Living &amp; Office</option>
+              <option value="Cooling, Heating & Laundry">Cooling, Heating &amp; Laundry</option>
+              <option value="Water Pumps & Outdoor">Water Pumps &amp; Outdoor</option>
+              <option value="Workshop & Commercial">Workshop &amp; Commercial</option>
+            </select>
+          </div>
+          <div class="entry-field">
+            <label for="newAppQty">Qty</label>
+            <input type="number" id="newAppQty" min="1" max="999" value="1" required />
+          </div>
+          <div class="entry-field">
+            <label for="newAppWatts">Watts (W) *</label>
+            <input type="number" id="newAppWatts" min="1" max="100000" placeholder="e.g. 250" required />
+          </div>
+          <div class="entry-field">
+            <label for="newAppSurge">Startup Surge</label>
+            <select id="newAppSurge">
+              <option value="1">1x (Resistive/LED)</option>
+              <option value="1.5">1.5x (Electronics/Fan)</option>
+              <option value="2">2x (Small Motor)</option>
+              <option value="2.5">2.5x (Power Tool)</option>
+              <option value="3">3x (Fridge/AC)</option>
+              <option value="3.5">3.5x (Freezer/Chiller)</option>
+              <option value="4">4x (Water Pump)</option>
+              <option value="4.5">4.5x (Borehole/Mill)</option>
+              <option value="5">5x (Heavy Compressor)</option>
+            </select>
+          </div>
+          <div class="entry-field">
+            <label for="newAppHours">Hrs/Day</label>
+            <input type="number" id="newAppHours" min="0" max="24" step="0.1" value="4" required />
+          </div>
+          <div class="entry-field">
+            <label for="newAppPriority">Backup Priority</label>
+            <select id="newAppPriority">
+              <option value="essential" selected>Essential</option>
+              <option value="non-essential">Non-Essential</option>
+            </select>
+          </div>
+          <button type="submit" class="btn btn-primary" style="min-height:38px;">+ Add Load</button>
+        </form>
+      </div>
+
+      <div class="table-toolbar">
+        <div class="search-box-wrap">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="search" id="tableSearchInput" class="search-input" placeholder="Filter added appliances..." aria-label="Filter added appliances" />
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <select id="tableCategoryFilter" class="table-select" aria-label="Filter by category">
+            <option value="ALL">All Categories</option>
+            <option value="Lighting & Security">Lighting &amp; Security</option>
+            <option value="Kitchen & Refrigeration">Kitchen &amp; Refrigeration</option>
+            <option value="Living & Office">Living &amp; Office</option>
+            <option value="Cooling, Heating & Laundry">Cooling, Heating &amp; Laundry</option>
+            <option value="Water Pumps & Outdoor">Water Pumps &amp; Outdoor</option>
+            <option value="Workshop & Commercial">Workshop &amp; Commercial</option>
+          </select>
+          <span id="tableFilterCount" style="font-size:0.78rem; color:var(--slate-500); font-weight:600;"></span>
+        </div>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="load-table">
+          <thead>
+            <tr>
+              <th style="min-width:210px;">Appliance / Category</th>
+              <th>Priority</th>
+              <th class="center-col">Qty</th>
+              <th class="num-col">Running (W)</th>
+              <th class="center-col">Surge Factor</th>
+              <th class="num-col">Active Hrs/Day</th>
+              <th class="num-col">Daily Energy</th>
+              <th class="num-col">Peak Surge</th>
+              <th class="center-col delete-col">Remove</th>
+            </tr>
+          </thead>
+          <tbody id="loadTableBody"></tbody>
+          <tfoot id="loadTableFoot">
+            <tr>
+              <td colspan="3">Total Connected Loads (All Items)</td>
+              <td class="num-col" id="footRunningWatts">340 W</td>
+              <td></td>
+              <td></td>
+              <td class="num-col" id="footDailyWh">2,135 Wh/day</td>
+              <td class="num-col" id="footPeakSurge">580 W</td>
+              <td class="delete-col"></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div class="cat-subtotal-strip" id="categorySubtotalStrip"></div>
+    </section>
+
+    <div class="split-grid">
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">System &amp; Battery Sizing Parameters</h2>
+            <p class="card-subtitle">Configure losses, backup days, battery chemistry, and DC bus voltage</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="param-group">
+            <div class="param-label-row">
+              <label class="param-label" for="inputMargin">System Losses &amp; Safety Margin</label>
+              <span class="param-value-badge" id="labelMargin">20%</span>
+            </div>
+            <input type="range" id="inputMargin" min="0" max="50" step="5" value="20" />
+            <div class="param-help">Accounts for inverter conversion losses (about 10%), idle draw, cable drops, and future load growth (20%–30% recommended).</div>
+          </div>
+
+          <div class="param-row-2 param-group">
+            <div>
+              <label class="param-label" for="selectAutonomy" style="display:block; margin-bottom:6px;">Backup Autonomy (Days)</label>
+              <select id="selectAutonomy" class="form-control">
+                <option value="0.5">0.5 Days (Evening / Half-day)</option>
+                <option value="1" selected>1.0 Day (Standard Daily Cycle)</option>
+                <option value="1.5">1.5 Days (Extended Backup)</option>
+                <option value="2">2.0 Days (Off-Grid / Cloudy Buffer)</option>
+                <option value="3">3.0 Days (Heavy Off-Grid Autonomy)</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="param-label" for="selectChemistry" style="display:block; margin-bottom:6px;">Battery Chemistry (Max DoD)</label>
+              <select id="selectChemistry" class="form-control">
+                <option value="90" selected>Lithium LiFePO4 (90% DoD)</option>
+                <option value="80">Lithium LiFePO4 Conservative (80% DoD)</option>
+                <option value="50">Lead-Acid: Tubular / Flooded / AGM / Gel (50% DoD)</option>
+                <option value="custom">Custom Depth of Discharge...</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="param-group" id="customDodGroup" style="display:none;">
+            <div class="param-label-row">
+              <label class="param-label" for="inputCustomDod">Custom Depth of Discharge (DoD %)</label>
+              <span class="param-value-badge" id="labelCustomDod">80%</span>
+            </div>
+            <input type="range" id="inputCustomDod" min="30" max="95" step="5" value="80" />
+          </div>
+
+          <div class="param-group">
+            <label class="param-label" style="display:block; margin-bottom:6px;">Battery Bank Nominal Voltage</label>
+            <div class="segmented-control" role="group" aria-label="Battery System Voltage">
+              <button type="button" class="seg-btn" data-voltage="12">12V DC</button>
+              <button type="button" class="seg-btn" data-voltage="24">24V DC</button>
+              <button type="button" class="seg-btn active" data-voltage="48">48V DC</button>
+            </div>
+            <div class="param-help">12V for small (&lt;1.5 kW) systems, 24V for mid-size (1.5–3 kW), 48V for residential/commercial (&gt;3 kW).</div>
+          </div>
+
+          <div class="param-group">
+            <label class="param-label" for="selectScope" style="display:block; margin-bottom:6px;">Battery Backs Up</label>
+            <select id="selectScope" class="form-control">
+              <option value="all">All loads (full daily energy)</option>
+              <option value="essential">Essential loads only</option>
+            </select>
+            <div class="param-help">Essential-only sizes the battery energy and discharge current for loads marked Essential. The inverter is still sized for all loads.</div>
+          </div>
+
+          <div class="param-group">
+            <label class="param-label" for="selectDischarge" style="display:block; margin-bottom:6px;">Battery Max Continuous Discharge</label>
+            <select id="selectDischarge" class="form-control">
+              <option value="0.1">0.1C (weak lead-acid)</option>
+              <option value="0.15">0.15C (lead-acid, typical)</option>
+              <option value="0.2">0.2C (good tubular lead-acid)</option>
+              <option value="0.3">0.3C</option>
+              <option value="0.5">0.5C (LiFePO4, typical)</option>
+              <option value="1">1C (LiFePO4, high-rate)</option>
+            </select>
+            <div class="param-help">The most current the battery can supply continuously, as a fraction of its Ah. For lithium, use the BMS rating on the datasheet.</div>
+          </div>
+
+          <div class="tech-note-box" id="techSizingNote">
+            <strong>Technician Note:</strong> Add appliances above to calculate your inverter kW/kVA rating and battery bank Amp-Hour (Ah) capacity.
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title">Daily Energy Consumption Breakdown</h2>
+            <p class="card-subtitle">Share of daily watt-hours by load priority and individual appliance</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="split-bar-container">
+            <div class="split-legend">
+              <span><span class="legend-dot" style="background:var(--emerald-500);"></span><span id="legendEssential">Essential: 76% (1,620 Wh)</span></span>
+              <span><span class="legend-dot" style="background:var(--amber-500);"></span><span id="legendNonEssential">Non-Essential: 24% (515 Wh)</span></span>
+            </div>
+            <div class="split-bar-track" aria-hidden="true">
+              <div class="split-bar-essential" id="barEssentialPct" style="width:76%;"></div>
+              <div class="split-bar-nonessential" id="barNonEssentialPct" style="width:24%;"></div>
+            </div>
+          </div>
+
+          <div class="bar-list" id="applianceBarList"></div>
+        </div>
+      </section>
+    </div>
+
+    <footer class="app-footer">
+      Solar Load Profile &amp; Sizing Estimator by Tencent Innovations • Results are planning estimates: confirm cable sizes, protection and the final design before buying or installing
+    </footer>
+  </div>
+
+  <div class="modal-backdrop" id="libraryModal" role="dialog" aria-modal="true" aria-labelledby="libraryModalTitle">
+    <div class="modal-dialog library-dialog">
+      <div class="modal-header">
+        <h3 class="modal-title" id="libraryModalTitle">Appliance Library (Residential, Commercial &amp; Off-Grid)</h3>
+        <button type="button" class="btn-icon-only" id="btnCloseLibrary" aria-label="Close appliance library">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="library-controls">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+          <input type="search" id="librarySearchInput" class="form-control" style="max-width:340px;" placeholder="Search 55+ appliances (e.g., borehole, freezer, welder, AC)..." />
+          <span style="font-size:0.78rem; color:var(--slate-500);">Click <strong>+ Add</strong> multiple times or adjust quantities in the main table.</span>
+        </div>
+        <div class="library-tabs" id="libraryTabs"></div>
+      </div>
+      <div class="library-list" id="libraryList"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toastMsg" role="status" aria-live="polite"></div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ======================================================================
+         1. CONSTANTS, APPLIANCE CATALOG & STARTER LOADS
+         ====================================================================== */
+      const STORAGE_KEY = "solar_load_profile_state_v2";
+
+      // Motor catalogue wattages are electrical INPUT power: shaft power (746 W per HP) divided by this efficiency.
+      const MOTOR_EFFICIENCY = 0.8;
+
+      // Inverter sizing rules
+      const INVERTER_HEADROOM = 1.25;   // continuous rating must be at least 125% of the running load
+      const SURGE_CAPABILITY = 2;       // typical inverter can surge to about 2x its rating for a few seconds
+      const SURGE_MARGIN = 1.1;         // 10% safety on top of that
+      const INVERTER_EFFICIENCY = 0.9;  // DC to AC conversion, used for battery current
+      const KVA_POWER_FACTOR = 0.8;     // kVA = kW / 0.8 (many hybrid inverters rate kW = kVA: check the datasheet)
+      const STANDARD_INVERTER_KW = [0.5, 1.0, 1.5, 2.0, 3.0, 3.5, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0];
+
+      const DISCHARGE_C_OPTIONS = [0.1, 0.15, 0.2, 0.3, 0.5, 1];
+      const DOD_MIN = 30, DOD_MAX = 95;
+
+      const APPLIANCE_LIBRARY = [
+        // Lighting & Security
+        { name: "LED Bulb (10W)", group: "Lighting & Security", category: "essential", qty: 4, watts: 10, surge: 1, hours: 5, featured: true },
+        { name: "LED Tube Light (18W)", group: "Lighting & Security", category: "essential", qty: 2, watts: 18, surge: 1, hours: 5 },
+        { name: "Outdoor Security Floodlight (50W)", group: "Lighting & Security", category: "essential", qty: 2, watts: 50, surge: 1, hours: 11 },
+        { name: "Outdoor Floodlight (100W)", group: "Lighting & Security", category: "essential", qty: 1, watts: 100, surge: 1, hours: 10 },
+        { name: "CCTV Camera System (NVR + 4 Cams)", group: "Lighting & Security", category: "essential", qty: 1, watts: 45, surge: 1, hours: 24, featured: true },
+        { name: "Electric Fence Energizer", group: "Lighting & Security", category: "essential", qty: 1, watts: 20, surge: 1.5, hours: 24 },
+        { name: "Automated Sliding Gate Motor", group: "Lighting & Security", category: "essential", qty: 1, watts: 350, surge: 3, hours: 0.2 },
+        { name: "Intercom / Doorbell System", group: "Lighting & Security", category: "essential", qty: 1, watts: 12, surge: 1, hours: 24 },
+
+        // Kitchen & Refrigeration
+        { name: "Refrigerator (Inverter / Modern)", group: "Kitchen & Refrigeration", category: "essential", qty: 1, watts: 120, surge: 3, hours: 8, featured: true },
+        { name: "Double-Door Fridge / Freezer", group: "Kitchen & Refrigeration", category: "essential", qty: 1, watts: 180, surge: 3.5, hours: 9 },
+        { name: "Chest Deep Freezer (200L–300L)", group: "Kitchen & Refrigeration", category: "essential", qty: 1, watts: 160, surge: 3.5, hours: 10 },
+        { name: "Microwave Oven", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 1100, surge: 1.5, hours: 0.3, featured: true },
+        { name: "Electric Kettle", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 1800, surge: 1, hours: 0.25 },
+        { name: "Induction Cooker / Single Hotplate", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 1500, surge: 1, hours: 1 },
+        { name: "Electric Oven / Cooking Range", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 2400, surge: 1, hours: 1 },
+        { name: "Toaster (2-Slice)", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 850, surge: 1, hours: 0.15 },
+        { name: "Coffee Maker / Espresso Machine", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 1000, surge: 1, hours: 0.3 },
+        { name: "Kitchen Blender / Juicer", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 450, surge: 2, hours: 0.2 },
+        { name: "Rice Cooker / Air Fryer", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 1200, surge: 1, hours: 0.5 },
+        { name: "Water Dispenser (Hot & Cold)", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 550, surge: 2, hours: 2 },
+        { name: "Dishwasher", group: "Kitchen & Refrigeration", category: "non-essential", qty: 1, watts: 1500, surge: 2, hours: 1 },
+
+        // Living & Office
+        { name: "Wi-Fi Router & Fiber ONT", group: "Living & Office", category: "essential", qty: 1, watts: 15, surge: 1, hours: 24, featured: true },
+        { name: "Starlink Dish & Router", group: "Living & Office", category: "essential", qty: 1, watts: 65, surge: 1.5, hours: 24 },
+        { name: "LED TV (43-inch)", group: "Living & Office", category: "non-essential", qty: 1, watts: 80, surge: 1, hours: 4, featured: true },
+        { name: "Smart TV (65-inch 4K)", group: "Living & Office", category: "non-essential", qty: 1, watts: 140, surge: 1, hours: 4 },
+        { name: "Laptop Charger", group: "Living & Office", category: "essential", qty: 1, watts: 65, surge: 1, hours: 4, featured: true },
+        { name: "Smartphone / Tablet Chargers", group: "Living & Office", category: "essential", qty: 3, watts: 15, surge: 1, hours: 3 },
+        { name: "Desktop PC & Monitor", group: "Living & Office", category: "non-essential", qty: 1, watts: 220, surge: 1, hours: 6 },
+        { name: "Workstation / Gaming PC", group: "Living & Office", category: "non-essential", qty: 1, watts: 450, surge: 1, hours: 5 },
+        { name: "Inkjet / Laser Printer (Standby/Print)", group: "Living & Office", category: "non-essential", qty: 1, watts: 350, surge: 1.5, hours: 0.5 },
+        { name: "Home Theater / Soundbar", group: "Living & Office", category: "non-essential", qty: 1, watts: 90, surge: 1.5, hours: 3 },
+        { name: "Decoder / Streaming Box", group: "Living & Office", category: "non-essential", qty: 1, watts: 20, surge: 1, hours: 5 },
+
+        // Cooling, Heating & Laundry
+        { name: "Ceiling Fan", group: "Cooling, Heating & Laundry", category: "essential", qty: 1, watts: 65, surge: 1.5, hours: 8, featured: true },
+        { name: "Standing / Pedestal Fan", group: "Cooling, Heating & Laundry", category: "essential", qty: 1, watts: 55, surge: 1.5, hours: 6 },
+        { name: "Split Air Conditioner (1.0 HP / 9k BTU)", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 900, surge: 3, hours: 6 },
+        { name: "Split Air Conditioner (1.5 HP / 12k BTU)", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 1200, surge: 3, hours: 6, featured: true },
+        { name: "Split Air Conditioner (2.0 HP / 18k BTU)", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 1750, surge: 3.5, hours: 6 },
+        { name: "Washing Machine (Front/Top Load)", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 500, surge: 3, hours: 1, featured: true },
+        { name: "Clothes Dryer (Electric Heat)", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 2500, surge: 2, hours: 0.8 },
+        { name: "Electric Clothes Iron", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 1200, surge: 1, hours: 0.4 },
+        { name: "Hair Dryer", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 1500, surge: 1, hours: 0.2 },
+        { name: "Electric Water Heater / Geyser", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 2000, surge: 1, hours: 1.5 },
+        { name: "Space Heater (Electric)", group: "Cooling, Heating & Laundry", category: "non-essential", qty: 1, watts: 1500, surge: 1, hours: 3 },
+
+        // Water Pumps & Outdoor (motor input power = HP x 746 / 0.8)
+        { name: "Surface Booster Pump (0.5 HP)", group: "Water Pumps & Outdoor", category: "essential", qty: 1, watts: 470, surge: 3.5, hours: 1 },
+        { name: "Water Pump (1.0 HP)", group: "Water Pumps & Outdoor", category: "essential", qty: 1, watts: 930, surge: 4, hours: 1, featured: true },
+        { name: "Submersible Borehole Pump (1.5 HP)", group: "Water Pumps & Outdoor", category: "essential", qty: 1, watts: 1400, surge: 4.5, hours: 1.5 },
+        { name: "Submersible Borehole Pump (2.0 HP)", group: "Water Pumps & Outdoor", category: "essential", qty: 1, watts: 1870, surge: 4.5, hours: 1.5 },
+        { name: "Swimming Pool Filtration Pump", group: "Water Pumps & Outdoor", category: "non-essential", qty: 1, watts: 1100, surge: 3.5, hours: 4 },
+        { name: "Electric Lawn Mower", group: "Water Pumps & Outdoor", category: "non-essential", qty: 1, watts: 1400, surge: 3, hours: 0.5 },
+
+        // Workshop & Commercial
+        { name: "POS Terminal & Receipt Printer", group: "Workshop & Commercial", category: "essential", qty: 1, watts: 60, surge: 1, hours: 10 },
+        { name: "Commercial Display Chiller / Cooler", group: "Workshop & Commercial", category: "essential", qty: 1, watts: 320, surge: 3.5, hours: 12, featured: true },
+        { name: "Cold Room Compressor Unit (2 HP)", group: "Workshop & Commercial", category: "essential", qty: 1, watts: 1870, surge: 4, hours: 10 },
+        { name: "Air Compressor (2 HP)", group: "Workshop & Commercial", category: "non-essential", qty: 1, watts: 1870, surge: 4, hours: 1 },
+        { name: "Angle Grinder / Circular Saw", group: "Workshop & Commercial", category: "non-essential", qty: 1, watts: 900, surge: 3, hours: 1 },
+        { name: "Electric Hand Drill", group: "Workshop & Commercial", category: "non-essential", qty: 1, watts: 650, surge: 2.5, hours: 1 },
+        { name: "Inverter Welding Machine (160A)", group: "Workshop & Commercial", category: "non-essential", qty: 1, watts: 3500, surge: 2, hours: 1 },
+        { name: "Posho / Grain Mill (3 HP)", group: "Workshop & Commercial", category: "non-essential", qty: 1, watts: 2800, surge: 4.5, hours: 2 }
+      ];
+
+      const PRESETS = APPLIANCE_LIBRARY.filter((item) => item.featured);
+
+      const DEFAULT_STATE = {
+        loads: [
+          { id: 1, name: "LED Lighting (10W bulbs)", group: "Lighting & Security", category: "essential", qty: 6, watts: 10, surge: 1, hours: 5 },
+          { id: 2, name: "Refrigerator (Cycling)", group: "Kitchen & Refrigeration", category: "essential", qty: 1, watts: 120, surge: 3, hours: 8 },
+          { id: 3, name: "Wi-Fi Router & Modem", group: "Living & Office", category: "essential", qty: 1, watts: 15, surge: 1, hours: 24 },
+          { id: 4, name: "LED Television", group: "Living & Office", category: "non-essential", qty: 1, watts: 80, surge: 1, hours: 4 },
+          { id: 5, name: "Laptop & Phone Charging", group: "Living & Office", category: "non-essential", qty: 1, watts: 65, surge: 1, hours: 3 }
+        ],
+        marginPct: 20,
+        autonomyDays: 1,
+        dodPct: 90,
+        backupScope: "all",
+        dischargeC: 0.5,
+        systemVoltage: 48
+      };
+
+      function clamp(value, min, max, fallback) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.min(max, Math.max(min, n));
+      }
+
+      function loadSavedState() {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (!raw) return JSON.parse(JSON.stringify(DEFAULT_STATE));
+          const parsed = JSON.parse(raw);
+          if (parsed && Array.isArray(parsed.loads)) {
+            const dod = Math.round(clamp(parsed.dodPct, DOD_MIN, DOD_MAX, 90));
+            return {
+              loads: parsed.loads.map((l, i) => ({
+                id: Number(l.id) || i + 1,
+                name: String(l.name || "Appliance"),
+                group: String(l.group || "Living & Office"),
+                category: l.category === "non-essential" ? "non-essential" : "essential",
+                qty: Math.max(0, Number(l.qty) || 1),
+                watts: Math.max(0, Number(l.watts) || 0),
+                surge: Math.max(1, Number(l.surge) || 1),
+                hours: Math.min(24, Math.max(0, Number(l.hours) || 0))
+              })),
+              marginPct: clamp(parsed.marginPct, 0, 50, 20),
+              autonomyDays: clamp(parsed.autonomyDays, 0.5, 3, 1),
+              dodPct: dod,
+              systemVoltage: [12, 24, 48].includes(Number(parsed.systemVoltage)) ? Number(parsed.systemVoltage) : 48,
+              backupScope: parsed.backupScope === "essential" ? "essential" : "all",
+              dischargeC: DISCHARGE_C_OPTIONS.includes(Number(parsed.dischargeC)) ? Number(parsed.dischargeC) : (dod >= 70 ? 0.5 : 0.15)
+            };
+          }
+        } catch (e) {
+          // Ignore storage access errors
+        }
+        return JSON.parse(JSON.stringify(DEFAULT_STATE));
+      }
+
+      let state = loadSavedState();
+      let nextId = state.loads.reduce((max, item) => Math.max(max, item.id), 0) + 1;
+      let tableSearchQuery = "";
+      let tableCategoryFilter = "ALL";
+      let libraryActiveGroup = "ALL";
+      let librarySearchQuery = "";
+
+      function saveState() {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        } catch (e) {
+          // Ignore storage quota / sandbox restrictions
+        }
+      }
+
+      /* ======================================================================
+         2. DOM REFERENCES
+         ====================================================================== */
+      const el = {
+        presetGrid: document.getElementById("presetGrid"),
+        loadTableBody: document.getElementById("loadTableBody"),
+        footRunningWatts: document.getElementById("footRunningWatts"),
+        footDailyWh: document.getElementById("footDailyWh"),
+        footPeakSurge: document.getElementById("footPeakSurge"),
+        categorySubtotalStrip: document.getElementById("categorySubtotalStrip"),
+
+        customAddForm: document.getElementById("customAddForm"),
+        newAppName: document.getElementById("newAppName"),
+        newAppGroup: document.getElementById("newAppGroup"),
+        newAppQty: document.getElementById("newAppQty"),
+        newAppWatts: document.getElementById("newAppWatts"),
+        newAppSurge: document.getElementById("newAppSurge"),
+        newAppHours: document.getElementById("newAppHours"),
+        newAppPriority: document.getElementById("newAppPriority"),
+
+        btnToggleConverter: document.getElementById("btnToggleConverter"),
+        converterDrawer: document.getElementById("converterDrawer"),
+        convAmps: document.getElementById("convAmps"),
+        convVolts: document.getElementById("convVolts"),
+        convPf: document.getElementById("convPf"),
+        btnApplyAmps: document.getElementById("btnApplyAmps"),
+        convHp: document.getElementById("convHp"),
+        btnApplyHp: document.getElementById("btnApplyHp"),
+
+        tableSearchInput: document.getElementById("tableSearchInput"),
+        tableCategoryFilter: document.getElementById("tableCategoryFilter"),
+        tableFilterCount: document.getElementById("tableFilterCount"),
+
+        btnOpenLibrary: document.getElementById("btnOpenLibrary"),
+        btnCloseLibrary: document.getElementById("btnCloseLibrary"),
+        libraryModal: document.getElementById("libraryModal"),
+        librarySearchInput: document.getElementById("librarySearchInput"),
+        libraryTabs: document.getElementById("libraryTabs"),
+        libraryList: document.getElementById("libraryList"),
+
+        kpiItemCount: document.getElementById("kpiItemCount"),
+        kpiRawEnergy: document.getElementById("kpiRawEnergy"),
+        kpiRawWh: document.getElementById("kpiRawWh"),
+        kpiEssentialBadge: document.getElementById("kpiEssentialBadge"),
+        kpiNonEssentialBadge: document.getElementById("kpiNonEssentialBadge"),
+
+        kpiMarginTag: document.getElementById("kpiMarginTag"),
+        kpiAdjustedEnergy: document.getElementById("kpiAdjustedEnergy"),
+        kpiAdjustedSub: document.getElementById("kpiAdjustedSub"),
+
+        kpiSurgeTag: document.getElementById("kpiSurgeTag"),
+        kpiInverterSize: document.getElementById("kpiInverterSize"),
+        kpiRunningLoad: document.getElementById("kpiRunningLoad"),
+
+        kpiBattSpecTag: document.getElementById("kpiBattSpecTag"),
+        kpiBatteryKwh: document.getElementById("kpiBatteryKwh"),
+        kpiBatteryAh: document.getElementById("kpiBatteryAh"),
+
+        inputMargin: document.getElementById("inputMargin"),
+        labelMargin: document.getElementById("labelMargin"),
+        selectAutonomy: document.getElementById("selectAutonomy"),
+        selectScope: document.getElementById("selectScope"),
+        selectDischarge: document.getElementById("selectDischarge"),
+        selectChemistry: document.getElementById("selectChemistry"),
+        customDodGroup: document.getElementById("customDodGroup"),
+        inputCustomDod: document.getElementById("inputCustomDod"),
+        labelCustomDod: document.getElementById("labelCustomDod"),
+        voltageBtns: document.querySelectorAll(".seg-btn[data-voltage]"),
+        techSizingNote: document.getElementById("techSizingNote"),
+
+        legendEssential: document.getElementById("legendEssential"),
+        legendNonEssential: document.getElementById("legendNonEssential"),
+        barEssentialPct: document.getElementById("barEssentialPct"),
+        barNonEssentialPct: document.getElementById("barNonEssentialPct"),
+        applianceBarList: document.getElementById("applianceBarList"),
+
+        btnAddCustom: document.getElementById("btnAddCustom"),
+        btnResetSample: document.getElementById("btnResetSample"),
+        btnClearAll: document.getElementById("btnClearAll"),
+        btnExportCsv: document.getElementById("btnExportCsv"),
+        btnPrint: document.getElementById("btnPrint"),
+        toastMsg: document.getElementById("toastMsg")
+      };
+
+      /* ======================================================================
+         3. HELPERS
+         ====================================================================== */
+      function fmtNum(val, decimals = 0) {
+        return Number(val).toLocaleString(undefined, {
+          minimumFractionDigits: decimals,
+          maximumFractionDigits: decimals
+        });
+      }
+
+      let toastTimer = null;
+      function showToast(message) {
+        el.toastMsg.textContent = message;
+        el.toastMsg.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => {
+          el.toastMsg.classList.remove("show");
+        }, 2800);
+      }
+
+      // Neutralise spreadsheet formula injection in CSV text cells
+      function csvText(v) {
+        let s = String(v);
+        if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+
+      function escapeHtml(str) {
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      /* ======================================================================
+         4. CORE ENGINEERING CALCULATIONS
+         ====================================================================== */
+
+      // One place that turns a table row into numbers, so the table, the totals and the CSV always agree.
+      function rowCalc(item) {
+        const qty = Math.max(0, Math.floor(Number(item.qty) || 0));
+        const watts = Math.max(0, Number(item.watts) || 0);
+        const surge = Math.max(1, Number(item.surge) || 1);
+        const hours = Math.min(24, Math.max(0, Number(item.hours) || 0));
+
+        const runningW = qty * watts;                          // all units running
+        const dailyWh = runningW * hours;                      // energy per day
+        const surgeExtraW = qty > 0 ? watts * (surge - 1) : 0; // extra draw while ONE unit starts
+        const peakW = runningW + surgeExtraW;                  // this row at its worst moment
+        return { qty, watts, surge, hours, runningW, dailyWh, surgeExtraW, peakW };
+      }
+
+      function computeMetrics() {
+        let totalRunningW = 0;
+        let totalDailyWh = 0;
+        let essentialWh = 0;
+        let nonEssentialWh = 0;
+        let maxSurgeExtraW = 0;
+
+        // The part of the load the battery actually carries (all loads, or essential loads only)
+        const essentialOnly = state.backupScope === "essential";
+        let backupRunningW = 0;
+        let backupWh = 0;
+        let maxBackupSurgeExtraW = 0;
+
+        const enrichedLoads = state.loads.map((item) => {
+          const c = rowCalc(item);
+
+          totalRunningW += c.runningW;
+          totalDailyWh += c.dailyWh;
+          if (item.category === "essential") essentialWh += c.dailyWh;
+          else nonEssentialWh += c.dailyWh;
+          if (c.surgeExtraW > maxSurgeExtraW) maxSurgeExtraW = c.surgeExtraW;
+
+          if (!essentialOnly || item.category === "essential") {
+            backupRunningW += c.runningW;
+            backupWh += c.dailyWh;
+            if (c.surgeExtraW > maxBackupSurgeExtraW) maxBackupSurgeExtraW = c.surgeExtraW;
+          }
+
+          return {
+            ...item,
+            qty: c.qty, watts: c.watts, surge: c.surge, hours: c.hours,
+            rowRunningW: c.runningW, rowDailyWh: c.dailyWh, rowPeakSurgeW: c.peakW
+          };
+        });
+
+        // Peak surge: every load running + the largest single start-up extra (two big motors rarely start at the same instant)
+        const estimatedPeakSurgeW = totalRunningW + maxSurgeExtraW;
+        const backupPeakW = backupRunningW + maxBackupSurgeExtraW;
+
+        // Daily energy with system losses & safety margin
+        const marginFactor = 1 + state.marginPct / 100;
+        const adjustedDailyWh = totalDailyWh * marginFactor;
+        const adjustedDailyKwh = adjustedDailyWh / 1000;
+
+        // Inverter: the larger of (running load x 1.25) and (peak surge / 2 x 1.1), rounded up to a standard size.
+        const minContinuousW = Math.max(
+          totalRunningW * INVERTER_HEADROOM,
+          (estimatedPeakSurgeW / SURGE_CAPABILITY) * SURGE_MARGIN
+        );
+        let recInverterKw = 0;
+        if (minContinuousW > 0) {
+          recInverterKw = STANDARD_INVERTER_KW.find((kw) => kw * 1000 >= minContinuousW) || Math.ceil(minContinuousW / 1000);
+        }
+        const recInverterKva = recInverterKw > 0 ? +(recInverterKw / KVA_POWER_FACTOR).toFixed(2) : 0;
+
+        // Battery: energy requirement (loads carried x margin x days / usable fraction)
+        const dodFraction = Math.min(DOD_MAX / 100, Math.max(DOD_MIN / 100, state.dodPct / 100));
+        const usableBatteryWh = backupWh * marginFactor * state.autonomyDays;
+        const totalBatteryWh = usableBatteryWh / dodFraction;
+        const energyBatteryAh = totalBatteryWh / state.systemVoltage;
+
+        // Battery: continuous discharge-current requirement.
+        // The battery feeds the backed-up load with 25% headroom, never more than the inverter's own rating.
+        const batteryLoadW = Math.min(recInverterKw * 1000, backupRunningW * INVERTER_HEADROOM);
+        const invDcAmps = batteryLoadW / (state.systemVoltage * INVERTER_EFFICIENCY);
+        const surgeDcAmps = backupPeakW / (state.systemVoltage * INVERTER_EFFICIENCY);
+        const dischargeC = Math.max(0.05, Number(state.dischargeC) || 0.5);
+        const minAhForCurrent = invDcAmps / dischargeC;
+        const currentLimited = minAhForCurrent > energyBatteryAh;
+
+        // Final bank is whichever requirement is larger
+        const totalBatteryAh = Math.max(energyBatteryAh, minAhForCurrent);
+        const totalBatteryKwh = (totalBatteryAh * state.systemVoltage) / 1000;
+
+        return {
+          enrichedLoads,
+          totalRunningW,
+          totalDailyWh,
+          totalDailyKwh: totalDailyWh / 1000,
+          essentialWh,
+          nonEssentialWh,
+          estimatedPeakSurgeW,
+          adjustedDailyWh,
+          adjustedDailyKwh,
+          recInverterKw,
+          recInverterKva,
+          backupRunningW,
+          backupWh,
+          usableBatteryKwh: totalBatteryKwh * dodFraction,
+          energyBatteryAh,
+          minAhForCurrent,
+          invDcAmps,
+          surgeDcAmps,
+          currentLimited,
+          dischargeC,
+          totalBatteryKwh,
+          totalBatteryAh
+        };
+      }
+
+      /* ======================================================================
+         5. RENDER FUNCTIONS
+         ====================================================================== */
+      function renderPresets() {
+        el.presetGrid.innerHTML = PRESETS.map((p, idx) => `
+          <button type="button" class="preset-chip" data-preset-idx="${idx}" title="Add ${escapeHtml(p.name)} (${p.watts}W, ${p.hours}h/day)">
+            <span>+ ${escapeHtml(p.name)}</span>
+            <span class="preset-watts">${p.watts}W</span>
+          </button>
+        `).join("");
+      }
+
+      function getFilteredLoads() {
+        const q = tableSearchQuery.trim().toLowerCase();
+        return state.loads.filter((item) => {
+          const matchesCat = tableCategoryFilter === "ALL" || (item.group || "Living & Office") === tableCategoryFilter;
+          const matchesSearch = !q || item.name.toLowerCase().includes(q) || (item.group || "").toLowerCase().includes(q);
+          return matchesCat && matchesSearch;
+        });
+      }
+
+      function renderTableRows() {
+        const filtered = getFilteredLoads();
+        el.tableFilterCount.textContent =
+          filtered.length === state.loads.length
+            ? `${state.loads.length} appliance ${state.loads.length === 1 ? "line" : "lines"}`
+            : `Showing ${filtered.length} of ${state.loads.length}`;
+
+        if (state.loads.length === 0) {
+          el.loadTableBody.innerHTML = `
+            <tr>
+              <td colspan="9" class="empty-state">
+                No appliances added yet. Use the <strong>Add Any Custom Appliance</strong> bar above, pick a preset, or click <strong>Browse All Appliances (55+)</strong>.
+              </td>
+            </tr>
+          `;
+          return;
+        }
+
+        if (filtered.length === 0) {
+          el.loadTableBody.innerHTML = `
+            <tr>
+              <td colspan="9" class="empty-state">
+                No added appliances match your current search/category filter.
+              </td>
+            </tr>
+          `;
+          return;
+        }
+
+        el.loadTableBody.innerHTML = filtered.map((item) => {
+          const c = rowCalc(item);
+          const isEss = item.category === "essential";
+          const groupLabel = item.group || "Living & Office";
+
+          return `
+            <tr data-id="${item.id}">
+              <td>
+                <input type="text" class="table-input" data-field="name" value="${escapeHtml(item.name)}" aria-label="Appliance name" />
+                <div class="cat-tag">${escapeHtml(groupLabel)}</div>
+              </td>
+              <td>
+                <button type="button" class="cat-toggle ${isEss ? "essential" : "non-essential"}" data-action="toggle-cat" title="Click to switch between Essential and Non-Essential">
+                  ${isEss ? "● Essential" : "○ Non-Essential"}
+                </button>
+              </td>
+              <td class="center-col">
+                <input type="number" class="table-input qty-input" data-field="qty" min="1" max="999" step="1" value="${item.qty}" aria-label="Quantity" />
+              </td>
+              <td class="num-col">
+                <input type="number" class="table-input num-input" data-field="watts" min="0" max="100000" step="1" value="${item.watts}" aria-label="Running watts" />
+              </td>
+              <td class="center-col">
+                <select class="table-select" data-field="surge" aria-label="Surge multiplier">
+                  <option value="1" ${Number(item.surge) === 1 ? "selected" : ""}>1x (Resistive/LED)</option>
+                  <option value="1.5" ${Number(item.surge) === 1.5 ? "selected" : ""}>1.5x (Fan/Electronics)</option>
+                  <option value="2" ${Number(item.surge) === 2 ? "selected" : ""}>2x (Small Motor)</option>
+                  <option value="2.5" ${Number(item.surge) === 2.5 ? "selected" : ""}>2.5x (Power Tool)</option>
+                  <option value="3" ${Number(item.surge) === 3 ? "selected" : ""}>3x (Fridge/AC)</option>
+                  <option value="3.5" ${Number(item.surge) === 3.5 ? "selected" : ""}>3.5x (Freezer/Chiller)</option>
+                  <option value="4" ${Number(item.surge) === 4 ? "selected" : ""}>4x (Water Pump)</option>
+                  <option value="4.5" ${Number(item.surge) === 4.5 ? "selected" : ""}>4.5x (Borehole/Mill)</option>
+                  <option value="5" ${Number(item.surge) === 5 ? "selected" : ""}>5x (Heavy Compressor)</option>
+                </select>
+              </td>
+              <td class="num-col">
+                <input type="number" class="table-input num-input" data-field="hours" min="0" max="24" step="0.1" value="${item.hours}" aria-label="Active hours per day" />
+              </td>
+              <td class="num-col computed-cell" data-cell="dailyWh">${fmtNum(c.dailyWh)} Wh</td>
+              <td class="num-col surge-cell" data-cell="peakSurge">${fmtNum(c.peakW)} W</td>
+              <td class="center-col delete-col">
+                <button type="button" class="btn-icon-only" data-action="delete" title="Remove appliance" aria-label="Remove ${escapeHtml(item.name)}">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                </button>
+              </td>
+            </tr>
+          `;
+        }).join("");
+      }
+
+      function renderLibraryModal() {
+        const groups = ["ALL", ...new Set(APPLIANCE_LIBRARY.map((i) => i.group))];
+        el.libraryTabs.innerHTML = groups.map((g) => `
+          <button type="button" class="lib-tab ${libraryActiveGroup === g ? "active" : ""}" data-lib-group="${escapeHtml(g)}">
+            ${g === "ALL" ? `All (${APPLIANCE_LIBRARY.length})` : escapeHtml(g)}
+          </button>
+        `).join("");
+
+        const q = librarySearchQuery.trim().toLowerCase();
+        const matches = APPLIANCE_LIBRARY.filter((item) => {
+          const matchGroup = libraryActiveGroup === "ALL" || item.group === libraryActiveGroup;
+          const matchText = !q || item.name.toLowerCase().includes(q) || item.group.toLowerCase().includes(q);
+          return matchGroup && matchText;
+        });
+
+        if (matches.length === 0) {
+          el.libraryList.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:28px; color:var(--slate-500);">No library appliances match "${escapeHtml(librarySearchQuery)}". You can add any custom appliance directly in the main form!</div>`;
+          return;
+        }
+
+        el.libraryList.innerHTML = matches.map((item) => {
+          const libIdx = APPLIANCE_LIBRARY.indexOf(item);
+          return `
+            <div class="lib-item-card">
+              <div class="lib-item-info">
+                <div class="lib-item-title">${escapeHtml(item.name)}</div>
+                <div class="lib-item-specs">
+                  ${fmtNum(item.watts)}W • ${item.surge}x surge • ${item.hours}h/day • <strong>${item.category === "essential" ? "Essential" : "Non-Essential"}</strong>
+                </div>
+              </div>
+              <button type="button" class="btn btn-primary" style="padding:6px 11px; min-height:32px; font-size:0.78rem;" data-lib-add="${libIdx}">
+                + Add
+              </button>
+            </div>
+          `;
+        }).join("");
+      }
+
+      function updateCalculationsUI() {
+        const m = computeMetrics();
+        saveState();
+
+        // Update inline row computed cells without re-rendering inputs (keeps cursor focus)
+        m.enrichedLoads.forEach((item) => {
+          const row = el.loadTableBody.querySelector(`tr[data-id="${item.id}"]`);
+          if (row) {
+            const cellWh = row.querySelector('[data-cell="dailyWh"]');
+            const cellSurge = row.querySelector('[data-cell="peakSurge"]');
+            if (cellWh) cellWh.textContent = `${fmtNum(item.rowDailyWh)} Wh`;
+            if (cellSurge) cellSurge.textContent = `${fmtNum(item.rowPeakSurgeW)} W`;
+          }
+        });
+
+        // Category subtotals
+        const catTotals = {};
+        m.enrichedLoads.forEach((item) => {
+          const g = item.group || "Living & Office";
+          catTotals[g] = (catTotals[g] || 0) + item.rowDailyWh;
+        });
+        const catEntries = Object.entries(catTotals).sort((a, b) => b[1] - a[1]);
+        if (catEntries.length > 0) {
+          el.categorySubtotalStrip.style.display = "flex";
+          el.categorySubtotalStrip.innerHTML = `<strong style="color:var(--slate-600); align-self:center;">By Category:</strong>` +
+            catEntries.map(([grp, wh]) => `<span class="cat-sub-pill">${escapeHtml(grp)}: <span>${fmtNum(wh)} Wh</span></span>`).join("");
+        } else {
+          el.categorySubtotalStrip.style.display = "none";
+        }
+
+        // Table footer
+        el.footRunningWatts.textContent = `${fmtNum(m.totalRunningW)} W`;
+        el.footDailyWh.textContent = `${fmtNum(m.totalDailyWh)} Wh/day`;
+        el.footPeakSurge.textContent = `${fmtNum(m.estimatedPeakSurgeW)} W`;
+
+        // KPI 1
+        const totalUnits = m.enrichedLoads.reduce((acc, i) => acc + i.qty, 0);
+        el.kpiItemCount.textContent = `${totalUnits} ${totalUnits === 1 ? "unit" : "units"}`;
+        el.kpiRawEnergy.textContent = `${fmtNum(m.totalDailyKwh, 2)} kWh/day`;
+        el.kpiRawWh.textContent = `${fmtNum(m.totalDailyWh)} Wh/day before system losses`;
+        el.kpiEssentialBadge.textContent = `Essential: ${fmtNum(m.essentialWh)} Wh`;
+        el.kpiNonEssentialBadge.textContent = `Non-Ess: ${fmtNum(m.nonEssentialWh)} Wh`;
+
+        // KPI 2
+        el.kpiMarginTag.textContent = `+${state.marginPct}% margin`;
+        el.kpiAdjustedEnergy.textContent = `${fmtNum(m.adjustedDailyKwh, 2)} kWh/day`;
+        el.kpiAdjustedSub.textContent = `${fmtNum(m.adjustedDailyWh)} Wh/day incl. losses & safety buffer`;
+
+        // KPI 3
+        el.kpiSurgeTag.textContent = `Peak Surge: ${fmtNum(m.estimatedPeakSurgeW)} W`;
+        el.kpiInverterSize.textContent = m.recInverterKw > 0
+          ? `${fmtNum(m.recInverterKw, 1)} kW / ${fmtNum(m.recInverterKva, 2)} kVA`
+          : "0 kW";
+        el.kpiRunningLoad.textContent = `Connected running load: ${fmtNum(m.totalRunningW)} W`;
+
+        // KPI 4
+        el.kpiBattSpecTag.textContent = `${state.systemVoltage}V • ${state.dodPct}% DoD`;
+        el.kpiBatteryKwh.textContent = `${fmtNum(m.totalBatteryKwh, 2)} kWh`;
+        el.kpiBatteryAh.textContent = (m.currentLimited ? "Sized for discharge current. " : "") +
+          `≈ ${fmtNum(Math.ceil(m.totalBatteryAh))} Ah @ ${state.systemVoltage}V (${state.autonomyDays}d autonomy, ${state.backupScope === "essential" ? "essential loads" : "all loads"})`;
+
+        // Technician note
+        if (m.totalDailyWh === 0 && m.totalRunningW === 0) {
+          el.techSizingNote.innerHTML = `<strong>Technician Note:</strong> Add appliances above to calculate your inverter kW/kVA rating and battery bank Amp-Hour (Ah) capacity.`;
+        } else {
+          let voltageAdvice = "";
+          const dischargeNote = ` The battery carries about <strong>${fmtNum(m.backupRunningW)} W</strong> of running load, which is about <strong>${fmtNum(m.invDcAmps)} A</strong> of continuous DC current (25% headroom, ~90% inverter efficiency). At ${m.dischargeC}C the bank needs at least <strong>${fmtNum(Math.ceil(m.minAhForCurrent))} Ah</strong>${m.currentLimited ? ", and this, not the energy need, sets the size above." : "; your energy need is larger, so this is already covered."} Motor start-up pulls about <strong>${fmtNum(m.surgeDcAmps)} A</strong> for a few seconds: check that the battery's BMS peak-current rating covers it.`;
+          const maxKwForVoltage = { 12: 1.5, 24: 3, 48: 15 }[state.systemVoltage];
+          if (m.recInverterKw > maxKwForVoltage) {
+            voltageAdvice = ` <strong style="color:#e11d48;">Warning: a ${fmtNum(m.recInverterKw, 1)} kW inverter is too large for a ${state.systemVoltage}V bank (very high DC current). Choose a higher system voltage.</strong>`;
+          } else if (m.recInverterKw >= 3 && state.systemVoltage < 48) {
+            voltageAdvice = ` <em>Tip: For inverters ≥ 3 kW, switching to a <strong>48V</strong> battery bank reduces DC cable current and losses.</em>`;
+          } else if (m.recInverterKw <= 1.5 && state.systemVoltage === 48) {
+            voltageAdvice = ` <em>Tip: For compact systems ≤ 1.5 kW, a <strong>12V or 24V</strong> inverter/battery setup is often more cost-effective.</em>`;
+          }
+          el.techSizingNote.innerHTML = `
+            <strong>Technician Recommendation:</strong> Size a <strong>${fmtNum(m.recInverterKw, 1)} kW (${fmtNum(m.recInverterKva, 2)} kVA)</strong> pure sine wave inverter to handle ${fmtNum(m.totalRunningW)} W continuous load and ${fmtNum(m.estimatedPeakSurgeW)} W startup surge, paired with at least <strong>${fmtNum(m.totalBatteryKwh, 2)} kWh (${fmtNum(Math.ceil(m.totalBatteryAh))} Ah at ${state.systemVoltage}V)</strong> total battery storage (${fmtNum(m.usableBatteryKwh, 2)} kWh usable at ${state.dodPct}% DoD).${dischargeNote}${voltageAdvice}
+          `;
+        }
+
+        renderBreakdownChart(m);
+      }
+
+      function renderBreakdownChart(m) {
+        const total = m.totalDailyWh;
+        const essPct = total > 0 ? Math.round((m.essentialWh / total) * 100) : 0;
+        const nonEssPct = total > 0 ? 100 - essPct : 0;
+
+        el.legendEssential.textContent = `Essential: ${essPct}% (${fmtNum(m.essentialWh)} Wh)`;
+        el.legendNonEssential.textContent = `Non-Essential: ${nonEssPct}% (${fmtNum(m.nonEssentialWh)} Wh)`;
+        el.barEssentialPct.style.width = `${essPct}%`;
+        el.barNonEssentialPct.style.width = `${nonEssPct}%`;
+
+        if (m.enrichedLoads.length === 0 || total === 0) {
+          el.applianceBarList.innerHTML = `<div style="color:var(--slate-500); font-size:0.84rem; padding:12px 0;">Add loads with active hours &gt; 0 to see the per-appliance consumption chart.</div>`;
+          return;
+        }
+
+        const sorted = [...m.enrichedLoads].sort((a, b) => b.rowDailyWh - a.rowDailyWh);
+        el.applianceBarList.innerHTML = sorted.map((item) => {
+          const sharePct = total > 0 ? (item.rowDailyWh / total) * 100 : 0;
+          const isEss = item.category === "essential";
+          return `
+            <div>
+              <div class="bar-item-header">
+                <span class="bar-item-name">${escapeHtml(item.name)} ${item.qty > 1 ? `(×${item.qty})` : ""}</span>
+                <span class="bar-item-meta">${fmtNum(item.rowDailyWh)} Wh (${fmtNum(sharePct, 1)}%)</span>
+              </div>
+              <div class="bar-track">
+                <div class="bar-fill ${isEss ? "essential" : "non-essential"}" style="width:${Math.max(sharePct, 1.5)}%;"></div>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+
+      function fullRender() {
+        renderTableRows();
+        updateCalculationsUI();
+      }
+
+      function syncControlsFromState() {
+        el.inputMargin.value = state.marginPct;
+        el.labelMargin.textContent = `${state.marginPct}%`;
+        el.selectAutonomy.value = String(state.autonomyDays);
+        el.selectScope.value = state.backupScope || "all";
+        el.selectDischarge.value = String(state.dischargeC);
+
+        const knownDods = ["90", "80", "50"];
+        if (knownDods.includes(String(state.dodPct))) {
+          el.selectChemistry.value = String(state.dodPct);
+          el.customDodGroup.style.display = "none";
+        } else {
+          el.selectChemistry.value = "custom";
+          el.customDodGroup.style.display = "block";
+          el.inputCustomDod.value = state.dodPct;
+          el.labelCustomDod.textContent = `${state.dodPct}%`;
+        }
+
+        el.voltageBtns.forEach((b) => {
+          b.classList.toggle("active", Number(b.dataset.voltage) === state.systemVoltage);
+        });
+      }
+
+      function addLoadItem(itemData) {
+        state.loads.push({
+          id: nextId++,
+          name: itemData.name,
+          group: itemData.group || "Living & Office",
+          category: itemData.category || "essential",
+          qty: Math.max(1, Math.floor(Number(itemData.qty)) || 1),
+          watts: Math.max(0, Number(itemData.watts) || 0),
+          surge: Math.max(1, Number(itemData.surge) || 1),
+          hours: Math.min(24, Math.max(0, Number(itemData.hours) || 0))
+        });
+        // Clear filters so the new appliance is visible immediately
+        if (tableSearchQuery || tableCategoryFilter !== "ALL") {
+          tableSearchQuery = "";
+          tableCategoryFilter = "ALL";
+          el.tableSearchInput.value = "";
+          el.tableCategoryFilter.value = "ALL";
+        }
+        fullRender();
+      }
+
+      /* ======================================================================
+         6. EVENT HANDLERS
+         ====================================================================== */
+      el.presetGrid.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-preset-idx]");
+        if (!btn) return;
+        const preset = PRESETS[Number(btn.dataset.presetIdx)];
+        if (!preset) return;
+        addLoadItem(preset);
+        showToast(`Added ${preset.name}`);
+      });
+
+      el.customAddForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const name = el.newAppName.value.trim();
+        const watts = parseFloat(el.newAppWatts.value);
+        if (!name || isNaN(watts) || watts < 0) return;
+
+        addLoadItem({
+          name,
+          group: el.newAppGroup.value,
+          qty: parseInt(el.newAppQty.value, 10) || 1,
+          watts,
+          surge: parseFloat(el.newAppSurge.value) || 1,
+          hours: parseFloat(el.newAppHours.value) || 0,
+          category: el.newAppPriority.value
+        });
+
+        el.newAppName.value = "";
+        el.newAppWatts.value = "";
+        el.newAppQty.value = "1";
+        el.newAppName.focus();
+        showToast(`Added "${name}" (${fmtNum(watts)}W)`);
+      });
+
+      el.btnToggleConverter.addEventListener("click", () => {
+        el.converterDrawer.classList.toggle("open");
+      });
+
+      el.btnApplyAmps.addEventListener("click", () => {
+        const amps = parseFloat(el.convAmps.value) || 0;
+        const volts = parseFloat(el.convVolts.value) || 230;
+        const pf = Math.min(1, Math.max(0.1, parseFloat(el.convPf.value) || 1));
+        if (amps <= 0) {
+          showToast("Enter Amps greater than 0");
+          return;
+        }
+        // single-phase real power: W = V x A x power factor
+        const calcWatts = Math.round(amps * volts * pf);
+        el.newAppWatts.value = calcWatts;
+        showToast(`Calculated ${fmtNum(calcWatts)} W from ${amps}A × ${volts}V × ${pf} PF`);
+      });
+
+      el.btnApplyHp.addEventListener("click", () => {
+        const hp = parseFloat(el.convHp.value) || 0;
+        if (hp <= 0) {
+          showToast("Enter Motor Horsepower (HP) > 0");
+          return;
+        }
+        // shaft power (746 W per HP) divided by motor efficiency gives electrical input power
+        const calcWatts = Math.round(hp * 746 / MOTOR_EFFICIENCY);
+        el.newAppWatts.value = calcWatts;
+        el.newAppGroup.value = "Water Pumps & Outdoor";
+        el.newAppSurge.value = "4";
+        showToast(`${hp} HP → ${fmtNum(calcWatts)} W (746 W per HP ÷ ${MOTOR_EFFICIENCY * 100}% motor efficiency, 4x surge)`);
+      });
+
+      el.btnOpenLibrary.addEventListener("click", () => {
+        renderLibraryModal();
+        el.libraryModal.classList.add("open");
+        el.librarySearchInput.focus();
+      });
+
+      el.btnCloseLibrary.addEventListener("click", () => {
+        el.libraryModal.classList.remove("open");
+      });
+
+      el.libraryModal.addEventListener("click", (e) => {
+        if (e.target === el.libraryModal) el.libraryModal.classList.remove("open");
+      });
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") el.libraryModal.classList.remove("open");
+      });
+
+      el.libraryTabs.addEventListener("click", (e) => {
+        const tab = e.target.closest("[data-lib-group]");
+        if (!tab) return;
+        libraryActiveGroup = tab.dataset.libGroup;
+        renderLibraryModal();
+      });
+
+      el.librarySearchInput.addEventListener("input", (e) => {
+        librarySearchQuery = e.target.value;
+        renderLibraryModal();
+      });
+
+      el.libraryList.addEventListener("click", (e) => {
+        const addBtn = e.target.closest("[data-lib-add]");
+        if (!addBtn) return;
+        const item = APPLIANCE_LIBRARY[Number(addBtn.dataset.libAdd)];
+        if (!item) return;
+        addLoadItem(item);
+        showToast(`Added ${item.name}`);
+      });
+
+      el.tableSearchInput.addEventListener("input", (e) => {
+        tableSearchQuery = e.target.value;
+        renderTableRows();
+      });
+
+      el.tableCategoryFilter.addEventListener("change", (e) => {
+        tableCategoryFilter = e.target.value;
+        renderTableRows();
+      });
+
+      el.btnAddCustom.addEventListener("click", () => {
+        addLoadItem({
+          name: "Custom Appliance",
+          group: "Living & Office",
+          category: "essential",
+          qty: 1,
+          watts: 100,
+          surge: 1,
+          hours: 2
+        });
+        const lastInput = el.loadTableBody.querySelector("tr:last-child input[data-field='name']");
+        if (lastInput) {
+          lastInput.focus();
+          lastInput.select();
+        }
+      });
+
+      el.btnResetSample.addEventListener("click", () => {
+        state = JSON.parse(JSON.stringify(DEFAULT_STATE));
+        nextId = state.loads.reduce((max, item) => Math.max(max, item.id), 0) + 1;
+        tableSearchQuery = "";
+        tableCategoryFilter = "ALL";
+        el.tableSearchInput.value = "";
+        el.tableCategoryFilter.value = "ALL";
+        syncControlsFromState();
+        fullRender();
+        showToast("Sample load profile restored");
+      });
+
+      el.btnClearAll.addEventListener("click", () => {
+        if (state.loads.length === 0) return;
+        state.loads = [];
+        fullRender();
+        showToast("Cleared all appliances");
+      });
+
+      el.loadTableBody.addEventListener("input", (e) => {
+        const tr = e.target.closest("tr[data-id]");
+        if (!tr) return;
+        const id = Number(tr.dataset.id);
+        const field = e.target.dataset.field;
+        const load = state.loads.find((l) => l.id === id);
+        if (!load || !field) return;
+
+        if (field === "name") {
+          load.name = e.target.value;
+        } else {
+          load[field] = parseFloat(e.target.value) || 0;
+        }
+        updateCalculationsUI();
+      });
+
+      el.loadTableBody.addEventListener("change", (e) => {
+        const tr = e.target.closest("tr[data-id]");
+        if (!tr) return;
+        const id = Number(tr.dataset.id);
+        const field = e.target.dataset.field;
+        const load = state.loads.find((l) => l.id === id);
+        if (!load || !field) return;
+
+        if (field === "surge") {
+          load.surge = parseFloat(e.target.value) || 1;
+          updateCalculationsUI();
+        }
+      });
+
+      el.loadTableBody.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-action]");
+        if (!btn) return;
+        const tr = btn.closest("tr[data-id]");
+        if (!tr) return;
+        const id = Number(tr.dataset.id);
+        const action = btn.dataset.action;
+
+        if (action === "toggle-cat") {
+          const load = state.loads.find((l) => l.id === id);
+          if (load) {
+            load.category = load.category === "essential" ? "non-essential" : "essential";
+            fullRender();
+          }
+        } else if (action === "delete") {
+          state.loads = state.loads.filter((l) => l.id !== id);
+          fullRender();
+          showToast("Appliance removed");
+        }
+      });
+
+      el.inputMargin.addEventListener("input", (e) => {
+        state.marginPct = Number(e.target.value);
+        el.labelMargin.textContent = `${state.marginPct}%`;
+        updateCalculationsUI();
+      });
+
+      el.selectAutonomy.addEventListener("change", (e) => {
+        state.autonomyDays = parseFloat(e.target.value) || 1;
+        updateCalculationsUI();
+      });
+
+      el.selectDischarge.addEventListener("change", (e) => {
+        state.dischargeC = parseFloat(e.target.value) || 0.5;
+        updateCalculationsUI();
+      });
+
+      el.selectScope.addEventListener("change", (e) => {
+        state.backupScope = e.target.value === "essential" ? "essential" : "all";
+        updateCalculationsUI();
+      });
+
+      el.selectChemistry.addEventListener("change", (e) => {
+        const val = e.target.value;
+        if (val === "custom") {
+          el.customDodGroup.style.display = "block";
+          state.dodPct = Number(el.inputCustomDod.value);
+          el.labelCustomDod.textContent = `${state.dodPct}%`;
+        } else {
+          el.customDodGroup.style.display = "none";
+          state.dodPct = Math.round(parseFloat(val));
+        }
+        // sensible default discharge rate for the chosen chemistry (can be changed afterwards)
+        state.dischargeC = state.dodPct >= 70 ? 0.5 : 0.15;
+        el.selectDischarge.value = String(state.dischargeC);
+        updateCalculationsUI();
+      });
+
+      el.inputCustomDod.addEventListener("input", (e) => {
+        state.dodPct = Number(e.target.value);
+        el.labelCustomDod.textContent = `${state.dodPct}%`;
+        updateCalculationsUI();
+      });
+
+      el.voltageBtns.forEach((btn) => {
+        btn.addEventListener("click", () => {
+          el.voltageBtns.forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          state.systemVoltage = Number(btn.dataset.voltage);
+          updateCalculationsUI();
+        });
+      });
+
+      /* ======================================================================
+         7. EXPORT CSV & PRINT
+         ====================================================================== */
+      el.btnExportCsv.addEventListener("click", () => {
+        const m = computeMetrics();
+        const rows = [
+          ["SOLAR LOAD PROFILE & SIZING AUDIT"],
+          ["Appliance", "Category", "Priority", "Qty", "Running Watts (W)", "Surge Multiplier", "Active Hours/Day", "Daily Energy (Wh)", "Peak Surge (W)"]
+        ];
+
+        m.enrichedLoads.forEach((item) => {
+          rows.push([
+            csvText(item.name),
+            csvText(item.group || "Living & Office"),
+            item.category,
+            item.qty,
+            item.watts,
+            `${item.surge}x`,
+            item.hours,
+            item.rowDailyWh,
+            item.rowPeakSurgeW
+          ]);
+        });
+
+        rows.push([]);
+        rows.push(["SUMMARY & SYSTEM SIZING"]);
+        rows.push(["Total Connected Running Load (W)", m.totalRunningW]);
+        rows.push(["Estimated Peak Surge (W)", m.estimatedPeakSurgeW]);
+        rows.push(["Raw Daily Energy (Wh/day)", m.totalDailyWh]);
+        rows.push(["System Loss & Safety Margin (%)", `${state.marginPct}%`]);
+        rows.push(["Design Daily Energy Target (Wh/day)", Math.round(m.adjustedDailyWh)]);
+        rows.push(["Recommended Inverter Size", `${m.recInverterKw} kW / ${m.recInverterKva} kVA`]);
+        rows.push(["Backup Autonomy (Days)", state.autonomyDays]);
+        rows.push(["Battery Backs Up", state.backupScope === "essential" ? "Essential loads only" : "All loads"]);
+        rows.push(["Backed-Up Running Load (W)", m.backupRunningW]);
+        rows.push(["Battery Max Discharge (C)", state.dischargeC]);
+        rows.push(["Battery Continuous DC Current (A)", Math.round(m.invDcAmps)]);
+        rows.push(["Battery Start-up DC Current (A)", Math.round(m.surgeDcAmps)]);
+        rows.push(["Min Battery Ah for Energy", Math.ceil(m.energyBatteryAh)]);
+        rows.push(["Min Battery Ah for Discharge Current", Math.ceil(m.minAhForCurrent)]);
+        rows.push(["Battery DoD (%)", `${state.dodPct}%`]);
+        rows.push(["System DC Voltage (V)", `${state.systemVoltage}V`]);
+        rows.push(["Recommended Total Battery Capacity (kWh)", m.totalBatteryKwh.toFixed(2)]);
+        rows.push(["Recommended Total Battery Capacity (Ah)", Math.ceil(m.totalBatteryAh)]);
+
+        const csvContent = rows.map((r) => r.join(",")).join("\n");
+        const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "solar-load-profile-audit.csv";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        showToast("CSV audit downloaded");
+      });
+
+      el.btnPrint.addEventListener("click", () => {
+        window.print();
+      });
+
+      /* ======================================================================
+         8. INITIALIZE
+         ====================================================================== */
+      syncControlsFromState();
+      renderPresets();
+      fullRender();
+    })();
+  </script>
+</body>
+</html>
