@@ -400,6 +400,19 @@
       </div>
     </header>
 
+    <section class="card">
+      <div class="card-body" style="display:flex; flex-wrap:wrap; gap:16px; align-items:center; justify-content:space-between;">
+        <div>
+          <label class="param-label" for="selectPhase" style="display:block; margin-bottom:6px;">Quote Type (AC Supply)</label>
+          <select id="selectPhase" class="form-control" style="min-width:240px;">
+            <option value="1">Single-phase 240 V</option>
+            <option value="3">Three-phase 415 V</option>
+          </select>
+        </div>
+        <div class="param-help" style="max-width:520px;">Sets the inverter type and sizes, the AC cable and breaker ratings, the ATS and the grid-side protection. Single-phase suits most homes and shops; three-phase suits larger premises or three-phase motors.</div>
+      </div>
+    </section>
+
     <section class="kpi-grid" aria-label="Load Summary Metrics">
       <div class="kpi-card accent-navy">
         <div>
@@ -706,6 +719,34 @@
             <div class="param-help">The most current the battery can supply continuously, as a fraction of its Ah. For lithium, use the BMS rating on the datasheet.</div>
           </div>
 
+          <div class="param-group">
+            <div class="param-label-row">
+              <label class="param-label" for="inputNightShare">Energy the Battery Must Supply</label>
+              <span class="param-value-badge" id="labelNightShare">60%</span>
+            </div>
+            <input type="range" id="inputNightShare" min="10" max="100" step="5" value="60" />
+            <div class="param-help">Share of the backed-up daily energy used when the sun is down and the grid is off (evening, night, early morning). Daytime loads run straight from the panels. Set 100% for a conservative whole-day battery.</div>
+          </div>
+
+          <div class="param-row-2 param-group">
+            <div>
+              <label class="param-label" for="inputBattUnitV" style="display:block; margin-bottom:6px;">Battery Unit Voltage</label>
+              <select id="inputBattUnitV" class="form-control">
+                <option value="2">2 V cell</option>
+                <option value="6">6 V</option>
+                <option value="12" selected>12 V</option>
+                <option value="24">24 V</option>
+                <option value="48">48 V</option>
+                <option value="51.2">51.2 V (LiFePO4 rack)</option>
+              </select>
+            </div>
+            <div>
+              <label class="param-label" for="inputBattUnitAh" style="display:block; margin-bottom:6px;">Battery Unit Capacity (Ah)</label>
+              <input type="number" id="inputBattUnitAh" class="form-control" min="5" max="5000" step="5" value="100" />
+            </div>
+          </div>
+          <div class="tech-note-box" id="battWiringNote" style="margin-top:0; margin-bottom:16px;"></div>
+
           <div class="tech-note-box" id="techSizingNote">
             <strong>Technician Note:</strong> Add appliances above to calculate your inverter kW/kVA rating and battery bank Amp-Hour (Ah) capacity.
           </div>
@@ -765,6 +806,29 @@
           <div class="param-help">Real output vs. rated: heat, dust, cable and inverter losses. 70–80% is typical.</div>
         </div>
 
+        <div class="param-row-2 param-group">
+          <div>
+            <label class="param-label" for="inputVoc" style="display:block; margin-bottom:6px;">Panel Voc (V)</label>
+            <input type="number" id="inputVoc" class="form-control" min="10" max="200" step="0.1" value="49.5" />
+            <div class="param-help">Open-circuit voltage from the panel datasheet.</div>
+          </div>
+          <div>
+            <label class="param-label" for="inputVmp" style="display:block; margin-bottom:6px;">Panel Vmp (V)</label>
+            <input type="number" id="inputVmp" class="form-control" min="10" max="200" step="0.1" value="41.5" />
+            <div class="param-help">Voltage at maximum power.</div>
+          </div>
+          <div>
+            <label class="param-label" for="inputIsc" style="display:block; margin-bottom:6px;">Panel Isc (A)</label>
+            <input type="number" id="inputIsc" class="form-control" min="1" max="40" step="0.1" value="14" />
+            <div class="param-help">Short-circuit current from the datasheet.</div>
+          </div>
+          <div>
+            <label class="param-label" for="inputCtrlVmax" style="display:block; margin-bottom:6px;">Controller Max PV Voltage (V)</label>
+            <input type="number" id="inputCtrlVmax" class="form-control" min="50" max="1000" step="10" value="150" />
+            <div class="param-help">Maximum PV input voltage of the MPPT controller (e.g. 100, 150, 250, 450).</div>
+          </div>
+        </div>
+
         <div class="kpi-grid" style="margin-bottom:0;">
           <div class="kpi-card accent-amber">
             <div class="kpi-label"><span>Required Array</span></div>
@@ -789,6 +853,103 @@
         </div>
 
         <div class="tech-note-box" id="arrayNote"></div>
+
+        <h3 class="card-title" style="margin:18px 0 10px;">Panel Connection Options: Series vs Parallel</h3>
+        <div class="table-wrapper">
+          <table class="load-table">
+            <thead>
+              <tr>
+                <th style="min-width:200px;">Connection</th>
+                <th class="num-col">Panels Wired</th>
+                <th class="num-col">Cold Voc</th>
+                <th class="num-col">Hot Vmp</th>
+                <th class="num-col">Array Current</th>
+                <th style="min-width:260px;">Verdict</th>
+              </tr>
+            </thead>
+            <tbody id="pvConnBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Cable Sizing &amp; Protection</h2>
+          <p class="card-subtitle">Panels → controller → battery → inverter → ATS → grid, with the breakers, fuses and surge protection each run needs</p>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="param-row-2 param-group">
+          <div>
+            <label class="param-label" for="selectAcSystem" style="display:block; margin-bottom:6px;">AC Supply (Inverter Output / Grid)</label>
+            <select id="selectAcSystem" class="form-control">
+              <option value="1">Single-phase 240 V</option>
+              <option value="3">Three-phase 415 V</option>
+            </select>
+            <div class="param-help">Kept in step with the Quote Type at the top of the page.</div>
+          </div>
+          <div>
+            <label class="param-label" for="selectAmbient" style="display:block; margin-bottom:6px;">Worst Ambient Temperature</label>
+            <select id="selectAmbient" class="form-control">
+              <option value="30">30 °C</option>
+              <option value="35" selected>35 °C</option>
+              <option value="40">40 °C</option>
+              <option value="45">45 °C</option>
+              <option value="50">50 °C</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="param-group">
+          <span class="param-label" style="display:block; margin-bottom:6px;">One-way cable length for each run (m)</span>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px;">
+            <div><label class="param-help" for="lenPv">Panels → controller</label><input type="number" id="lenPv" class="form-control" min="0.5" max="500" step="0.5" value="15" /></div>
+            <div><label class="param-help" for="lenCtrl">Controller → battery</label><input type="number" id="lenCtrl" class="form-control" min="0.5" max="500" step="0.5" value="2" /></div>
+            <div><label class="param-help" for="lenBatt">Battery → inverter</label><input type="number" id="lenBatt" class="form-control" min="0.5" max="500" step="0.5" value="1.5" /></div>
+            <div><label class="param-help" for="lenInv">Inverter → ATS</label><input type="number" id="lenInv" class="form-control" min="0.5" max="500" step="0.5" value="3" /></div>
+            <div><label class="param-help" for="lenGrid">ATS → grid</label><input type="number" id="lenGrid" class="form-control" min="0.5" max="500" step="0.5" value="10" /></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="load-table">
+          <thead>
+            <tr>
+              <th style="min-width:220px;">Cable Run</th>
+              <th class="num-col">Design Current</th>
+              <th class="num-col">Protective Device</th>
+              <th class="num-col">Length</th>
+              <th class="num-col">Copper Cable</th>
+              <th class="num-col">Voltage Drop</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody id="cableTableBody"></tbody>
+        </table>
+      </div>
+
+      <div class="card-body">
+        <h3 class="card-title" style="margin-bottom:10px;">Protection Schedule</h3>
+      </div>
+      <div class="table-wrapper">
+        <table class="load-table">
+          <thead>
+            <tr>
+              <th style="min-width:170px;">Location</th>
+              <th style="min-width:230px;">Device</th>
+              <th>Rating</th>
+              <th style="min-width:260px;">Note</th>
+            </tr>
+          </thead>
+          <tbody id="protTableBody"></tbody>
+        </table>
+      </div>
+
+      <div class="card-body">
+        <div class="tech-note-box" id="cableNote" style="margin-top:0;"></div>
       </div>
     </section>
 
@@ -837,10 +998,33 @@
       const INVERTER_EFFICIENCY = 0.9;  // DC to AC conversion, used for battery current
       const KVA_POWER_FACTOR = 0.8;     // kVA = kW / 0.8 (many hybrid inverters rate kW = kVA: check the datasheet)
       const STANDARD_INVERTER_KW = [0.5, 1.0, 1.5, 2.0, 3.0, 3.5, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0];
+      const STANDARD_INVERTER_KW_3P = [5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0];
 
       const DISCHARGE_C_OPTIONS = [0.1, 0.15, 0.2, 0.3, 0.5, 1];
+      const BATT_UNIT_VOLTS = [2, 6, 12, 24, 48, 51.2];
       const CONTROLLER_HEADROOM = 1.25; // controller current rating = 125% of array current
       const STANDARD_CONTROLLER_A = [10, 20, 30, 40, 50, 60, 80, 100];
+
+      // Battery round-trip efficiency (energy that passes through the battery is partly lost)
+      const BATTERY_RTE_LITHIUM = 0.95;
+      const BATTERY_RTE_LEAD = 0.8;
+
+      // Cable and protection rules (copper conductors, planning values)
+      const AC_VOLTS = { 1: 240, 3: 415 };
+      const AC_PF = 0.9;                 // power factor used for AC currents and voltage drop
+      const CU_RESISTIVITY = 0.021;      // ohm.mm2/m, copper at about 70 C
+      const CABLE_SIZES = [1.5, 2.5, 4, 6, 10, 16, 25, 35, 50, 70, 95, 120, 150, 185, 240];
+      const AMPACITY_PVC = [19.5, 27, 36, 46, 63, 85, 112, 138, 168, 213, 258, 299, 344, 392, 461];  // 70 C insulation, clipped direct, 30 C
+      const AMPACITY_XLPE = [24, 33, 45, 58, 80, 107, 138, 171, 209, 269, 328, 382, 441, 506, 599]; // 90 C insulation (PV cable)
+      const TEMP_DERATE_PVC = { 30: 1, 35: 0.94, 40: 0.87, 45: 0.79, 50: 0.71 };
+      const TEMP_DERATE_XLPE = { 30: 1, 35: 0.96, 40: 0.91, 45: 0.87, 50: 0.82 };
+      const PV_ROOF_DERATE = 0.65;       // PV cables sit under hot panels: about 65 C
+      const COLD_VOC_FACTOR = 1.15;      // Voc rises on cold mornings
+      const STD_DC_BREAKER = [10, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800];
+      const STD_AC_BREAKER = [6, 10, 16, 20, 25, 32, 40, 50, 63, 80, 100, 125, 160, 200, 250];
+      const STD_PV_FUSE = [10, 12, 15, 16, 20, 25, 32];
+      const VD_LIMITS = { pv: 3, ctrl: 1.5, batt: 1, inv: 2, grid: 2 }; // maximum voltage drop, % of circuit voltage
+      const MIN_CABLE_MM2 = { pv: 4, ctrl: 4, batt: 4, inv: 2.5, grid: 2.5 }; // smallest cable used on each run, whatever the maths says
       const DOD_MIN = 30, DOD_MAX = 95;
 
       const APPLIANCE_LIBRARY = [
@@ -932,7 +1116,21 @@
         systemVoltage: 48,
         sunHours: 5,
         performanceRatio: 75,
-        panelWatts: 550
+        panelWatts: 550,
+        nightSharePct: 60,
+        panelVoc: 49.5,
+        panelVmp: 41.5,
+        panelIsc: 14,
+        ctrlMaxVoc: 150,
+        ambientC: 35,
+        acPhases: 1,
+        lenPv: 15,
+        lenCtrl: 2,
+        lenBatt: 1.5,
+        lenInv: 3,
+        lenGrid: 10,
+        battUnitV: 12,
+        battUnitAh: 100
       };
 
       function clamp(value, min, max, fallback) {
@@ -967,7 +1165,21 @@
               dischargeC: DISCHARGE_C_OPTIONS.includes(Number(parsed.dischargeC)) ? Number(parsed.dischargeC) : (dod >= 70 ? 0.5 : 0.15),
               sunHours: clamp(parsed.sunHours, 1, 10, 5),
               performanceRatio: Math.round(clamp(parsed.performanceRatio, 50, 95, 75)),
-              panelWatts: clamp(parsed.panelWatts, 10, 1000, 550)
+              panelWatts: clamp(parsed.panelWatts, 10, 1000, 550),
+              nightSharePct: Math.round(clamp(parsed.nightSharePct, 10, 100, 60)),
+              panelVoc: clamp(parsed.panelVoc, 10, 200, 49.5),
+              panelVmp: clamp(parsed.panelVmp, 10, 200, 41.5),
+              panelIsc: clamp(parsed.panelIsc, 1, 40, 14),
+              ctrlMaxVoc: clamp(parsed.ctrlMaxVoc, 50, 1000, 150),
+              ambientC: [30, 35, 40, 45, 50].includes(Number(parsed.ambientC)) ? Number(parsed.ambientC) : 35,
+              acPhases: Number(parsed.acPhases) === 3 ? 3 : 1,
+              lenPv: clamp(parsed.lenPv, 0.5, 500, 15),
+              lenCtrl: clamp(parsed.lenCtrl, 0.5, 500, 2),
+              lenBatt: clamp(parsed.lenBatt, 0.5, 500, 1.5),
+              lenInv: clamp(parsed.lenInv, 0.5, 500, 3),
+              lenGrid: clamp(parsed.lenGrid, 0.5, 500, 10),
+              battUnitV: BATT_UNIT_VOLTS.includes(Number(parsed.battUnitV)) ? Number(parsed.battUnitV) : 12,
+              battUnitAh: clamp(parsed.battUnitAh, 5, 5000, 100)
             };
           }
         } catch (e) {
@@ -1128,6 +1340,56 @@
         return { qty, watts, surge, hours, runningW, dailyWh, surgeExtraW, peakW };
       }
 
+      function nextStd(list, value) {
+        return list.find((x) => x >= value) || Math.ceil(value);
+      }
+
+      // Every way to wire the panels, and the best one: voltage must be safe for the controller (cold) and high
+      // enough to charge the bank (hot); then fewest extra panels; then highest voltage (lowest current).
+      function pvConnectionOptions(panelCount) {
+        const vocCold = state.panelVoc * COLD_VOC_FACTOR;
+        const maxSeries = Math.max(1, Math.floor(state.ctrlMaxVoc / vocCold));
+        const minVmp = state.systemVoltage + 15;
+        const rows = [];
+        if (panelCount > 0) {
+          for (let s = 1; s <= Math.min(panelCount, maxSeries); s++) {
+            const p = Math.ceil(panelCount / s);
+            const vmpHot = s * state.panelVmp * 0.8;
+            rows.push({ series: s, parallel: p, wired: s * p, extra: s * p - panelCount, voc: s * vocCold, vmpHot, amps: p * state.panelIsc, vmpOk: vmpHot >= minVmp });
+          }
+        }
+        const okRows = rows.filter((r) => r.vmpOk);
+        const pool = okRows.length ? okRows : rows;
+        let best = null;
+        pool.forEach((r) => {
+          if (!best || r.extra < best.extra || (r.extra === best.extra && r.series > best.series)) best = r;
+        });
+        return { rows, best, maxSeries, minVmp };
+      }
+
+      function earthSize(phaseMm2) {
+        let s;
+        if (phaseMm2 <= 16) s = phaseMm2;
+        else if (phaseMm2 <= 35) s = 16;
+        else s = nextStd(CABLE_SIZES, phaseMm2 / 2);
+        return Math.max(4, s); // 4 mm² minimum where the conductor is not mechanically protected
+      }
+
+      // Smallest standard copper size that meets BOTH the voltage-drop limit and the current rating of the protective device.
+      function sizeCable(o) {
+        const k = o.kind === "dc" ? 2 : (o.kind === "ac3" ? Math.sqrt(3) * AC_PF : 2 * AC_PF);
+        const maxDropV = o.volts * o.vdPct / 100;
+        const minByDrop = (k * CU_RESISTIVITY * o.lengthM * o.ib) / maxDropV;
+        const table = o.xlpe ? AMPACITY_XLPE : AMPACITY_PVC;
+        const minSize = Math.max(minByDrop, o.minSize || 0);
+        let idx = CABLE_SIZES.findIndex((s, i) => s >= minSize && table[i] * o.derate >= o.inA);
+        let note = "";
+        if (idx === -1) { idx = CABLE_SIZES.length - 1; note = "Above 240 mm²: use parallel cables"; }
+        const size = CABLE_SIZES[idx];
+        const dropV = (k * CU_RESISTIVITY * o.lengthM * o.ib) / size;
+        return { size, dropPct: (dropV / o.volts) * 100, note };
+      }
+
       function computeMetrics() {
         let totalRunningW = 0;
         let totalDailyWh = 0;
@@ -1177,15 +1439,35 @@
           totalRunningW * INVERTER_HEADROOM,
           (estimatedPeakSurgeW / SURGE_CAPABILITY) * SURGE_MARGIN
         );
+        const phaseCount = state.acPhases === 3 ? 3 : 1;
+        const inverterSizes = phaseCount === 3 ? STANDARD_INVERTER_KW_3P : STANDARD_INVERTER_KW;
         let recInverterKw = 0;
         if (minContinuousW > 0) {
-          recInverterKw = STANDARD_INVERTER_KW.find((kw) => kw * 1000 >= minContinuousW) || Math.ceil(minContinuousW / 1000);
+          recInverterKw = inverterSizes.find((kw) => kw * 1000 >= minContinuousW) || Math.ceil(minContinuousW / 1000);
         }
         const recInverterKva = recInverterKw > 0 ? +(recInverterKw / KVA_POWER_FACTOR).toFixed(2) : 0;
 
+        // Phase checks for the quote type
+        const maxSingleLoadW = enrichedLoads.reduce((mx, l) => (l.qty > 0 && l.watts > mx ? l.watts : mx), 0);
+        let phaseAdvice = "";
+        if (phaseCount === 3) {
+          phaseAdvice = ` <em>Three-phase quote: use a three-phase inverter and spread the single-phase loads evenly across the three phases (about ${fmtNum((recInverterKw * 1000) / 3)} W per phase).</em>`;
+          if (minContinuousW > 0 && minContinuousW < 3000) {
+            phaseAdvice += ` <em>The smallest three-phase inverter listed is ${STANDARD_INVERTER_KW_3P[0]} kW, well above this load (${fmtNum(Math.ceil(minContinuousW))} W needed). If the customer does not need a three-phase supply for these loads, a single-phase inverter will cost less.</em>`;
+          }
+          if (maxSingleLoadW > (recInverterKw * 1000) / 3) {
+            phaseAdvice += ` <strong style="color:#e11d48;">Warning: the largest single-phase load (${fmtNum(maxSingleLoadW)} W) is more than one phase can supply. Use a three-phase motor or load, or a larger inverter.</strong>`;
+          }
+        } else if (recInverterKw > 10) {
+          phaseAdvice = ` <strong style="color:#e11d48;">Warning: ${fmtNum(recInverterKw, 1)} kW is large for a single-phase supply. Check the available inverter sizes, split the load across several inverters, or quote three-phase.</strong>`;
+        }
+
         // Battery: energy requirement (loads carried x margin x days / usable fraction)
         const dodFraction = Math.min(DOD_MAX / 100, Math.max(DOD_MIN / 100, state.dodPct / 100));
-        const usableBatteryWh = backupWh * marginFactor * state.autonomyDays;
+        // Daytime loads run straight from the panels; the battery only supplies the non-sun hours (grid off)
+        const nightFraction = Math.min(1, Math.max(0.1, state.nightSharePct / 100));
+        const batteryDeliveredWh = backupWh * nightFraction;
+        const usableBatteryWh = batteryDeliveredWh * marginFactor * state.autonomyDays;
         const totalBatteryWh = usableBatteryWh / dodFraction;
         const energyBatteryAh = totalBatteryWh / state.systemVoltage;
 
@@ -1202,10 +1484,27 @@
         const totalBatteryAh = Math.max(energyBatteryAh, minAhForCurrent);
         const totalBatteryKwh = (totalBatteryAh * state.systemVoltage) / 1000;
 
+        // Battery bank wiring: series makes the voltage, parallel makes the Ah
+        const battSeries = Math.max(1, Math.round(state.systemVoltage / state.battUnitV));
+        const battParallel = Math.max(1, Math.ceil(totalBatteryAh / state.battUnitAh));
+        const battUnits = battSeries * battParallel;
+        const battBankAh = battParallel * state.battUnitAh;
+        const battBankKwh = (battBankAh * battSeries * state.battUnitV) / 1000;
+        const battIsLead = dodFraction < 0.7;
+        const battMaxParallel = battIsLead ? 3 : 4;
+        const battVoltMismatch = Math.abs(battSeries * state.battUnitV - state.systemVoltage) / state.systemVoltage > 0.1;
+
         // Solar array: energy the array must make per day = load / (sun hours x performance ratio)
         const pr = state.performanceRatio / 100;
-        const requiredArrayWp = totalDailyWh > 0 ? totalDailyWh / (state.sunHours * pr) : 0;
-        const panelCount = requiredArrayWp > 0 ? Math.ceil(requiredArrayWp / state.panelWatts) : 0;
+        // Energy that passes through the battery is partly lost, so the array makes up that loss
+        const batteryRte = dodFraction >= 0.7 ? BATTERY_RTE_LITHIUM : BATTERY_RTE_LEAD;
+        const arrayDailyWh = totalDailyWh + batteryDeliveredWh * (1 / batteryRte - 1);
+        const requiredArrayWp = totalDailyWh > 0 ? arrayDailyWh / (state.sunHours * pr) : 0;
+        const minPanelCount = requiredArrayWp > 0 ? Math.ceil(requiredArrayWp / state.panelWatts) : 0;
+        // Best series/parallel layout for that many panels. It can add a spare panel so every string is equal,
+        // so the panels to install, the array size, the yield and the controller all come from the wired count.
+        const pvOptions = pvConnectionOptions(minPanelCount);
+        const panelCount = pvOptions.best ? pvOptions.best.wired : minPanelCount;
         const installedArrayWp = panelCount * state.panelWatts;
         const dailyYieldWh = installedArrayWp * state.sunHours * pr;
         const controllerAmps = (installedArrayWp / state.systemVoltage) * CONTROLLER_HEADROOM;
@@ -1213,6 +1512,76 @@
           ? (STANDARD_CONTROLLER_A.find((a) => a >= controllerAmps) || STANDARD_CONTROLLER_A[STANDARD_CONTROLLER_A.length - 1])
           : 0;
         const controllerCount = controllerRating > 0 ? Math.ceil(controllerAmps / controllerRating) : 0;
+
+        // ---- Cables & protection ----
+        const acPhases = phaseCount;
+        const acVolts = AC_VOLTS[acPhases];
+        const acDivisor = acPhases === 3 ? Math.sqrt(3) * acVolts : acVolts; // amps = VA / this
+        const acKind = acPhases === 3 ? "ac3" : "ac1";
+        const dPvc = TEMP_DERATE_PVC[state.ambientC] || 1;
+
+        // PV strings: the best series/parallel layout from the options table
+        const stringCount = pvOptions.best ? pvOptions.best.parallel : 0;
+        const panelsPerString = pvOptions.best ? pvOptions.best.series : 0;
+        const wiredPanels = stringCount * panelsPerString;
+        const stringVoc = panelsPerString * state.panelVoc * COLD_VOC_FACTOR;
+        const stringVmp = panelsPerString * state.panelVmp;
+        const vocTooHigh = state.panelVoc * COLD_VOC_FACTOR > state.ctrlMaxVoc;
+        const lowStringVoltage = panelsPerString > 0 && stringVmp * 0.8 < state.systemVoltage + 15;
+        const stringsPerCtrl = stringCount > 0 ? Math.ceil(stringCount / Math.max(1, controllerCount)) : 0;
+
+        // Design currents (Ib) and protective device ratings (In)
+        const pvIb = state.panelIsc * 1.25 * stringsPerCtrl;
+        const pvIn = nextStd(STD_DC_BREAKER, pvIb * 1.25);
+        const ctrlIb = controllerRating;
+        const ctrlIn = nextStd(STD_DC_BREAKER, ctrlIb);
+        const battIb = (recInverterKw * 1000) / (state.systemVoltage * INVERTER_EFFICIENCY);
+        const battIn = nextStd(STD_DC_BREAKER, battIb * 1.25);
+        const invIb = (recInverterKva * 1000) / acDivisor;
+        const invIn = nextStd(STD_AC_BREAKER, invIb);
+        const gridIb = Math.max(invIb, totalRunningW / (acDivisor * AC_PF));
+        const gridIn = nextStd(STD_AC_BREAKER, gridIb);
+        const atsIn = nextStd(STD_AC_BREAKER, Math.max(gridIn, 16));
+
+        const cableRuns = [];
+        const addRun = (key, label, circuit, ib, inA, volts, lengthM, kind, xlpe, derate) => {
+          if (!(ib > 0)) return;
+          const res = sizeCable({ ib, inA, volts, lengthM, vdPct: VD_LIMITS[key], kind, xlpe, derate, minSize: MIN_CABLE_MM2[key] });
+          cableRuns.push({ key, label, circuit, ib, inA, lengthM, vdLimit: VD_LIMITS[key], res });
+        };
+        if (panelCount > 0) {
+          addRun("pv", "Panels → MPPT controller", `DC · ${fmtNum(stringVmp)} V string · XLPE PV cable`, pvIb, pvIn, stringVmp, state.lenPv, "dc", true, PV_ROOF_DERATE);
+          addRun("ctrl", "MPPT controller → battery", `DC · ${state.systemVoltage} V`, ctrlIb, ctrlIn, state.systemVoltage, state.lenCtrl, "dc", false, dPvc);
+        }
+        if (recInverterKw > 0) {
+          addRun("batt", "Battery → inverter", `DC · ${state.systemVoltage} V · full inverter load`, battIb, battIn, state.systemVoltage, state.lenBatt, "dc", false, dPvc);
+          addRun("inv", "Inverter → ATS", `AC · ${acVolts} V ${acPhases === 3 ? "3-phase" : "1-phase"}`, invIb, invIn, acVolts, state.lenInv, acKind, false, dPvc);
+          addRun("grid", "ATS → grid", `AC · ${acVolts} V ${acPhases === 3 ? "3-phase" : "1-phase"}`, gridIb, gridIn, acVolts, state.lenGrid, acKind, false, dPvc);
+        }
+
+        const protections = [];
+        const dcVolts = { 12: 32, 24: 63, 48: 80 }[state.systemVoltage];
+        const gridRun = cableRuns.find((r) => r.key === "grid");
+        if (panelCount > 0) {
+          protections.push({ where: "PV strings", device: stringCount >= 3 ? "gPV string fuse (each string, + and −)" : "String fuses",
+            rating: stringCount >= 3 ? `${nextStd(STD_PV_FUSE, state.panelIsc * 1.5)} A, ≥ ${fmtNum(stringVoc)} V DC` : "Not required",
+            note: stringCount >= 3 ? "Must not exceed the panel's maximum series fuse rating (datasheet)." : "1–2 strings in parallel need no fuses if the panel's reverse-current rating allows it." });
+          protections.push({ where: "Array → controller", device: "DC breaker or isolator (2-pole, DC-rated)", rating: `${pvIn} A, ≥ ${fmtNum(stringVoc)} V DC`, note: "One per controller, next to it. Never use an AC breaker on PV." });
+          protections.push({ where: "PV side", device: "DC surge protector (Type 2)", rating: `Ucpv ≥ ${fmtNum(stringVoc * 1.1)} V DC`, note: "At the controller input, with the shortest possible earth lead." });
+          protections.push({ where: "Panel frames and rails", device: "Equipotential bonding", rating: "6 mm² Cu minimum", note: "Bond every frame and rail to the earth electrode; add lightning protection where the site needs it." });
+        }
+        if (panelCount > 0) {
+          protections.push({ where: "Controller → battery", device: "DC breaker (2-pole)", rating: `${ctrlIn} A, ≥ ${dcVolts} V DC`, note: "One per controller, on the battery side." });
+        }
+        if (recInverterKw > 0) {
+          protections.push({ where: "Battery positive", device: "Class T / MRBF fuse with isolator", rating: `${battIn} A, ≥ ${dcVolts} V DC`, note: "Fit within 30 cm of the battery terminal. Breaking capacity must exceed the battery's short-circuit current; check that it tolerates motor start-up. Lithium needs a BMS." });
+          protections.push({ where: "Inverter output", device: `AC MCB (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${invIn} A`, note: "Feeds the ATS." });
+          protections.push({ where: "Final circuits (DB)", device: "RCBO or RCD, 30 mA, Type A", rating: `≥ ${invIn} A`, note: "Protects people on every circuit the inverter can supply." });
+          protections.push({ where: "ATS", device: `Automatic transfer switch (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${atsIn} A, AC-33iB or better`, note: "Must be break-before-make, so the inverter never back-feeds the grid." });
+          protections.push({ where: "Grid side", device: `Main AC MCB (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${gridIn} A`, note: "Between the meter and the ATS." });
+          protections.push({ where: "Grid side", device: "AC surge protector (Type 2)", rating: "Imax ≥ 20 kA, Up ≤ 1.5 kV", note: "In the DB, with a backup MCB if the SPD maker asks for one." });
+          protections.push({ where: "Earthing", device: "Protective earth conductor", rating: gridRun ? `${earthSize(gridRun.res.size)} mm² Cu (grid run)` : "Size to the phase cable", note: "Connect the inverter, ATS, battery frame and DB to one earth electrode. Keep only one neutral–earth link, as the inverter manual says." });
+        }
 
         return {
           enrichedLoads,
@@ -1237,8 +1606,13 @@
           dischargeC,
           totalBatteryKwh,
           totalBatteryAh,
-          requiredArrayWp, panelCount, installedArrayWp, dailyYieldWh,
-          controllerAmps, controllerRating, controllerCount
+          requiredArrayWp, minPanelCount, panelCount, installedArrayWp, dailyYieldWh,
+          controllerAmps, controllerRating, controllerCount,
+          arrayDailyWh, batteryDeliveredWh,
+          stringCount, panelsPerString, wiredPanels, stringVoc, stringVmp, vocTooHigh, lowStringVoltage,
+          acPhases, acVolts, cableRuns, protections,
+          pvOptions, phaseAdvice, phaseCount,
+          battSeries, battParallel, battUnits, battBankAh, battBankKwh, battIsLead, battMaxParallel, battVoltMismatch
         };
       }
 
@@ -1433,13 +1807,13 @@
         el.kpiInverterSize.textContent = m.recInverterKw > 0
           ? `${fmtNum(m.recInverterKw, 1)} kW / ${fmtNum(m.recInverterKva, 2)} kVA`
           : "0 kW";
-        el.kpiRunningLoad.textContent = `Connected running load: ${fmtNum(m.totalRunningW)} W`;
+        el.kpiRunningLoad.textContent = `Connected running load: ${fmtNum(m.totalRunningW)} W · ${state.acPhases === 3 ? "three-phase 415 V" : "single-phase 240 V"}`;
 
         // KPI 4
         el.kpiBattSpecTag.textContent = `${state.systemVoltage}V • ${state.dodPct}% DoD`;
         el.kpiBatteryKwh.textContent = `${fmtNum(m.totalBatteryKwh, 2)} kWh`;
         el.kpiBatteryAh.textContent = (m.currentLimited ? "Sized for discharge current. " : "") +
-          `≈ ${fmtNum(Math.ceil(m.totalBatteryAh))} Ah @ ${state.systemVoltage}V (${state.autonomyDays}d autonomy, ${state.backupScope === "essential" ? "essential loads" : "all loads"})`;
+          `≈ ${fmtNum(Math.ceil(m.totalBatteryAh))} Ah @ ${state.systemVoltage}V (${state.autonomyDays}d autonomy, ${state.nightSharePct}% of ${state.backupScope === "essential" ? "essential" : "all"} loads)`;
 
         // Technician note
         if (m.totalDailyWh === 0 && m.totalRunningW === 0) {
@@ -1456,11 +1830,13 @@
             voltageAdvice = ` <em>Tip: For compact systems ≤ 1.5 kW, a <strong>12V or 24V</strong> inverter/battery setup is often more cost-effective.</em>`;
           }
           el.techSizingNote.innerHTML = `
-            <strong>Technician Recommendation:</strong> Size a <strong>${fmtNum(m.recInverterKw, 1)} kW (${fmtNum(m.recInverterKva, 2)} kVA)</strong> pure sine wave inverter to handle ${fmtNum(m.totalRunningW)} W continuous load and ${fmtNum(m.estimatedPeakSurgeW)} W startup surge, paired with at least <strong>${fmtNum(m.totalBatteryKwh, 2)} kWh (${fmtNum(Math.ceil(m.totalBatteryAh))} Ah at ${state.systemVoltage}V)</strong> total battery storage (${fmtNum(m.usableBatteryKwh, 2)} kWh usable at ${state.dodPct}% DoD).${dischargeNote}${voltageAdvice}
+            <strong>Technician Recommendation:</strong> Size a <strong>${fmtNum(m.recInverterKw, 1)} kW (${fmtNum(m.recInverterKva, 2)} kVA)</strong> pure sine wave inverter to handle ${fmtNum(m.totalRunningW)} W continuous load and ${fmtNum(m.estimatedPeakSurgeW)} W startup surge, paired with at least <strong>${fmtNum(m.totalBatteryKwh, 2)} kWh (${fmtNum(Math.ceil(m.totalBatteryAh))} Ah at ${state.systemVoltage}V)</strong> total battery storage (${fmtNum(m.usableBatteryKwh, 2)} kWh usable at ${state.dodPct}% DoD).${dischargeNote}${voltageAdvice}${m.phaseAdvice}
           `;
         }
 
         renderArray(m);
+        renderBattWiring(m);
+        renderCables(m);
         renderBreakdownChart(m);
       }
 
@@ -1497,23 +1873,112 @@
         }).join("");
       }
 
+      function renderPvConnections(m) {
+        const body = document.getElementById("pvConnBody");
+        if (!m.pvOptions.rows.length) {
+          body.innerHTML = `<tr><td colspan="6" class="empty-state">Add appliances to see the wiring options.</td></tr>`;
+          return;
+        }
+        body.innerHTML = m.pvOptions.rows.map((r) => {
+          const isBest = r === m.pvOptions.best;
+          const mode = r.parallel === 1 ? "All in series" : (r.series === 1 ? "All in parallel" : "Series-parallel");
+          let verdict;
+          if (isBest && !r.vmpOk) verdict = `<strong style="color:var(--rose-600);">Closest option, but the voltage is too low in hot weather: see the warning above.</strong>`;
+          else if (isBest) verdict = `<strong style="color:var(--emerald-600);">★ Best.</strong> Highest safe voltage with equal strings: lowest current, thinner cable, fewer fuses.`;
+          else if (!r.vmpOk) verdict = "Voltage too low to charge reliably in hot weather";
+          else if (r.extra > 0) verdict = `Needs ${r.extra} extra panel${r.extra === 1 ? "" : "s"} to make equal strings`;
+          else verdict = "Works, but more current and thicker cable than the best option";
+          return `<tr${isBest ? ' style="background:var(--emerald-50);"' : ""}>
+            <td><strong>${r.series} in series × ${r.parallel} string${r.parallel === 1 ? "" : "s"}</strong><div class="cat-tag">${mode}</div></td>
+            <td class="num-col">${r.wired}</td>
+            <td class="num-col">${fmtNum(r.voc)} V <span style="color:var(--slate-500);">(max ${state.ctrlMaxVoc})</span></td>
+            <td class="num-col">${fmtNum(r.vmpHot)} V <span style="color:var(--slate-500);">(min ${m.pvOptions.minVmp})</span></td>
+            <td class="num-col">${fmtNum(r.amps, 1)} A</td>
+            <td>${verdict}</td>
+          </tr>`;
+        }).join("");
+      }
+
+      function renderBattWiring(m) {
+        const box = document.getElementById("battWiringNote");
+        if (!(m.totalBatteryAh > 0)) {
+          box.innerHTML = `<strong>Battery wiring:</strong> Add appliances to see how to connect the battery bank.`;
+          return;
+        }
+        const unit = `${fmtNum(state.battUnitV, 1)} V ${fmtNum(state.battUnitAh)} Ah`;
+        const mode = m.battParallel === 1 ? "all in series" : (m.battSeries === 1 ? "all in parallel" : "series-parallel");
+        let html = `<strong>Battery wiring (best connection):</strong> use <strong>${m.battUnits} × ${unit}</strong>: <strong>${m.battSeries} in series</strong> to make ${state.systemVoltage} V and <strong>${m.battParallel} string${m.battParallel === 1 ? "" : "s"} in parallel</strong> to reach ${fmtNum(m.battBankAh)} Ah (${fmtNum(m.battBankKwh, 2)} kWh), which is ${mode}. Series adds voltage; parallel adds Ah. Use batteries of the same make, age and capacity, equal-length cables, and take the bank's positive and negative from opposite ends of the bank.`;
+        if (m.battVoltMismatch) {
+          html += ` <strong style="color:#e11d48;">Warning: ${unit} units cannot make ${state.systemVoltage} V. Pick a unit voltage that divides ${state.systemVoltage} V (for example 12 V for a 48 V bank).</strong>`;
+        }
+        if (m.battParallel > m.battMaxParallel) {
+          const betterAh = Math.ceil(m.totalBatteryAh / m.battMaxParallel / 50) * 50;
+          html += m.battIsLead
+            ? ` <strong style="color:#e11d48;">Warning: more than ${m.battMaxParallel} parallel lead-acid strings charge and age unevenly. Use larger units (about ${fmtNum(betterAh)} Ah each) so you need ${m.battMaxParallel} strings or fewer.</strong>`
+            : ` <strong style="color:#e11d48;">Check the maker's limit on parallel packs (often about 4 for small packs). A larger unit (about ${fmtNum(betterAh)} Ah) means fewer parallel connections.</strong>`;
+        }
+        box.innerHTML = html;
+      }
+
       function renderArray(m) {
         const $ = (id) => document.getElementById(id);
         const none = m.panelCount === 0;
         $("kpiArrayWp").textContent = `${fmtNum(m.requiredArrayWp)} Wp`;
-        $("kpiArraySub").textContent = `${fmtNum(m.totalDailyWh)} Wh ÷ (${state.sunHours} h × ${state.performanceRatio}%)`;
+        $("kpiArraySub").textContent = `${fmtNum(m.arrayDailyWh)} Wh (load + battery losses) ÷ (${state.sunHours} h × ${state.performanceRatio}%)`;
         $("kpiPanelCount").textContent = `${m.panelCount} × ${fmtNum(state.panelWatts)} W`;
-        $("kpiPanelSub").textContent = none ? "Add loads to size the array" : `Installed array: ${fmtNum(m.installedArrayWp)} Wp (${fmtNum(m.installedArrayWp / 1000, 2)} kWp)`;
+        $("kpiPanelSub").textContent = none ? "Add loads to size the array" : `Installed array: ${fmtNum(m.installedArrayWp)} Wp (${fmtNum(m.installedArrayWp / 1000, 2)} kWp)${m.panelCount > m.minPanelCount ? `, includes ${m.panelCount - m.minPanelCount} extra for equal strings` : ""}`;
         $("kpiYield").textContent = `${fmtNum(m.dailyYieldWh / 1000, 2)} kWh/day`;
-        const surplus = m.totalDailyWh > 0 ? ((m.dailyYieldWh / m.totalDailyWh) - 1) * 100 : 0;
-        $("kpiYieldSub").textContent = none ? "" : `${fmtNum(surplus, 0)}% above the daily load of ${fmtNum(m.totalDailyWh)} Wh`;
+        const surplus = m.arrayDailyWh > 0 ? ((m.dailyYieldWh / m.arrayDailyWh) - 1) * 100 : 0;
+        $("kpiYieldSub").textContent = none ? "" : `${fmtNum(surplus, 0)}% above the ${fmtNum(m.arrayDailyWh)} Wh needed per day`;
         $("kpiController").textContent = none ? "0 A"
           : `${m.controllerCount > 1 ? m.controllerCount + " × " : ""}${m.controllerRating} A`;
         $("kpiControllerSub").textContent = none ? "" : `Needs ≥ ${fmtNum(m.controllerAmps, 1)} A at ${state.systemVoltage}V (25% headroom)`;
+        renderPvConnections(m);
+        let warn = "";
+        if (m.vocTooHigh) warn += ` <strong style="color:#e11d48;">Warning: one panel's cold Voc already exceeds the controller's ${state.ctrlMaxVoc} V limit. Choose a controller with a higher PV voltage.</strong>`;
+        else if (m.lowStringVoltage) warn += ` <strong style="color:#e11d48;">Warning: ${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series (${fmtNum(m.stringVmp)} V) is too low to charge a ${state.systemVoltage}V bank reliably in hot weather. Use more panels in series, or a lower battery voltage.</strong>`;
         $("arrayNote").innerHTML = none
           ? `<strong>Technician Note:</strong> Add appliances to size the solar array.`
-          : `<strong>Technician Note:</strong> Install <strong>${m.panelCount} × ${fmtNum(state.panelWatts)} W</strong> panels with ${m.controllerCount > 1 ? `<strong>${m.controllerCount} × ${m.controllerRating} A</strong> MPPT controllers (split the array between them)` : `a <strong>${m.controllerRating} A</strong> MPPT controller`} on the ${state.systemVoltage}V bank. Before buying, check the panel string's cold-weather Voc against the controller's maximum PV input voltage, and the array's short-circuit current against its PV current limit. Panel wiring (series/parallel) is not calculated here.`;
+          : `<strong>Technician Note:</strong> Install <strong>${m.panelCount} × ${fmtNum(state.panelWatts)} W</strong> panels with ${m.controllerCount > 1 ? `<strong>${m.controllerCount} × ${m.controllerRating} A</strong> MPPT controllers (split the strings between them)` : `a <strong>${m.controllerRating} A</strong> MPPT controller`} on the ${state.systemVoltage}V bank. Best connection: <strong>${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series × ${m.stringCount} string${m.stringCount === 1 ? "" : "s"} in parallel</strong>${m.panelCount > m.minPanelCount ? ` (${m.panelCount - m.minPanelCount} extra panel${m.panelCount - m.minPanelCount === 1 ? "" : "s"} beyond the ${m.minPanelCount} needed, so every string is equal)` : ""}. Cold-weather string Voc is about <strong>${fmtNum(m.stringVoc)} V</strong> against the controller's ${state.ctrlMaxVoc} V limit. Also check the array's short-circuit current against the controller's PV current limit.${warn}`;
       }
+
+      function renderCables(m) {
+        const cableBody = document.getElementById("cableTableBody");
+        const protBody = document.getElementById("protTableBody");
+        const note = document.getElementById("cableNote");
+        if (m.cableRuns.length === 0) {
+          cableBody.innerHTML = `<tr><td colspan="7" class="empty-state">Add appliances to size the cables.</td></tr>`;
+          protBody.innerHTML = `<tr><td colspan="4" class="empty-state">Add appliances to see the protection schedule.</td></tr>`;
+          note.innerHTML = "";
+          return;
+        }
+        cableBody.innerHTML = m.cableRuns.map((r) => `
+          <tr>
+            <td><strong>${escapeHtml(r.label)}</strong><div class="cat-tag">${escapeHtml(r.circuit)}</div></td>
+            <td class="num-col">${fmtNum(r.ib, 1)} A</td>
+            <td class="num-col">${fmtNum(r.inA)} A</td>
+            <td class="num-col">${fmtNum(r.lengthM, 1)} m</td>
+            <td class="num-col computed-cell">${r.res.size} mm²</td>
+            <td class="num-col">${fmtNum(r.res.dropPct, 2)}% <span style="color:var(--slate-500);">(max ${r.vdLimit}%)</span></td>
+            <td style="color:var(--rose-600); font-weight:600;">${escapeHtml(r.res.note)}</td>
+          </tr>
+        `).join("");
+        protBody.innerHTML = m.protections.map((p) => `
+          <tr>
+            <td><strong>${escapeHtml(p.where)}</strong></td>
+            <td>${escapeHtml(p.device)}</td>
+            <td class="computed-cell">${escapeHtml(p.rating)}</td>
+            <td style="color:var(--slate-600);">${escapeHtml(p.note)}</td>
+          </tr>
+        `).join("");
+        note.innerHTML = `<strong>How these are worked out:</strong> copper cable, sized on the larger of the voltage-drop limit and the current rating at the protective device, so each breaker or fuse protects its own cable. Smallest sizes used: 4 mm² on PV and DC runs, 2.5 mm² on AC runs. Ratings assume ${state.ambientC} °C ambient (PV cable: roof-temperature derating of ${PV_ROOF_DERATE}), cable clipped direct, and no grouping with other cables. Currents: PV = panel Isc × 1.25, breaker × 1.25 again; battery fuse = 125% of the full inverter DC current; AC currents use the inverter kVA at ${acPf()} power factor. Keep the battery cables as short as you can. Have a qualified electrician check the design against IEC 60364, IEC 62548 (PV), Kenyan wiring rules and the inverter, battery and controller datasheets before installing.`;
+        const battRun = m.cableRuns.find((r) => r.key === "batt");
+        if (battRun && battRun.ib > 250) {
+          note.innerHTML += ` <strong style="color:#e11d48;">Warning: the battery carries about ${fmtNum(battRun.ib)} A at ${state.systemVoltage}V, which needs very heavy cable (${battRun.res.size} mm²). Use a higher-voltage battery system, or run the cable in parallel.</strong>`;
+        }
+      }
+
+      function acPf() { return AC_PF; }
 
       function fullRender() {
         renderTableRows();
@@ -1546,6 +2011,23 @@
         document.getElementById("inputPanelWatts").value = state.panelWatts;
         document.getElementById("inputPR").value = state.performanceRatio;
         document.getElementById("labelPR").textContent = `${state.performanceRatio}%`;
+
+        document.getElementById("inputNightShare").value = state.nightSharePct;
+        document.getElementById("labelNightShare").textContent = `${state.nightSharePct}%`;
+        document.getElementById("inputVoc").value = state.panelVoc;
+        document.getElementById("inputVmp").value = state.panelVmp;
+        document.getElementById("inputIsc").value = state.panelIsc;
+        document.getElementById("inputCtrlVmax").value = state.ctrlMaxVoc;
+        document.getElementById("selectAcSystem").value = String(state.acPhases);
+        document.getElementById("selectPhase").value = String(state.acPhases);
+        document.getElementById("inputBattUnitV").value = String(state.battUnitV);
+        document.getElementById("inputBattUnitAh").value = state.battUnitAh;
+        document.getElementById("selectAmbient").value = String(state.ambientC);
+        document.getElementById("lenPv").value = state.lenPv;
+        document.getElementById("lenCtrl").value = state.lenCtrl;
+        document.getElementById("lenBatt").value = state.lenBatt;
+        document.getElementById("lenInv").value = state.lenInv;
+        document.getElementById("lenGrid").value = state.lenGrid;
       }
 
       function addLoadItem(itemData) {
@@ -1838,6 +2320,43 @@
         updateCalculationsUI();
       });
 
+      document.getElementById("inputNightShare").addEventListener("input", (e) => {
+        state.nightSharePct = Math.round(clamp(e.target.value, 10, 100, 60));
+        document.getElementById("labelNightShare").textContent = `${state.nightSharePct}%`;
+        updateCalculationsUI();
+      });
+      [["inputVoc", "panelVoc", 10, 200, 49.5], ["inputVmp", "panelVmp", 10, 200, 41.5], ["inputIsc", "panelIsc", 1, 40, 14],
+       ["inputCtrlVmax", "ctrlMaxVoc", 50, 1000, 150], ["lenPv", "lenPv", 0.5, 500, 15], ["lenCtrl", "lenCtrl", 0.5, 500, 2],
+       ["lenBatt", "lenBatt", 0.5, 500, 1.5], ["lenInv", "lenInv", 0.5, 500, 3], ["lenGrid", "lenGrid", 0.5, 500, 10]
+      ].forEach(([id, key, min, max, fallback]) => {
+        document.getElementById(id).addEventListener("input", (e) => {
+          state[key] = clamp(e.target.value, min, max, fallback);
+          updateCalculationsUI();
+        });
+      });
+      document.getElementById("selectAcSystem").addEventListener("change", (e) => {
+        state.acPhases = Number(e.target.value) === 3 ? 3 : 1;
+        document.getElementById("selectPhase").value = String(state.acPhases);
+        updateCalculationsUI();
+      });
+      document.getElementById("selectPhase").addEventListener("change", (e) => {
+        state.acPhases = Number(e.target.value) === 3 ? 3 : 1;
+        document.getElementById("selectAcSystem").value = String(state.acPhases);
+        updateCalculationsUI();
+      });
+      document.getElementById("inputBattUnitV").addEventListener("change", (e) => {
+        state.battUnitV = Number(e.target.value) || 12;
+        updateCalculationsUI();
+      });
+      document.getElementById("inputBattUnitAh").addEventListener("input", (e) => {
+        state.battUnitAh = clamp(e.target.value, 5, 5000, 100);
+        updateCalculationsUI();
+      });
+      document.getElementById("selectAmbient").addEventListener("change", (e) => {
+        state.ambientC = Number(e.target.value);
+        updateCalculationsUI();
+      });
+
       /* ======================================================================
          7. EXPORT CSV & PRINT
          ====================================================================== */
@@ -1864,6 +2383,7 @@
 
         rows.push([]);
         rows.push(["SUMMARY & SYSTEM SIZING"]);
+        rows.push(["AC Supply", m.acPhases === 3 ? "Three-phase 415 V" : "Single-phase 240 V"]);
         rows.push(["Total Connected Running Load (W)", m.totalRunningW]);
         rows.push(["Estimated Peak Surge (W)", m.estimatedPeakSurgeW]);
         rows.push(["Raw Daily Energy (Wh/day)", m.totalDailyWh]);
@@ -1882,13 +2402,27 @@
         rows.push(["System DC Voltage (V)", `${state.systemVoltage}V`]);
         rows.push(["Recommended Total Battery Capacity (kWh)", m.totalBatteryKwh.toFixed(2)]);
         rows.push(["Recommended Total Battery Capacity (Ah)", Math.ceil(m.totalBatteryAh)]);
+        rows.push(["Battery Bank Wiring", `${m.battUnits} x ${state.battUnitV} V ${state.battUnitAh} Ah: ${m.battSeries} in series x ${m.battParallel} string${m.battParallel === 1 ? "" : "s"} in parallel (${m.battParallel === 1 ? "all in series" : (m.battSeries === 1 ? "all in parallel" : "series-parallel")})`]);
         rows.push(["Peak Sun Hours (h/day)", state.sunHours]);
         rows.push(["Performance Ratio (%)", `${state.performanceRatio}%`]);
         rows.push(["Required Array (Wp)", Math.round(m.requiredArrayWp)]);
         rows.push(["Panel Size (W)", state.panelWatts]);
-        rows.push(["Panels Needed", m.panelCount]);
+        rows.push(["Panels Needed (minimum)", m.minPanelCount]);
+        rows.push(["Panels To Install (equal strings)", m.panelCount]);
         rows.push(["Installed Array (Wp)", m.installedArrayWp]);
         rows.push(["MPPT Controller", `${m.controllerCount} x ${m.controllerRating} A`]);
+        rows.push(["Battery Supplies (% of backed-up daily energy)", `${state.nightSharePct}%`]);
+        rows.push(["PV Strings", `${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series x ${m.stringCount} string${m.stringCount === 1 ? "" : "s"} in parallel`]);
+        rows.push(["PV Connection", m.stringCount === 1 ? "All in series" : (m.panelsPerString === 1 ? "All in parallel" : "Series-parallel")]);
+        rows.push(["PV Cold String Voc (V)", Math.round(m.stringVoc)]);
+        rows.push([]);
+        rows.push(["CABLE SIZING (copper)"]);
+        rows.push(["Run", "Design Current (A)", "Protective Device (A)", "One-way Length (m)", "Cable Size (mm2)", "Voltage Drop (%)"]);
+        m.cableRuns.forEach((r) => rows.push([csvText(r.label), r.ib.toFixed(1), r.inA, r.lengthM, r.res.size, r.res.dropPct.toFixed(2)]));
+        rows.push([]);
+        rows.push(["PROTECTION SCHEDULE"]);
+        rows.push(["Location", "Device", "Rating"]);
+        m.protections.forEach((p) => rows.push([csvText(p.where), csvText(p.device), csvText(p.rating)]));
 
         const csvContent = rows.map((r) => r.join(",")).join("\n");
         const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8;" });
