@@ -854,22 +854,8 @@
 
         <div class="tech-note-box" id="arrayNote"></div>
 
-        <h3 class="card-title" style="margin:18px 0 10px;">Panel Connection Options: Series vs Parallel</h3>
-        <div class="table-wrapper">
-          <table class="load-table">
-            <thead>
-              <tr>
-                <th style="min-width:200px;">Connection</th>
-                <th class="num-col">Panels Wired</th>
-                <th class="num-col">Cold Voc</th>
-                <th class="num-col">Hot Vmp</th>
-                <th class="num-col">Array Current</th>
-                <th style="min-width:260px;">Verdict</th>
-              </tr>
-            </thead>
-            <tbody id="pvConnBody"></tbody>
-          </table>
-        </div>
+        <h3 class="card-title" style="margin:18px 0 10px;">Recommended Panel Connection</h3>
+        <div class="tech-note-box" id="pvConnBox" style="margin-top:0;"></div>
       </div>
     </section>
 
@@ -1874,29 +1860,33 @@
       }
 
       function renderPvConnections(m) {
-        const body = document.getElementById("pvConnBody");
-        if (!m.pvOptions.rows.length) {
-          body.innerHTML = `<tr><td colspan="6" class="empty-state">Add appliances to see the wiring options.</td></tr>`;
+        const box = document.getElementById("pvConnBox");
+        const b = m.pvOptions.best;
+        if (!b) {
+          box.innerHTML = `<strong>Panel connection:</strong> Add appliances to see how to wire the panels.`;
           return;
         }
-        body.innerHTML = m.pvOptions.rows.map((r) => {
-          const isBest = r === m.pvOptions.best;
-          const mode = r.parallel === 1 ? "All in series" : (r.series === 1 ? "All in parallel" : "Series-parallel");
-          let verdict;
-          if (isBest && !r.vmpOk) verdict = `<strong style="color:var(--rose-600);">Closest option, but the voltage is too low in hot weather: see the warning above.</strong>`;
-          else if (isBest) verdict = `<strong style="color:var(--emerald-600);">★ Best.</strong> Highest safe voltage with equal strings: lowest current, thinner cable, fewer fuses.`;
-          else if (!r.vmpOk) verdict = "Voltage too low to charge reliably in hot weather";
-          else if (r.extra > 0) verdict = `Needs ${r.extra} extra panel${r.extra === 1 ? "" : "s"} to make equal strings`;
-          else verdict = "Works, but more current and thicker cable than the best option";
-          return `<tr${isBest ? ' style="background:var(--emerald-50);"' : ""}>
-            <td><strong>${r.series} in series × ${r.parallel} string${r.parallel === 1 ? "" : "s"}</strong><div class="cat-tag">${mode}</div></td>
-            <td class="num-col">${r.wired}</td>
-            <td class="num-col">${fmtNum(r.voc)} V <span style="color:var(--slate-500);">(max ${state.ctrlMaxVoc})</span></td>
-            <td class="num-col">${fmtNum(r.vmpHot)} V <span style="color:var(--slate-500);">(min ${m.pvOptions.minVmp})</span></td>
-            <td class="num-col">${fmtNum(r.amps, 1)} A</td>
-            <td>${verdict}</td>
-          </tr>`;
-        }).join("");
+        const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+        let kind, why;
+        if (b.parallel === 1) {
+          kind = "All in series";
+          why = "Highest safe voltage: lowest current, thinner cable and no string fuses.";
+        } else if (b.series === 1) {
+          kind = "All in parallel";
+          why = `The panels' voltage is already enough for this ${state.systemVoltage}V bank, so they are joined in parallel.`;
+        } else {
+          kind = "Series-parallel";
+          why = `One string cannot be longer than ${m.pvOptions.maxSeries} panels (the controller's ${state.ctrlMaxVoc} V limit in cold weather), so equal strings of ${b.series} are joined in parallel.`;
+        }
+        const fact = (label, value) => `<div><div style="font-size:0.72rem; font-weight:700; text-transform:uppercase; color:var(--slate-500);">${label}</div><div style="font-weight:700;">${value}</div></div>`;
+        box.innerHTML = `
+          <div><strong>${kind}:</strong> connect <strong>${plural(b.series, "panel")} in series</strong>${b.parallel > 1 ? `, then join <strong>${plural(b.parallel, "string")} in parallel</strong>` : ""} (${plural(b.wired, "panel")} in total).</div>
+          <div style="margin-top:4px;">${why}${b.vmpOk ? "" : ` <strong style="color:var(--rose-600);">This is the closest option, but the voltage is too low in hot weather: see the warning below.</strong>`}</div>
+          <div style="display:flex; flex-wrap:wrap; gap:22px; margin-top:10px;">
+            ${fact("Cold voltage (Voc)", `${fmtNum(b.voc)} V <span style="color:var(--slate-500); font-weight:500;">(max ${state.ctrlMaxVoc})</span>`)}
+            ${fact("Hot voltage (Vmp)", `${fmtNum(b.vmpHot)} V <span style="color:var(--slate-500); font-weight:500;">(min ${m.pvOptions.minVmp})</span>`)}
+            ${fact("Array current", `${fmtNum(b.amps, 1)} A`)}
+          </div>`;
       }
 
       function renderBattWiring(m) {
