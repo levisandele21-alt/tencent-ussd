@@ -785,6 +785,50 @@
         </div>
       </div>
       <div class="card-body">
+        <div class="param-group">
+          <label class="param-label" for="selectInverterType" style="display:block; margin-bottom:6px;">Inverter Type</label>
+          <select id="selectInverterType" class="form-control">
+            <option value="separate">Separate MPPT charge controller + inverter</option>
+            <option value="hybrid">Hybrid inverter with built-in MPPT</option>
+          </select>
+          <div class="param-help">A hybrid inverter has the solar charge controller inside it, so no separate controller is sized. The panels, voltage and current are then checked against the inverter's datasheet limits below.</div>
+        </div>
+        <div id="hybridFields" class="param-row-2 param-group" style="display:none;">
+          <div>
+            <label class="param-label" for="hybridMaxV" style="display:block; margin-bottom:6px;">Max PV Input Voltage (V)</label>
+            <input type="number" id="hybridMaxV" class="form-control" min="100" max="1500" step="10" value="500" />
+            <div class="param-help">Datasheet "max. PV input voltage" (e.g. 450, 500, 600, 1000).</div>
+          </div>
+          <div>
+            <label class="param-label" for="hybridMinV" style="display:block; margin-bottom:6px;">MPPT Minimum Voltage (V)</label>
+            <input type="number" id="hybridMinV" class="form-control" min="20" max="500" step="5" value="120" />
+            <div class="param-help">Lowest voltage at which the MPPT works ("MPPT range" start, or start-up voltage if higher).</div>
+          </div>
+          <div>
+            <label class="param-label" for="hybridMppts" style="display:block; margin-bottom:6px;">Number of MPPT Inputs</label>
+            <input type="number" id="hybridMppts" class="form-control" min="1" max="6" step="1" value="2" />
+            <div class="param-help">Each input takes its own string or strings.</div>
+          </div>
+          <div>
+            <label class="param-label" for="hybridMppIn" style="display:block; margin-bottom:6px;">Max Current per MPPT Input (A)</label>
+            <input type="number" id="hybridMppIn" class="form-control" min="5" max="60" step="0.5" value="16" />
+            <div class="param-help">Datasheet "max. input current" (use the short-circuit rating if both are given).</div>
+          </div>
+          <div>
+            <label class="param-label" for="hybridMaxPvW" style="display:block; margin-bottom:6px;">Max PV Power (W)</label>
+            <input type="number" id="hybridMaxPvW" class="form-control" min="0" max="100000" step="100" value="6500" />
+            <div class="param-help">Datasheet "max. PV input power". Enter 0 to skip this check.</div>
+          </div>
+          <div>
+            <label class="param-label" for="hybridBattA" style="display:block; margin-bottom:6px;">Max Battery Current (A)</label>
+            <input type="number" id="hybridBattA" class="form-control" min="10" max="1000" step="5" value="100" />
+            <div class="param-help">Datasheet max. charge / discharge current.</div>
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <label style="display:flex; align-items:center; gap:8px; font-weight:600; cursor:pointer;"><input type="checkbox" id="hybridKvaEqKw" checked /> Inverter is rated kVA = kW (power factor 1)</label>
+            <div class="param-help">Most hybrid inverters are. Untick if the datasheet shows a kVA figure larger than the kW figure (then kVA = kW ÷ 0.8 is used).</div>
+          </div>
+        </div>
         <div class="param-row-2 param-group">
           <div>
             <label class="param-label" for="inputSunHours" style="display:block; margin-bottom:6px;">Peak Sun Hours (h/day)</label>
@@ -822,7 +866,7 @@
             <input type="number" id="inputIsc" class="form-control" min="1" max="40" step="0.1" value="14" />
             <div class="param-help">Short-circuit current from the datasheet.</div>
           </div>
-          <div>
+          <div id="wrapCtrlVmax">
             <label class="param-label" for="inputCtrlVmax" style="display:block; margin-bottom:6px;">Controller Max PV Voltage (V)</label>
             <input type="number" id="inputCtrlVmax" class="form-control" min="50" max="1000" step="10" value="150" />
             <div class="param-help">Maximum PV input voltage of the MPPT controller (e.g. 100, 150, 250, 450).</div>
@@ -846,13 +890,14 @@
             <div class="kpi-sub" id="kpiYieldSub"></div>
           </div>
           <div class="kpi-card accent-blue">
-            <div class="kpi-label"><span>MPPT Charge Controller</span></div>
+            <div class="kpi-label"><span id="kpiControllerLabel">MPPT Charge Controller</span></div>
             <div class="kpi-value" id="kpiController">0 A</div>
             <div class="kpi-sub" id="kpiControllerSub"></div>
           </div>
         </div>
 
         <div class="tech-note-box" id="arrayNote"></div>
+        <div class="tech-note-box" id="hybridCheckBox" style="display:none;"></div>
 
         <h3 class="card-title" style="margin:18px 0 10px;">Recommended Panel Connection</h3>
         <div class="tech-note-box" id="pvConnBox" style="margin-top:0;"></div>
@@ -891,7 +936,7 @@
         <div class="param-group">
           <span class="param-label" style="display:block; margin-bottom:6px;">One-way cable length for each run (m)</span>
           <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px;">
-            <div><label class="param-help" for="lenPv">Panels → controller</label><input type="number" id="lenPv" class="form-control" min="0.5" max="500" step="0.5" value="15" /></div>
+            <div><label class="param-help" for="lenPv" id="lenPvLabel">Panels → controller</label><input type="number" id="lenPv" class="form-control" min="0.5" max="500" step="0.5" value="15" /></div>
             <div><label class="param-help" for="lenCtrl">Controller → battery</label><input type="number" id="lenCtrl" class="form-control" min="0.5" max="500" step="0.5" value="2" /></div>
             <div><label class="param-help" for="lenBatt">Battery → inverter</label><input type="number" id="lenBatt" class="form-control" min="0.5" max="500" step="0.5" value="1.5" /></div>
             <div><label class="param-help" for="lenInv">Inverter → ATS</label><input type="number" id="lenInv" class="form-control" min="0.5" max="500" step="0.5" value="3" /></div>
@@ -1001,6 +1046,8 @@
       const CU_RESISTIVITY = 0.021;      // ohm.mm2/m, copper at about 70 C
       const CABLE_SIZES = [1.5, 2.5, 4, 6, 10, 16, 25, 35, 50, 70, 95, 120, 150, 185, 240];
       const AMPACITY_PVC = [19.5, 27, 36, 46, 63, 85, 112, 138, 168, 213, 258, 299, 344, 392, 461];  // 70 C insulation, clipped direct, 30 C
+      // Three loaded conductors (three-phase), PVC, BS 7671 Table 4D2A method C: lower than the two-conductor column
+      const AMPACITY_PVC_3P = [17.5, 24, 32, 41, 57, 76, 96, 119, 144, 184, 223, 259, 299, 341, 403];
       const AMPACITY_XLPE = [24, 33, 45, 58, 80, 107, 138, 171, 209, 269, 328, 382, 441, 506, 599]; // 90 C insulation (PV cable)
       const TEMP_DERATE_PVC = { 30: 1, 35: 0.94, 40: 0.87, 45: 0.79, 50: 0.71 };
       const TEMP_DERATE_XLPE = { 30: 1, 35: 0.96, 40: 0.91, 45: 0.87, 50: 0.82 };
@@ -1108,6 +1155,14 @@
         panelVmp: 41.5,
         panelIsc: 14,
         ctrlMaxVoc: 150,
+        inverterType: "separate",
+        hybridMaxV: 500,
+        hybridMinV: 120,
+        hybridMppts: 2,
+        hybridMppIn: 16,
+        hybridMaxPvW: 6500,
+        hybridBattA: 100,
+        hybridKvaEqKw: true,
         ambientC: 35,
         acPhases: 1,
         lenPv: 15,
@@ -1157,6 +1212,14 @@
               panelVmp: clamp(parsed.panelVmp, 10, 200, 41.5),
               panelIsc: clamp(parsed.panelIsc, 1, 40, 14),
               ctrlMaxVoc: clamp(parsed.ctrlMaxVoc, 50, 1000, 150),
+              inverterType: parsed.inverterType === "hybrid" ? "hybrid" : "separate",
+              hybridMaxV: clamp(parsed.hybridMaxV, 100, 1500, 500),
+              hybridMinV: clamp(parsed.hybridMinV, 20, 500, 120),
+              hybridMppts: Math.round(clamp(parsed.hybridMppts, 1, 6, 2)),
+              hybridMppIn: clamp(parsed.hybridMppIn, 5, 60, 16),
+              hybridMaxPvW: clamp(parsed.hybridMaxPvW, 0, 100000, 6500),
+              hybridBattA: clamp(parsed.hybridBattA, 10, 1000, 100),
+              hybridKvaEqKw: parsed.hybridKvaEqKw !== false,
               ambientC: [30, 35, 40, 45, 50].includes(Number(parsed.ambientC)) ? Number(parsed.ambientC) : 35,
               acPhases: Number(parsed.acPhases) === 3 ? 3 : 1,
               lenPv: clamp(parsed.lenPv, 0.5, 500, 15),
@@ -1333,24 +1396,31 @@
       // Every way to wire the panels, and the best one: voltage must be safe for the controller (cold) and high
       // enough to charge the bank (hot); then fewest extra panels; then highest voltage (lowest current).
       function pvConnectionOptions(panelCount) {
+        const hybrid = state.inverterType === "hybrid";
         const vocCold = state.panelVoc * COLD_VOC_FACTOR;
-        const maxSeries = Math.max(1, Math.floor(state.ctrlMaxVoc / vocCold));
-        const minVmp = state.systemVoltage + 15;
+        const maxV = hybrid ? state.hybridMaxV : state.ctrlMaxVoc;
+        const maxSeries = Math.max(1, Math.floor(maxV / vocCold));
+        const minVmp = hybrid ? state.hybridMinV : state.systemVoltage + 15;
+        const inputs = hybrid ? Math.max(1, state.hybridMppts) : 1;
         const rows = [];
         if (panelCount > 0) {
           for (let s = 1; s <= Math.min(panelCount, maxSeries); s++) {
             const p = Math.ceil(panelCount / s);
             const vmpHot = s * state.panelVmp * 0.8;
-            rows.push({ series: s, parallel: p, wired: s * p, extra: s * p - panelCount, voc: s * vocCold, vmpHot, amps: p * state.panelIsc, vmpOk: vmpHot >= minVmp });
+            // hybrid: the strings are shared between the MPPT inputs; each input has a current limit
+            const perInput = hybrid ? Math.ceil(p / Math.min(inputs, p)) : p;
+            const currOk = !hybrid || perInput * state.panelIsc <= state.hybridMppIn;
+            rows.push({ series: s, parallel: p, wired: s * p, extra: s * p - panelCount, voc: s * vocCold, vmpHot, amps: p * state.panelIsc, perInput, currOk, vmpOk: vmpHot >= minVmp });
           }
         }
-        const okRows = rows.filter((r) => r.vmpOk);
-        const pool = okRows.length ? okRows : rows;
+        let pool = rows.filter((r) => r.vmpOk && r.currOk);
+        if (!pool.length) pool = rows.filter((r) => r.vmpOk);
+        if (!pool.length) pool = rows;
         let best = null;
         pool.forEach((r) => {
           if (!best || r.extra < best.extra || (r.extra === best.extra && r.series > best.series)) best = r;
         });
-        return { rows, best, maxSeries, minVmp };
+        return { rows, best, maxSeries, minVmp, maxV, hybrid };
       }
 
       function earthSize(phaseMm2) {
@@ -1366,7 +1436,7 @@
         const k = o.kind === "dc" ? 2 : (o.kind === "ac3" ? Math.sqrt(3) * AC_PF : 2 * AC_PF);
         const maxDropV = o.volts * o.vdPct / 100;
         const minByDrop = (k * CU_RESISTIVITY * o.lengthM * o.ib) / maxDropV;
-        const table = o.xlpe ? AMPACITY_XLPE : AMPACITY_PVC;
+        const table = o.xlpe ? AMPACITY_XLPE : (o.kind === "ac3" ? AMPACITY_PVC_3P : AMPACITY_PVC);
         const minSize = Math.max(minByDrop, o.minSize || 0);
         let idx = CABLE_SIZES.findIndex((s, i) => s >= minSize && table[i] * o.derate >= o.inA);
         let note = "";
@@ -1431,7 +1501,9 @@
         if (minContinuousW > 0) {
           recInverterKw = inverterSizes.find((kw) => kw * 1000 >= minContinuousW) || Math.ceil(minContinuousW / 1000);
         }
-        const recInverterKva = recInverterKw > 0 ? +(recInverterKw / KVA_POWER_FACTOR).toFixed(2) : 0;
+        const isHybrid = state.inverterType === "hybrid";
+        const kvaPf = isHybrid && state.hybridKvaEqKw ? 1 : KVA_POWER_FACTOR;
+        const recInverterKva = recInverterKw > 0 ? +(recInverterKw / kvaPf).toFixed(2) : 0;
 
         // Phase checks for the quote type
         const maxSingleLoadW = enrichedLoads.reduce((mx, l) => (l.qty > 0 && l.watts > mx ? l.watts : mx), 0);
@@ -1493,7 +1565,7 @@
         const panelCount = pvOptions.best ? pvOptions.best.wired : minPanelCount;
         const installedArrayWp = panelCount * state.panelWatts;
         const dailyYieldWh = installedArrayWp * state.sunHours * pr;
-        const controllerAmps = (installedArrayWp / state.systemVoltage) * CONTROLLER_HEADROOM;
+        const controllerAmps = isHybrid ? 0 : (installedArrayWp / state.systemVoltage) * CONTROLLER_HEADROOM;
         const controllerRating = controllerAmps > 0
           ? (STANDARD_CONTROLLER_A.find((a) => a >= controllerAmps) || STANDARD_CONTROLLER_A[STANDARD_CONTROLLER_A.length - 1])
           : 0;
@@ -1512,9 +1584,11 @@
         const wiredPanels = stringCount * panelsPerString;
         const stringVoc = panelsPerString * state.panelVoc * COLD_VOC_FACTOR;
         const stringVmp = panelsPerString * state.panelVmp;
-        const vocTooHigh = state.panelVoc * COLD_VOC_FACTOR > state.ctrlMaxVoc;
-        const lowStringVoltage = panelsPerString > 0 && stringVmp * 0.8 < state.systemVoltage + 15;
-        const stringsPerCtrl = stringCount > 0 ? Math.ceil(stringCount / Math.max(1, controllerCount)) : 0;
+        const vocTooHigh = state.panelVoc * COLD_VOC_FACTOR > pvOptions.maxV;
+        const lowStringVoltage = panelsPerString > 0 && stringVmp * 0.8 < pvOptions.minVmp;
+        const stringsPerCtrl = stringCount > 0
+          ? Math.ceil(stringCount / (isHybrid ? Math.max(1, Math.min(state.hybridMppts, stringCount)) : Math.max(1, controllerCount)))
+          : 0;
 
         // Design currents (Ib) and protective device ratings (In)
         const pvIb = state.panelIsc * 1.25 * stringsPerCtrl;
@@ -1536,7 +1610,7 @@
           cableRuns.push({ key, label, circuit, ib, inA, lengthM, vdLimit: VD_LIMITS[key], res });
         };
         if (panelCount > 0) {
-          addRun("pv", "Panels → MPPT controller", `DC · ${fmtNum(stringVmp)} V string · XLPE PV cable`, pvIb, pvIn, stringVmp, state.lenPv, "dc", true, PV_ROOF_DERATE);
+          addRun("pv", isHybrid ? "Panels → inverter MPPT input" : "Panels → MPPT controller", `DC · ${fmtNum(stringVmp)} V string · XLPE PV cable`, pvIb, pvIn, stringVmp, state.lenPv, "dc", true, PV_ROOF_DERATE);
           addRun("ctrl", "MPPT controller → battery", `DC · ${state.systemVoltage} V`, ctrlIb, ctrlIn, state.systemVoltage, state.lenCtrl, "dc", false, dPvc);
         }
         if (recInverterKw > 0) {
@@ -1552,24 +1626,39 @@
           protections.push({ where: "PV strings", device: stringCount >= 3 ? "gPV string fuse (each string, + and −)" : "String fuses",
             rating: stringCount >= 3 ? `${nextStd(STD_PV_FUSE, state.panelIsc * 1.5)} A, ≥ ${fmtNum(stringVoc)} V DC` : "Not required",
             note: stringCount >= 3 ? "Must not exceed the panel's maximum series fuse rating (datasheet)." : "1–2 strings in parallel need no fuses if the panel's reverse-current rating allows it." });
-          protections.push({ where: "Array → controller", device: "DC breaker or isolator (2-pole, DC-rated)", rating: `${pvIn} A, ≥ ${fmtNum(stringVoc)} V DC`, note: "One per controller, next to it. Never use an AC breaker on PV." });
-          protections.push({ where: "PV side", device: "DC surge protector (Type 2)", rating: `Ucpv ≥ ${fmtNum(stringVoc * 1.1)} V DC`, note: "At the controller input, with the shortest possible earth lead." });
+          protections.push({ where: isHybrid ? "Array → inverter (per MPPT input)" : "Array → controller", device: "DC breaker or isolator (2-pole, DC-rated)", rating: `${pvIn} A, ≥ ${fmtNum(stringVoc)} V DC`, note: isHybrid ? "One per MPPT input, next to the inverter. Never use an AC breaker on PV." : "One per controller, next to it. Never use an AC breaker on PV." });
+          protections.push({ where: "PV side", device: "DC surge protector (Type 2)", rating: `Ucpv ≥ ${fmtNum(stringVoc * 1.1)} V DC`, note: isHybrid ? "At the inverter PV input, with the shortest possible earth lead." : "At the controller input, with the shortest possible earth lead." });
           protections.push({ where: "Panel frames and rails", device: "Equipotential bonding", rating: "6 mm² Cu minimum", note: "Bond every frame and rail to the earth electrode; add lightning protection where the site needs it." });
         }
-        if (panelCount > 0) {
+        if (panelCount > 0 && !isHybrid) {
           protections.push({ where: "Controller → battery", device: "DC breaker (2-pole)", rating: `${ctrlIn} A, ≥ ${dcVolts} V DC`, note: "One per controller, on the battery side." });
         }
         if (recInverterKw > 0) {
           protections.push({ where: "Battery positive", device: "Class T / MRBF fuse with isolator", rating: `${battIn} A, ≥ ${dcVolts} V DC`, note: "Fit within 30 cm of the battery terminal. Breaking capacity must exceed the battery's short-circuit current; check that it tolerates motor start-up. Lithium needs a BMS." });
           protections.push({ where: "Inverter output", device: `AC MCB (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${invIn} A`, note: "Feeds the ATS." });
           protections.push({ where: "Final circuits (DB)", device: "RCBO or RCD, 30 mA, Type A", rating: `≥ ${invIn} A`, note: "Protects people on every circuit the inverter can supply." });
-          protections.push({ where: "ATS", device: `Automatic transfer switch (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${atsIn} A, AC-33iB or better`, note: "Must be break-before-make, so the inverter never back-feeds the grid." });
+          protections.push({ where: "ATS", device: `Automatic transfer switch (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${atsIn} A, AC-33iB or better`, note: isHybrid ? "Must be break-before-make, so the inverter never back-feeds the grid. Many hybrid inverters have a built-in transfer switch and a GRID input: if yours does, check the manual before adding a separate ATS." : "Must be break-before-make, so the inverter never back-feeds the grid." });
           protections.push({ where: "Grid side", device: `Main AC MCB (${acPhases === 3 ? "4-pole" : "2-pole"})`, rating: `${gridIn} A`, note: "Between the meter and the ATS." });
           protections.push({ where: "Grid side", device: "AC surge protector (Type 2)", rating: "Imax ≥ 20 kA, Up ≤ 1.5 kV", note: "In the DB, with a backup MCB if the SPD maker asks for one." });
           protections.push({ where: "Earthing", device: "Protective earth conductor", rating: gridRun ? `${earthSize(gridRun.res.size)} mm² Cu (grid run)` : "Size to the phase cable", note: "Connect the inverter, ATS, battery frame and DB to one earth electrode. Keep only one neutral–earth link, as the inverter manual says." });
         }
 
+        // ---- Hybrid inverter datasheet checks (limits are typed in from the datasheet) ----
+        const hybridChecks = [];
+        if (isHybrid && panelCount > 0) {
+          const inputsUsed = Math.max(1, Math.min(state.hybridMppts, stringCount));
+          const perInput = stringsPerCtrl;
+          const chargeA = installedArrayWp / state.systemVoltage;
+          if (state.hybridMaxPvW > 0) hybridChecks.push({ label: "Array power", value: `${fmtNum(installedArrayWp)} W`, limit: `max ${fmtNum(state.hybridMaxPvW)} W`, ok: installedArrayWp <= state.hybridMaxPvW, hint: "Over the limit: the inverter clips the extra power, or use a larger inverter." });
+          hybridChecks.push({ label: "Cold string voltage (Voc)", value: `${fmtNum(stringVoc)} V`, limit: `max ${fmtNum(state.hybridMaxV)} V`, ok: stringVoc <= state.hybridMaxV, hint: "Over the limit can destroy the inverter: use fewer panels in series." });
+          hybridChecks.push({ label: "Hot string voltage (Vmp)", value: `${fmtNum(stringVmp * 0.8)} V`, limit: `min ${fmtNum(state.hybridMinV)} V`, ok: stringVmp * 0.8 >= state.hybridMinV, hint: "Below the MPPT minimum the inverter stops charging: use more panels in series." });
+          hybridChecks.push({ label: `Current per MPPT input (${inputsUsed} of ${state.hybridMppts} used)`, value: `${perInput} string${perInput === 1 ? "" : "s"} × ${fmtNum(state.panelIsc, 1)} A = ${fmtNum(perInput * state.panelIsc, 1)} A`, limit: `max ${fmtNum(state.hybridMppIn, 1)} A`, ok: perInput * state.panelIsc <= state.hybridMppIn, hint: "Over the limit: use more MPPT inputs, longer series strings, or a bigger inverter." });
+          hybridChecks.push({ label: "Battery discharge at the backed-up load", value: `${fmtNum(invDcAmps)} A`, limit: `max ${fmtNum(state.hybridBattA)} A`, ok: invDcAmps <= state.hybridBattA, hint: "Over the limit: use a higher battery voltage or a larger inverter." });
+          hybridChecks.push({ label: "Solar charge current (array W ÷ battery V)", value: `${fmtNum(chargeA)} A`, limit: `max ${fmtNum(state.hybridBattA)} A`, ok: chargeA <= state.hybridBattA, hint: "Over the limit is not harmful: the inverter limits charging and some solar energy is wasted." });
+        }
+
         return {
+          isHybrid, hybridChecks,
           enrichedLoads,
           totalRunningW,
           totalDailyWh,
@@ -1876,16 +1965,17 @@
           why = `The panels' voltage is already enough for this ${state.systemVoltage}V bank, so they are joined in parallel.`;
         } else {
           kind = "Series-parallel";
-          why = `One string cannot be longer than ${m.pvOptions.maxSeries} panels (the controller's ${state.ctrlMaxVoc} V limit in cold weather), so equal strings of ${b.series} are joined in parallel.`;
+          why = `One string cannot be longer than ${m.pvOptions.maxSeries} panels (the ${m.isHybrid ? "inverter's" : "controller's"} ${m.pvOptions.maxV} V limit in cold weather), so equal strings of ${b.series} are joined in parallel.`;
         }
         const fact = (label, value) => `<div><div style="font-size:0.72rem; font-weight:700; text-transform:uppercase; color:var(--slate-500);">${label}</div><div style="font-weight:700;">${value}</div></div>`;
         box.innerHTML = `
           <div><strong>${kind}:</strong> connect <strong>${plural(b.series, "panel")} in series</strong>${b.parallel > 1 ? `, then join <strong>${plural(b.parallel, "string")} in parallel</strong>` : ""} (${plural(b.wired, "panel")} in total).</div>
           <div style="margin-top:4px;">${why}${b.vmpOk ? "" : ` <strong style="color:var(--rose-600);">This is the closest option, but the voltage is too low in hot weather: see the warning below.</strong>`}</div>
           <div style="display:flex; flex-wrap:wrap; gap:22px; margin-top:10px;">
-            ${fact("Cold voltage (Voc)", `${fmtNum(b.voc)} V <span style="color:var(--slate-500); font-weight:500;">(max ${state.ctrlMaxVoc})</span>`)}
+            ${fact("Cold voltage (Voc)", `${fmtNum(b.voc)} V <span style="color:var(--slate-500); font-weight:500;">(max ${m.pvOptions.maxV})</span>`)}
             ${fact("Hot voltage (Vmp)", `${fmtNum(b.vmpHot)} V <span style="color:var(--slate-500); font-weight:500;">(min ${m.pvOptions.minVmp})</span>`)}
             ${fact("Array current", `${fmtNum(b.amps, 1)} A`)}
+            ${m.isHybrid ? fact("Strings per MPPT input", `${b.perInput} <span style="color:var(--slate-500); font-weight:500;">(${fmtNum(b.perInput * state.panelIsc, 1)} A, max ${fmtNum(state.hybridMppIn, 1)})</span>`) : ""}
           </div>`;
       }
 
@@ -1920,16 +2010,37 @@
         $("kpiYield").textContent = `${fmtNum(m.dailyYieldWh / 1000, 2)} kWh/day`;
         const surplus = m.arrayDailyWh > 0 ? ((m.dailyYieldWh / m.arrayDailyWh) - 1) * 100 : 0;
         $("kpiYieldSub").textContent = none ? "" : `${fmtNum(surplus, 0)}% above the ${fmtNum(m.arrayDailyWh)} Wh needed per day`;
-        $("kpiController").textContent = none ? "0 A"
-          : `${m.controllerCount > 1 ? m.controllerCount + " × " : ""}${m.controllerRating} A`;
-        $("kpiControllerSub").textContent = none ? "" : `Needs ≥ ${fmtNum(m.controllerAmps, 1)} A at ${state.systemVoltage}V (25% headroom)`;
+        $("kpiControllerLabel").textContent = m.isHybrid ? "Charge Controller" : "MPPT Charge Controller";
+        document.getElementById("lenPvLabel").textContent = m.isHybrid ? "Panels → inverter" : "Panels → controller";
+        if (m.isHybrid) {
+          $("kpiController").textContent = "Built-in MPPT";
+          $("kpiControllerSub").textContent = none ? "" : `${state.hybridMppts} input${state.hybridMppts === 1 ? "" : "s"}, ≤ ${fmtNum(state.hybridMppIn, 1)} A each: no separate controller needed`;
+        } else {
+          $("kpiController").textContent = none ? "0 A"
+            : `${m.controllerCount > 1 ? m.controllerCount + " × " : ""}${m.controllerRating} A`;
+          $("kpiControllerSub").textContent = none ? "" : `Needs ≥ ${fmtNum(m.controllerAmps, 1)} A at ${state.systemVoltage}V (25% headroom)`;
+        }
+        renderHybridChecks(m);
         renderPvConnections(m);
         let warn = "";
-        if (m.vocTooHigh) warn += ` <strong style="color:#e11d48;">Warning: one panel's cold Voc already exceeds the controller's ${state.ctrlMaxVoc} V limit. Choose a controller with a higher PV voltage.</strong>`;
-        else if (m.lowStringVoltage) warn += ` <strong style="color:#e11d48;">Warning: ${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series (${fmtNum(m.stringVmp)} V) is too low to charge a ${state.systemVoltage}V bank reliably in hot weather. Use more panels in series, or a lower battery voltage.</strong>`;
+        if (m.vocTooHigh) warn += ` <strong style="color:#e11d48;">Warning: one panel's cold Voc already exceeds the ${m.isHybrid ? "inverter's" : "controller's"} ${m.pvOptions.maxV} V limit. Choose ${m.isHybrid ? "an inverter" : "a controller"} with a higher PV voltage.</strong>`;
+        else if (m.lowStringVoltage) warn += ` <strong style="color:#e11d48;">Warning: ${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series (${fmtNum(m.stringVmp)} V) is too low ${m.isHybrid ? "for the inverter's " + fmtNum(state.hybridMinV) + " V MPPT minimum" : "to charge a " + state.systemVoltage + "V bank reliably"} in hot weather. Use more panels in series${m.isHybrid ? "" : ", or a lower battery voltage"}.</strong>`;
         $("arrayNote").innerHTML = none
           ? `<strong>Technician Note:</strong> Add appliances to size the solar array.`
-          : `<strong>Technician Note:</strong> Install <strong>${m.panelCount} × ${fmtNum(state.panelWatts)} W</strong> panels with ${m.controllerCount > 1 ? `<strong>${m.controllerCount} × ${m.controllerRating} A</strong> MPPT controllers (split the strings between them)` : `a <strong>${m.controllerRating} A</strong> MPPT controller`} on the ${state.systemVoltage}V bank. Best connection: <strong>${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series × ${m.stringCount} string${m.stringCount === 1 ? "" : "s"} in parallel</strong>${m.panelCount > m.minPanelCount ? ` (${m.panelCount - m.minPanelCount} extra panel${m.panelCount - m.minPanelCount === 1 ? "" : "s"} beyond the ${m.minPanelCount} needed, so every string is equal)` : ""}. Cold-weather string Voc is about <strong>${fmtNum(m.stringVoc)} V</strong> against the controller's ${state.ctrlMaxVoc} V limit. Also check the array's short-circuit current against the controller's PV current limit.${warn}`;
+          : `<strong>Technician Note:</strong> Install <strong>${m.panelCount} × ${fmtNum(state.panelWatts)} W</strong> panels with ${m.isHybrid ? `the hybrid inverter's built-in MPPT (${state.hybridMppts} input${state.hybridMppts === 1 ? "" : "s"}; no separate controller)` : m.controllerCount > 1 ? `<strong>${m.controllerCount} × ${m.controllerRating} A</strong> MPPT controllers (split the strings between them)` : `a <strong>${m.controllerRating} A</strong> MPPT controller`} on the ${state.systemVoltage}V bank. Best connection: <strong>${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series × ${m.stringCount} string${m.stringCount === 1 ? "" : "s"} in parallel</strong>${m.panelCount > m.minPanelCount ? ` (${m.panelCount - m.minPanelCount} extra panel${m.panelCount - m.minPanelCount === 1 ? "" : "s"} beyond the ${m.minPanelCount} needed, so every string is equal)` : ""}. Cold-weather string Voc is about <strong>${fmtNum(m.stringVoc)} V</strong> against the ${m.isHybrid ? "inverter's" : "controller's"} ${m.pvOptions.maxV} V limit. Also check the array's short-circuit current against the ${m.isHybrid ? "inverter's" : "controller's"} PV current limit.${warn}`;
+      }
+
+      function renderHybridChecks(m) {
+        const box = document.getElementById("hybridCheckBox");
+        if (!m.isHybrid || m.hybridChecks.length === 0) { box.style.display = "none"; box.innerHTML = ""; return; }
+        const allOk = m.hybridChecks.every((c) => c.ok);
+        box.style.display = "block";
+        box.innerHTML = `<strong>Hybrid inverter check (against the datasheet values you entered):</strong> ${allOk ? '<span style="color:var(--emerald-600, #059669); font-weight:700;">all pass</span>' : '<span style="color:#e11d48; font-weight:700;">one or more limits exceeded</span>'}
+          <div style="overflow-x:auto; margin-top:8px;"><table style="width:100%; border-collapse:collapse; font-size:0.85rem;">
+            <thead><tr><th style="text-align:left; padding:4px 8px;">Check</th><th style="text-align:left; padding:4px 8px;">Your design</th><th style="text-align:left; padding:4px 8px;">Inverter limit</th><th style="text-align:left; padding:4px 8px;">Result</th></tr></thead>
+            <tbody>${m.hybridChecks.map((c) => `<tr style="border-top:1px solid var(--slate-200, #e2e8f0);"><td style="padding:4px 8px;">${escapeHtml(c.label)}</td><td style="padding:4px 8px; font-weight:700;">${escapeHtml(c.value)}</td><td style="padding:4px 8px;">${escapeHtml(c.limit)}</td><td style="padding:4px 8px; font-weight:700; color:${c.ok ? "#059669" : "#e11d48"};">${c.ok ? "OK" : escapeHtml(c.hint)}</td></tr>`).join("")}</tbody>
+          </table></div>
+          <div style="margin-top:6px; color:var(--slate-500);">These limits come from the datasheet of the inverter you pick. Check the maker's manual for the PV and battery limits of your exact model.</div>`;
       }
 
       function renderCables(m) {
@@ -2008,6 +2119,10 @@
         document.getElementById("inputVmp").value = state.panelVmp;
         document.getElementById("inputIsc").value = state.panelIsc;
         document.getElementById("inputCtrlVmax").value = state.ctrlMaxVoc;
+        ["hybridMaxV", "hybridMinV", "hybridMppts", "hybridMppIn", "hybridMaxPvW", "hybridBattA"].forEach((k) => { document.getElementById(k).value = state[k]; });
+        document.getElementById("hybridKvaEqKw").checked = state.hybridKvaEqKw;
+        document.getElementById("selectInverterType").value = state.inverterType;
+        syncInverterTypeUI();
         document.getElementById("selectAcSystem").value = String(state.acPhases);
         document.getElementById("selectPhase").value = String(state.acPhases);
         document.getElementById("inputBattUnitV").value = String(state.battUnitV);
@@ -2018,6 +2133,12 @@
         document.getElementById("lenBatt").value = state.lenBatt;
         document.getElementById("lenInv").value = state.lenInv;
         document.getElementById("lenGrid").value = state.lenGrid;
+      }
+
+      function syncInverterTypeUI() {
+        const h = state.inverterType === "hybrid";
+        document.getElementById("hybridFields").style.display = h ? "grid" : "none";
+        document.getElementById("wrapCtrlVmax").style.display = h ? "none" : "";
       }
 
       function addLoadItem(itemData) {
@@ -2317,12 +2438,23 @@
       });
       [["inputVoc", "panelVoc", 10, 200, 49.5], ["inputVmp", "panelVmp", 10, 200, 41.5], ["inputIsc", "panelIsc", 1, 40, 14],
        ["inputCtrlVmax", "ctrlMaxVoc", 50, 1000, 150], ["lenPv", "lenPv", 0.5, 500, 15], ["lenCtrl", "lenCtrl", 0.5, 500, 2],
+       ["hybridMaxV", "hybridMaxV", 100, 1500, 500], ["hybridMinV", "hybridMinV", 20, 500, 120], ["hybridMppts", "hybridMppts", 1, 6, 2],
+       ["hybridMppIn", "hybridMppIn", 5, 60, 16], ["hybridMaxPvW", "hybridMaxPvW", 0, 100000, 6500], ["hybridBattA", "hybridBattA", 10, 1000, 100],
        ["lenBatt", "lenBatt", 0.5, 500, 1.5], ["lenInv", "lenInv", 0.5, 500, 3], ["lenGrid", "lenGrid", 0.5, 500, 10]
       ].forEach(([id, key, min, max, fallback]) => {
         document.getElementById(id).addEventListener("input", (e) => {
           state[key] = clamp(e.target.value, min, max, fallback);
           updateCalculationsUI();
         });
+      });
+      document.getElementById("selectInverterType").addEventListener("change", (e) => {
+        state.inverterType = e.target.value === "hybrid" ? "hybrid" : "separate";
+        syncInverterTypeUI();
+        updateCalculationsUI();
+      });
+      document.getElementById("hybridKvaEqKw").addEventListener("change", (e) => {
+        state.hybridKvaEqKw = e.target.checked;
+        updateCalculationsUI();
       });
       document.getElementById("selectAcSystem").addEventListener("change", (e) => {
         state.acPhases = Number(e.target.value) === 3 ? 3 : 1;
@@ -2400,7 +2532,12 @@
         rows.push(["Panels Needed (minimum)", m.minPanelCount]);
         rows.push(["Panels To Install (equal strings)", m.panelCount]);
         rows.push(["Installed Array (Wp)", m.installedArrayWp]);
-        rows.push(["MPPT Controller", `${m.controllerCount} x ${m.controllerRating} A`]);
+        rows.push(["Inverter Type", m.isHybrid ? "Hybrid inverter (built-in MPPT)" : "Separate MPPT controller + inverter"]);
+        rows.push(["MPPT Controller", m.isHybrid ? "Built into the hybrid inverter" : `${m.controllerCount} x ${m.controllerRating} A`]);
+        if (m.isHybrid) {
+          rows.push(["Hybrid Datasheet Limits", csvText(`Max PV ${state.hybridMaxV} V; MPPT min ${state.hybridMinV} V; ${state.hybridMppts} MPPT input(s) of ${state.hybridMppIn} A; max PV ${state.hybridMaxPvW} W; max battery ${state.hybridBattA} A`)]);
+          m.hybridChecks.forEach((c) => rows.push([csvText("Hybrid check: " + c.label), csvText(c.value + " (" + c.limit + ") " + (c.ok ? "OK" : "OVER"))]));
+        }
         rows.push(["Battery Supplies (% of backed-up daily energy)", `${state.nightSharePct}%`]);
         rows.push(["PV Strings", `${m.panelsPerString} panel${m.panelsPerString === 1 ? "" : "s"} in series x ${m.stringCount} string${m.stringCount === 1 ? "" : "s"} in parallel`]);
         rows.push(["PV Connection", m.stringCount === 1 ? "All in series" : (m.panelsPerString === 1 ? "All in parallel" : "Series-parallel")]);
