@@ -72,6 +72,7 @@ module.exports = function mountSolar({ app, renderPage, guard = [], basePath = '
                     <li><strong>Daily energy use</strong> from a library of 55+ appliances, or your own entries.</li>
                     <li><strong>Peak start-up surge</strong>, which usually decides the inverter size.</li>
                     <li><strong>Single-phase or three-phase quote</strong>, chosen at the top of the calculator: it sets the inverter sizes, AC currents, cable sizes, breakers and the ATS.</li>
+                    <li><strong>Separate controller or hybrid inverter</strong>: choose a hybrid inverter with a built-in MPPT and the calculator drops the separate controller and checks the panels and battery against the inverter's datasheet limits.</li>
                     <li><strong>Inverter size</strong> in kW and kVA, with a battery-voltage check.</li>
                     <li><strong>Battery bank</strong> in kWh and Ah, sized only for the hours when the sun is down and the grid is off, checked against the battery's discharge-current limit.</li>
                     <li><strong>Solar array</strong> from peak sun hours and performance ratio: panel count and MPPT charge-controller rating.</li>
